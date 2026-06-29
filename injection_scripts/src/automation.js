@@ -247,6 +247,13 @@
         }
       } catch (_) {}
 
+      // 单作者采集上限：从后端配置读取（设置页可调，0=不限），覆盖默认值
+      try {
+        var cfgRet = await WXU.request({ method: "GET", url: "/__wx_channels_api/harvest-config" });
+        var hc = cfgRet && cfgRet[1];
+        if (hc && typeof hc.max_per_author === "number") MAX_ITEMS_PER_AUTHOR = hc.max_per_author;
+      } catch (_) {}
+
       setPanel("running", "正在获取关注列表…");
       var authors = await fetchAllFollows(function (n, total) {
         setPanel("running", "正在获取关注列表… 已发现 " + n + (total ? "/" + total : "") + " 个");
@@ -300,6 +307,10 @@
         finish("已停止 · 已采 " + totalVideos + " 条新作品 / " + done + " 个作者");
       } else {
         finish("完成 · 共采 " + totalVideos + " 条新作品，覆盖 " + done + " 个作者" + tail);
+        // 采集完成且未取消 → 触发上传处理（fire-and-forget）
+        try {
+          WXU.request({ method: "POST", url: "/__wx_channels_api/process-uploads", data: {} });
+        } catch (_) {}
       }
     } catch (ex) {
       finish("失败：" + (ex && ex.message ? ex.message : ex));
@@ -326,7 +337,7 @@
   function setPanel(state, msg) {
     ensurePanel();
     if (state === "idle") {
-      $panel.innerHTML = '<button id="wx-harvest-btn" style="' + BTN_STYLE + '">🔄 一键采集全部关注</button>';
+      $panel.innerHTML = autoStatusHtml() + '<button id="wx-harvest-btn" style="' + BTN_STYLE + '">🔄 一键采集全部关注</button>';
       $panel.querySelector("#wx-harvest-btn").onclick = harvestAll;
     } else if (state === "running") {
       $panel.innerHTML =
@@ -349,10 +360,70 @@
     setPanel("done", msg);
   }
 
+  // ---- 自动定时采集调度 ----
+  // 人工把视频号页面挂着，脚本随页面存活；这里定时检查配置 + 时间窗 + 间隔，到点自动跑 harvestAll。
+  var LAST_RUN_KEY = "wx_harvest_last_run";
+  var POLL_MS = 5 * 60 * 1000; // 每 5 分钟检查一次
+  var FIRST_TICK_MS = 30 * 1000; // 页面加载后 30s 先检查一次（便于刚开页就补跑到点任务）
+  var autoCfg = null; // 最近一次拉到的配置，仅用于 idle 态状态展示
+
+  function inWindow(hour, start, end) {
+    // end===24 视为「到当天结束」，hour<24 恒真；start>end 表示跨天回绕（如 22→6）
+    if (start === end) return true; // 整天
+    if (start < end) return hour >= start && hour < end;
+    return hour >= start || hour < end;
+  }
+
+  // 渲染 idle 态顶部的自动采集状态行（从最近配置读）
+  function autoStatusHtml() {
+    if (!autoCfg) return "";
+    if (!autoCfg.enabled) {
+      return '<div style="font-size:12px;color:#bbb;margin-bottom:8px;">⏰ 自动采集：关闭</div>';
+    }
+    var s = autoCfg.window_start_hour, e = autoCfg.window_end_hour, h = autoCfg.interval_hours;
+    return (
+      '<div style="font-size:12px;color:#9fe0b4;margin-bottom:8px;">' +
+      "⏰ 自动采集：开启 · 窗口 " + s + "–" + e + " 点 · 每 " + h + "h</div>"
+    );
+  }
+
+  async function tick() {
+    if (running) return; // 手动/上次自动仍在跑
+    var cfg;
+    try {
+      var ret = await WXU.request({ method: "GET", url: "/__wx_channels_api/harvest-config" });
+      cfg = ret && ret[1];
+    } catch (_) {
+      return;
+    }
+    if (!cfg || typeof cfg !== "object") return;
+    autoCfg = cfg;
+    // 刷新 idle 态状态行（仅当前处于 idle 面板时）
+    if ($panel && $panel.querySelector("#wx-harvest-btn")) setPanel("idle", "");
+    if (!cfg.enabled) return;
+
+    var now = new Date();
+    if (!inWindow(now.getHours(), cfg.window_start_hour | 0, cfg.window_end_hour | 0)) return;
+
+    var last = 0;
+    try {
+      last = parseInt(localStorage.getItem(LAST_RUN_KEY) || "0", 10) || 0;
+    } catch (_) {}
+    var intervalMs = (cfg.interval_hours > 0 ? cfg.interval_hours : 6) * 3600 * 1000;
+    if (Date.now() - last < intervalMs) return; // 还没到点
+
+    await harvestAll();
+    try {
+      localStorage.setItem(LAST_RUN_KEY, String(Date.now()));
+    } catch (_) {}
+  }
+
   var iv = setInterval(function () {
     if (document.body) {
       clearInterval(iv);
       setPanel("idle", "");
+      setTimeout(tick, FIRST_TICK_MS);
+      setInterval(tick, POLL_MS);
     }
   }, 100);
 })();

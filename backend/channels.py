@@ -1172,8 +1172,34 @@ def cancel_async_download(task_id):
         task = _download_tasks.get(task_id)
         if not task:
             return jsonify({"error": "未找到指定的下载任务"}), 404
-        
+
         task["cancel_event"].set()
         task["status"] = "cancelled"
         return jsonify({"success": True, "message": "下载已请求取消"})
+
+
+@channels_bp.route("/process-uploads", methods=["POST"])
+def process_uploads():
+    """处理待上传作品：下载→COS→服务器"""
+    from backend.channels_upload import process_pending_uploads
+    from backend.config import load_json
+
+    feeds_db = load_json(CHANNELS_FEEDS_FILE, {})
+    # 与 process_pending_uploads 的筛选条件保持一致：仅统计本次新同步、待上传的作品，
+    # 排除历史积压（无 needs_upload 标志）的旧作品，避免返回给前端的数量虚高。
+    pending_count = sum(
+        1
+        for items in feeds_db.values()
+        for item in items
+        if item.get("needs_upload") and not item.get("uploaded") and item.get("video_url")
+    )
+
+    def bg_task():
+        try:
+            process_pending_uploads()
+        except Exception as e:
+            print(f"Upload process error: {e}")
+
+    threading.Thread(target=bg_task, daemon=True).start()
+    return jsonify({"started": True, "pending_count": pending_count})
 

@@ -107,6 +107,93 @@ const SettingsPage = {
                     </div>
                 </div>
 
+                <!-- 视频号自动采集配置 -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3 class="card-title">⏰ 视频号自动采集</h3>
+                    </div>
+                    <div class="card-body" style="padding: 0 var(--spacing-md) var(--spacing-md);">
+                        <div class="form-group" style="margin-top: var(--spacing-md);">
+                            <label class="form-checkbox-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
+                                <input type="checkbox" id="setting-channels-auto-harvest" style="width: 18px; height: 18px; accent-color: var(--primary);" />
+                                <span>启用定时自动采集全部关注</span>
+                            </label>
+                            <div class="form-hint">需在微信里保持视频号页面（首页或主页）开着，注入脚本才会按时自动采集。</div>
+                        </div>
+                        <div style="display: flex; gap: 16px;">
+                            <div class="form-group" style="flex: 1;">
+                                <label class="form-label" for="setting-channels-harvest-interval">采集间隔</label>
+                                <select class="form-input" id="setting-channels-harvest-interval">
+                                    <option value="4">每 4 小时</option>
+                                    <option value="6">每 6 小时</option>
+                                    <option value="8">每 8 小时</option>
+                                    <option value="12">每 12 小时</option>
+                                </select>
+                            </div>
+                            <div class="form-group" style="flex: 1;">
+                                <label class="form-label" for="setting-channels-harvest-max">单作者上限（条/次）</label>
+                                <input type="number" class="form-input" id="setting-channels-harvest-max" min="0" step="1" placeholder="30" />
+                                <div class="form-hint">每个作者单次最多采集并上传多少条；0 = 不限。上传数据与采集一致。</div>
+                            </div>
+                        </div>
+                        <div style="display: flex; gap: 16px;">
+                            <div class="form-group" style="flex: 1;">
+                                <label class="form-label" for="setting-channels-harvest-start">允许开始时间</label>
+                                <select class="form-input" id="setting-channels-harvest-start">
+                                    ${startOptions}
+                                </select>
+                            </div>
+                            <div class="form-group" style="flex: 1;">
+                                <label class="form-label" for="setting-channels-harvest-end">允许结束时间</label>
+                                <select class="form-input" id="setting-channels-harvest-end">
+                                    ${endOptions}
+                                </select>
+                            </div>
+                        </div>
+                        <div class="form-hint">仅在设置的时间范围内才会触发自动采集，24 点表示当天结束。</div>
+                    </div>
+                </div>
+
+                <!-- 视频号上传服务器配置 -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3 class="card-title">☁️ 视频号上传服务器配置</h3>
+                    </div>
+                    <div class="card-body" style="padding: 0 var(--spacing-md) var(--spacing-md);">
+                        <div class="form-group" style="margin-top: var(--spacing-md);">
+                            <label class="form-checkbox-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
+                                <input type="checkbox" id="setting-channels-upload-enabled" style="width: 18px; height: 18px; accent-color: var(--primary);" />
+                                <span>启用自动上传到服务器</span>
+                            </label>
+                            <div class="form-hint">每次采集完成后，自动将新作品下载→上传腾讯云COS→推送到服务器。</div>
+                        </div>
+                        <div style="display: flex; gap: 12px;">
+                            <div class="form-group" style="flex: 2;">
+                                <label class="form-label" for="setting-channels-upload-url">服务器接收地址</label>
+                                <input type="text" class="form-input" id="setting-channels-upload-url" placeholder="https://your-server.com/api/data/submitVideos" />
+                            </div>
+                            <div class="form-group" style="flex: 1;">
+                                <label class="form-label" for="setting-channels-device-id">设备 ID (deviceId)</label>
+                                <input type="text" class="form-input" id="setting-channels-device-id" placeholder="视频号_caiji2" />
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">腾讯云 COS 配置</label>
+                            <div style="display: grid; gap: 12px;">
+                                <input type="text" class="form-input" id="setting-cos-secret-id" placeholder="SecretId" />
+                                <input type="password" class="form-input" id="setting-cos-secret-key" placeholder="SecretKey" />
+                                <div style="display: flex; gap: 12px;">
+                                    <input type="text" class="form-input" id="setting-cos-region" placeholder="Region (如 ap-guangzhou)" style="flex: 1;" />
+                                    <input type="text" class="form-input" id="setting-cos-bucket" placeholder="Bucket (如 my-bucket-1234567890)" style="flex: 1;" />
+                                </div>
+                                <input type="text" class="form-input" id="setting-cos-cds-domain" placeholder="访问域名 (如 https://bucket.cos.ap-guangzhou.myqcloud.com/)" />
+                                <input type="text" class="form-input" id="setting-cos-prefix" placeholder="前缀路径 (如 channels/)" />
+                            </div>
+                            <div class="form-hint">视频先上传到COS获取公网地址（访问域名 + 前缀 + feedId.mp4），再将地址推送给服务器。</div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- RSS 订阅配置 -->
                 <div class="card">
                     <div class="card-header">
@@ -244,6 +331,37 @@ const SettingsPage = {
         if (rssEndMinute) rssEndMinute.value = data.rss_end_minute !== undefined ? data.rss_end_minute : 0;
         if (rssUploadEnabled) rssUploadEnabled.checked = data.rss_upload_enabled !== undefined ? !!data.rss_upload_enabled : false;
         if (rssUploadUrl) rssUploadUrl.value = data.rss_upload_url || '';
+
+        const chAutoHarvest = document.getElementById('setting-channels-auto-harvest');
+        const chHarvestInterval = document.getElementById('setting-channels-harvest-interval');
+        const chHarvestStart = document.getElementById('setting-channels-harvest-start');
+        const chHarvestEnd = document.getElementById('setting-channels-harvest-end');
+        if (chAutoHarvest) chAutoHarvest.checked = !!data.channels_auto_harvest_enabled;
+        if (chHarvestInterval) chHarvestInterval.value = data.channels_harvest_interval_hours !== undefined ? data.channels_harvest_interval_hours : 6;
+        if (chHarvestStart) chHarvestStart.value = data.channels_harvest_window_start_hour !== undefined ? data.channels_harvest_window_start_hour : 8;
+        if (chHarvestEnd) chHarvestEnd.value = data.channels_harvest_window_end_hour !== undefined ? data.channels_harvest_window_end_hour : 24;
+        const chHarvestMax = document.getElementById('setting-channels-harvest-max');
+        if (chHarvestMax) chHarvestMax.value = data.channels_harvest_max_per_author !== undefined ? data.channels_harvest_max_per_author : 30;
+
+        const chUploadEnabled = document.getElementById('setting-channels-upload-enabled');
+        const chUploadUrl = document.getElementById('setting-channels-upload-url');
+        const cosSecretId = document.getElementById('setting-cos-secret-id');
+        const cosSecretKey = document.getElementById('setting-cos-secret-key');
+        const cosRegion = document.getElementById('setting-cos-region');
+        const cosBucket = document.getElementById('setting-cos-bucket');
+        const cosPrefix = document.getElementById('setting-cos-prefix');
+        const cosCdsDomain = document.getElementById('setting-cos-cds-domain');
+        const chDeviceId = document.getElementById('setting-channels-device-id');
+        if (chUploadEnabled) chUploadEnabled.checked = !!data.channels_upload_enabled;
+        if (chUploadUrl) chUploadUrl.value = data.channels_upload_url || '';
+        if (cosSecretId) cosSecretId.value = data.cos_secret_id || '';
+        if (cosSecretKey) cosSecretKey.value = data.cos_secret_key || '';
+        if (cosRegion) cosRegion.value = data.cos_region || '';
+        if (cosBucket) cosBucket.value = data.cos_bucket || '';
+        if (cosPrefix) cosPrefix.value = data.cos_prefix !== undefined ? data.cos_prefix : 'channels/';
+        if (cosCdsDomain) cosCdsDomain.value = data.cos_cds_domain || '';
+        if (chDeviceId) chDeviceId.value = data.channels_device_id || '视频号_caiji2';
+
         this.toggleRssUpload();
         this.syncRssEndMinute();
     },
@@ -314,6 +432,20 @@ const SettingsPage = {
             rss_end_minute: rssEndMinute && !rssEndMinute.disabled ? parseInt(rssEndMinute.value) : 0,
             rss_upload_enabled: rssUploadEnabled ? rssUploadEnabled.checked : false,
             rss_upload_url: rssUploadUrl ? rssUploadUrl.value.trim() : '',
+            channels_auto_harvest_enabled: (() => { const el = document.getElementById('setting-channels-auto-harvest'); return el ? el.checked : false; })(),
+            channels_harvest_interval_hours: (() => { const el = document.getElementById('setting-channels-harvest-interval'); return el ? parseInt(el.value) : 6; })(),
+            channels_harvest_window_start_hour: (() => { const el = document.getElementById('setting-channels-harvest-start'); return el ? parseInt(el.value) : 8; })(),
+            channels_harvest_window_end_hour: (() => { const el = document.getElementById('setting-channels-harvest-end'); return el ? parseInt(el.value) : 24; })(),
+            channels_harvest_max_per_author: (() => { const el = document.getElementById('setting-channels-harvest-max'); const v = el ? parseInt(el.value) : 30; return (isNaN(v) || v < 0) ? 30 : v; })(),
+            channels_upload_enabled: (() => { const el = document.getElementById('setting-channels-upload-enabled'); return el ? el.checked : false; })(),
+            channels_upload_url: (() => { const el = document.getElementById('setting-channels-upload-url'); return el ? el.value.trim() : ''; })(),
+            cos_secret_id: (() => { const el = document.getElementById('setting-cos-secret-id'); return el ? el.value.trim() : ''; })(),
+            cos_secret_key: (() => { const el = document.getElementById('setting-cos-secret-key'); return el ? el.value.trim() : ''; })(),
+            cos_region: (() => { const el = document.getElementById('setting-cos-region'); return el ? el.value.trim() : ''; })(),
+            cos_bucket: (() => { const el = document.getElementById('setting-cos-bucket'); return el ? el.value.trim() : ''; })(),
+            cos_prefix: (() => { const el = document.getElementById('setting-cos-prefix'); return el ? el.value.trim() : 'channels/'; })(),
+            cos_cds_domain: (() => { const el = document.getElementById('setting-cos-cds-domain'); return el ? el.value.trim() : ''; })(),
+            channels_device_id: (() => { const el = document.getElementById('setting-channels-device-id'); return el ? (el.value.trim() || '视频号_caiji2') : '视频号_caiji2'; })(),
         };
 
         try {
@@ -345,6 +477,20 @@ const SettingsPage = {
                 rss_end_minute: 0,
                 rss_upload_enabled: false,
                 rss_upload_url: '',
+                channels_auto_harvest_enabled: false,
+                channels_harvest_interval_hours: 6,
+                channels_harvest_window_start_hour: 8,
+                channels_harvest_window_end_hour: 24,
+                channels_harvest_max_per_author: 30,
+                channels_upload_enabled: false,
+                channels_upload_url: '',
+                cos_secret_id: '',
+                cos_secret_key: '',
+                cos_region: '',
+                cos_bucket: '',
+                cos_prefix: 'channels/',
+                cos_cds_domain: '',
+                channels_device_id: '视频号_caiji2',
             };
             try {
                 await API.settings.save(defaults);
