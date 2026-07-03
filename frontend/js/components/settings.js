@@ -124,9 +124,10 @@ const SettingsPage = {
                             <div class="form-group" style="flex: 1;">
                                 <label class="form-label" for="setting-channels-harvest-interval">采集间隔</label>
                                 <select class="form-input" id="setting-channels-harvest-interval">
+                                    <option value="1">每 1 小时</option>
+                                    <option value="2">每 2 小时</option>
                                     <option value="4">每 4 小时</option>
                                     <option value="6">每 6 小时</option>
-                                    <option value="8">每 8 小时</option>
                                     <option value="12">每 12 小时</option>
                                 </select>
                             </div>
@@ -156,8 +157,9 @@ const SettingsPage = {
 
                 <!-- 视频号上传服务器配置 -->
                 <div class="card">
-                    <div class="card-header">
+                    <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
                         <h3 class="card-title">☁️ 视频号上传服务器配置</h3>
+                        <button class="btn btn-secondary btn-sm" onclick="SettingsPage.showChannelsUploadLog()" style="padding: 4px 12px; font-size: 0.82rem;">📋 查看上传日志</button>
                     </div>
                     <div class="card-body" style="padding: 0 var(--spacing-md) var(--spacing-md);">
                         <div class="form-group" style="margin-top: var(--spacing-md);">
@@ -458,6 +460,54 @@ const SettingsPage = {
     },
 
 
+
+    async showChannelsUploadLog() {
+        Modal.open({
+            title: '📋 视频号上传日志',
+            content: `<div id="channels-upload-log-body" style="max-height: 60vh; overflow-y: auto; font-size: 0.85rem;">
+                <div style="color: var(--text-muted); text-align: center; padding: 20px;">加载中...</div>
+            </div>`,
+            footer: '<button class="btn btn-secondary" onclick="Modal.close()" style="width: 100%;">关闭</button>'
+        });
+
+        const body = document.getElementById('channels-upload-log-body');
+        try {
+            const log = await API.channels.getUploadLog(200);
+            if (!log || log.length === 0) {
+                body.innerHTML = '<div style="color: var(--text-muted); text-align: center; padding: 20px;">暂无上传日志</div>';
+                return;
+            }
+            const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+            body.innerHTML = log.map(r => {
+                const t = r.ts ? new Date(r.ts).toLocaleString('zh-CN', { hour12: false }) : '';
+                let line = '';
+                if (r.event === 'start') {
+                    line = `<span style="color: var(--text-primary); font-weight: 600;">▶ 开始上传流程</span>，待上传 ${r.pending} 个`;
+                } else if (r.event === 'item') {
+                    line = r.cos_ok
+                        ? `<span style="color: var(--primary);">✓ COS成功</span> ${esc(r.title || r.feedId)}<br><a href="${esc(r.cos_url)}" target="_blank" style="font-size: 0.78rem; color: var(--text-muted); word-break: break-all;">${esc(r.cos_url)}</a>`
+                        : `<span style="color: var(--error);">✗ COS失败</span> ${esc(r.title || r.feedId)}<br><span style="font-size: 0.78rem; color: var(--error); word-break: break-all;">原因: ${esc(r.error || '未知')}（将随下批采集重试）</span>`;
+                } else if (r.event === 'server_post') {
+                    const batchTag = r.total_batches ? `[第${r.batch}/${r.total_batches}批] ` : '';
+                    if (r.ok === true) line = `<span style="color: var(--primary); font-weight: 600;">✓ ${batchTag}服务器接收成功</span>，${r.records} 条`;
+                    else if (r.ok === false) line = `<span style="color: var(--error); font-weight: 600;">✗ ${batchTag}服务器POST失败</span>（${r.records} 条待下次重试）<br><span style="font-size: 0.78rem; color: var(--error);">原因: ${esc(r.error || '未知')}</span>`;
+                    else line = `<span style="color: var(--text-muted);">— 无COS成功视频，跳过服务器上传</span>`;
+                } else if (r.event === 'done') {
+                    line = `<span style="color: var(--text-primary); font-weight: 600;">■ 流程结束</span>：处理 ${r.processed} 个，成功 ${r.uploaded} 个${r.cos_fail ? `，COS失败 ${r.cos_fail} 个` : ''}`;
+                } else if (r.event === 'batch') {
+                    // 旧版日志格式兼容
+                    line = `第 ${r.idx}/${r.total_batches} 批：COS成功 ${r.cos_ok} 个，服务器 ${r.server_ok === true ? '✓成功' : r.server_ok === false ? '✗失败' : '未提交'}`;
+                } else {
+                    line = esc(JSON.stringify(r));
+                }
+                return `<div style="padding: 8px 4px; border-bottom: 1px solid var(--border-color); line-height: 1.5;">
+                    <span style="color: var(--text-muted); font-size: 0.75rem; display: block;">${t}</span>${line}
+                </div>`;
+            }).join('');
+        } catch (err) {
+            body.innerHTML = `<div style="color: var(--error); text-align: center; padding: 20px;">加载日志失败: ${err.message}</div>`;
+        }
+    },
 
     async resetDefaults() {
         Modal.confirm('恢复默认设置', '确定要将所有配置项恢复为系统默认吗？', async () => {

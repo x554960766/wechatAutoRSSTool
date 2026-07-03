@@ -5,6 +5,7 @@
 
 import re
 import sys
+import json
 import time
 import random
 import subprocess
@@ -139,17 +140,36 @@ def decrypt_channels_data(data: bytearray, key: int, enc_len: int = 131072):
 
 
 
-def add_channels_history_item(title: str, item_type: str, file_path: str, size_bytes: int):
-    """保存下载记录到视频号历史记录文件"""
+def add_channels_history_item(title: str, item_type: str, file_path: str, size_bytes: int,
+                              feed_id: str = None, uploaded: bool = None, cos_url: str = None,
+                              upload_error: str = None):
+    """保存下载记录到视频号历史记录文件。
+
+    feed_id/uploaded/cos_url/upload_error 为自动上传流程专用：
+    传入 feed_id 时按其去重（重试成功后更新原条目而不是新增一条）。
+    """
     from backend.config import load_json, save_json
     history = load_json(CHANNELS_HISTORY_FILE, [])
-    history.insert(0, {
+    entry = {
         "title": title,
         "type": item_type,
         "path": str(file_path),
         "size": f"{size_bytes / (1024 * 1024):.2f} MB" if size_bytes else "未知",
         "time": time.strftime("%Y-%m-%d %H:%M:%S")
-    })
+    }
+    if feed_id is not None:
+        entry["feed_id"] = str(feed_id)
+        entry["uploaded"] = bool(uploaded)
+        if cos_url:
+            entry["cos_url"] = cos_url
+        if upload_error:
+            entry["upload_error"] = str(upload_error)[:200]
+        # 同一作品重试时更新旧条目，避免历史里堆积重复记录
+        for i, old in enumerate(history):
+            if old.get("feed_id") == entry["feed_id"]:
+                history.pop(i)
+                break
+    history.insert(0, entry)
     save_json(CHANNELS_HISTORY_FILE, history[:150])
 
 
@@ -685,6 +705,30 @@ def get_history():
     from backend.config import load_json
     history = load_json(CHANNELS_HISTORY_FILE, [])
     return jsonify(history)
+
+
+@channels_bp.route("/upload-log", methods=["GET"])
+def get_upload_log():
+    """获取视频号自动上传日志（channels_upload_log.jsonl 最近 N 条，新→旧）"""
+    from backend.channels_upload import CHANNELS_UPLOAD_LOG_FILE
+    limit = request.args.get("limit", 100, type=int)
+    entries = []
+    try:
+        if CHANNELS_UPLOAD_LOG_FILE.exists():
+            with open(CHANNELS_UPLOAD_LOG_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            for line in lines[-limit:]:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except Exception:
+                    pass
+    except Exception as e:
+        return jsonify({"error": f"读取上传日志失败: {e}"}), 500
+    entries.reverse()
+    return jsonify(entries)
 
 
 @channels_bp.route("/history", methods=["DELETE"])
