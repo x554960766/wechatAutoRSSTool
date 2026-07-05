@@ -363,8 +363,8 @@ class XhsClient:
             raise ValueError("触发风控或 Cookie 失效，请在登录页更新 Cookie。")
             
         note_id = note.get("noteId") or note.get("id", "")
-        title = note.get("title", "").strip()
-        desc = note.get("desc", "").strip()
+        title = str(note.get("title") if note.get("title") is not None else "").strip()
+        desc = str(note.get("desc") if note.get("desc") is not None else "").strip()
         
         tag_list = note.get("tagList", [])
         tags = []
@@ -662,10 +662,10 @@ class XhsClient:
         page_data = user_data.get("userPageData", {})
         basic_info = page_data.get("basicInfo", {})
 
-        nickname = basic_info.get("nickname", "").strip()
-        avatar = basic_info.get("images", "").strip()
-        desc = basic_info.get("desc", "").strip()
-        red_id = basic_info.get("redId", "").strip()
+        nickname = str(basic_info.get("nickname") if basic_info.get("nickname") is not None else "").strip()
+        avatar = str(basic_info.get("images") if basic_info.get("images") is not None else "").strip()
+        desc = str(basic_info.get("desc") if basic_info.get("desc") is not None else "").strip()
+        red_id = str(basic_info.get("redId") if basic_info.get("redId") is not None else "").strip()
 
         fans = "0"
         interactions = page_data.get("interactions", [])
@@ -1200,7 +1200,7 @@ def _do_xhs_download_thread(task_id: str, urls: list, account_name: str):
 @xhs_bp.route("/parse", methods=["POST"])
 def parse_url():
     data = request.get_json() or {}
-    url = data.get("url", "").strip()
+    url = str(data.get("url") if data.get("url") is not None else "").strip()
     if not url:
         return jsonify({"error": "请输入小红书链接"}), 400
         
@@ -1264,7 +1264,7 @@ def list_accounts():
 @xhs_bp.route("/accounts/parse", methods=["POST"])
 def parse_user_url():
     data = request.get_json() or {}
-    url = data.get("url", "").strip()
+    url = str(data.get("url") if data.get("url") is not None else "").strip()
     if not url:
         return jsonify({"error": "请输入博主主页链接"}), 400
         
@@ -1278,8 +1278,8 @@ def parse_user_url():
 @xhs_bp.route("/accounts", methods=["POST"])
 def add_account():
     user = request.get_json() or {}
-    user_id = user.get("user_id", "").strip()
-    nickname = user.get("nickname", "").strip()
+    user_id = str(user.get("user_id") if user.get("user_id") is not None else "").strip()
+    nickname = str(user.get("nickname") if user.get("nickname") is not None else "").strip()
     if not user_id or not nickname:
         return jsonify({"error": "博主 ID 和昵称不能为空"}), 400
         
@@ -1466,7 +1466,7 @@ def open_folder():
     import sys
     
     data = request.get_json() or {}
-    account = data.get("account", "").strip()
+    account = str(data.get("account") if data.get("account") is not None else "").strip()
     
     path = XHS_DIR
     if account:

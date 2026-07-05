@@ -55,18 +55,18 @@ def process_pending_uploads():
             return {"error": "channels_upload_url not configured"}
 
         cos_cfg = {
-            "secret_id": settings.get("cos_secret_id", "").strip(),
-            "secret_key": settings.get("cos_secret_key", "").strip(),
-            "region": settings.get("cos_region", "").strip(),
-            "bucket": settings.get("cos_bucket", "").strip(),
-            "prefix": settings.get("cos_prefix", "channels/").strip(),
-            "cds_domain": settings.get("cos_cds_domain", "").strip(),
+            "secret_id": str(settings.get("cos_secret_id") if settings.get("cos_secret_id") is not None else "").strip(),
+            "secret_key": str(settings.get("cos_secret_key") if settings.get("cos_secret_key") is not None else "").strip(),
+            "region": str(settings.get("cos_region") if settings.get("cos_region") is not None else "").strip(),
+            "bucket": str(settings.get("cos_bucket") if settings.get("cos_bucket") is not None else "").strip(),
+            "prefix": str(settings.get("cos_prefix") if settings.get("cos_prefix") is not None else "channels/").strip(),
+            "cds_domain": str(settings.get("cos_cds_domain") if settings.get("cos_cds_domain") is not None else "").strip(),
         }
         if not all([cos_cfg["secret_id"], cos_cfg["secret_key"], cos_cfg["region"], cos_cfg["bucket"]]):
             logger.error("[视频号上传] 错误：COS凭证不完整")
             return {"error": "COS credentials incomplete"}
 
-        device_id = settings.get("channels_device_id", "视频号_caiji2").strip() or "视频号_caiji2"
+        device_id = str(settings.get("channels_device_id") if settings.get("channels_device_id") is not None else "视频号_caiji2").strip() or "视频号_caiji2"
         logger.info(f"[视频号上传] 配置加载完成 - 目标服务器: {server_url}, 设备ID: {device_id}, COS区域: {cos_cfg['region']}")
 
         feeds_db = load_json(CHANNELS_FEEDS_FILE, {})

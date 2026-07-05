@@ -55,11 +55,11 @@ def _serialize_cookies(cookies: list) -> str:
     """将 Cookie 列表序列化为字符串（仅保留 kuaishou.com 域）"""
     cookie_dict = {}
     for c in cookies:
-        name = c.get("name", "").strip()
-        value = c.get("value", "").strip()
+        name = str(c.get("name") if c.get("name") is not None else "").strip()
+        value = str(c.get("value") if c.get("value") is not None else "").strip()
         if not name or not value:
             continue
-        domain = c.get("domain", "").strip().lstrip(".").lower()
+        domain = str(c.get("domain") if c.get("domain") is not None else "").strip().lstrip(".").lower()
         if not domain or domain.endswith("kuaishou.com"):
             cookie_dict[name] = value
     return "; ".join(f"{name}={value}" for name, value in cookie_dict.items())

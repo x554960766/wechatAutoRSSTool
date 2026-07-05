@@ -285,7 +285,7 @@ def start_range_download():
     account_name = data.get("account_name", "unknown")
     start_time = data.get("start_time", 0)
     end_time = data.get("end_time", 0)
-    keyword = data.get("keyword", "").strip()
+    keyword = str(data.get("keyword") if data.get("keyword") is not None else "").strip()
     page_size = int(data.get("page_size", 10) or 10)
 
     if not fakeid:
@@ -877,7 +877,7 @@ def open_folder():
     import sys
     
     data = request.get_json() or {}
-    account = data.get("account", "").strip()
+    account = str(data.get("account") if data.get("account") is not None else "").strip()
     
     settings = get_settings()
     download_dir_str = settings.get("download_dir") or str(OUTPUT_DIR)

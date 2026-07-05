@@ -492,7 +492,7 @@ def save_parsed_video_to_db(result):
 def fetch_video_profile():
     """解析视频号分享链接，提取视频 CDN 地址和元数据（支持本地解析、私有Worker以及免翻墙智能穿透）"""
     data = request.get_json() or {}
-    url = data.get("url", "").strip()
+    url = str(data.get("url") if data.get("url") is not None else "").strip()
     if not url:
         return jsonify({"error": "请输入有效的视频号链接"}), 400
 
@@ -504,8 +504,8 @@ def fetch_video_profile():
 
     # 获取系统配置，检测是否配置了本地解析凭证或私有 Worker
     settings = get_settings()
-    yuanbao_cookie = settings.get("yuanbao_cookie", "").strip()
-    custom_worker = settings.get("custom_channels_worker", "").strip()
+    yuanbao_cookie = str(settings.get("yuanbao_cookie") if settings.get("yuanbao_cookie") is not None else "").strip()
+    custom_worker = str(settings.get("custom_channels_worker") if settings.get("custom_channels_worker") is not None else "").strip()
 
     # ================= 模式 1: 100% 软件内部本地解析（如用户配置了元宝 Cookie） =================
     if yuanbao_cookie:
@@ -599,9 +599,9 @@ def fetch_video_profile():
 def download_video():
     """在后端下载并自动解密的视频文件到本地下载目录，避免前端跨域(CORS)限制"""
     data = request.get_json() or {}
-    video_url = data.get("url", "").strip()
-    description = data.get("description", "").strip()
-    createtime = data.get("createtime", "").strip()
+    video_url = str(data.get("url") if data.get("url") is not None else "").strip()
+    description = str(data.get("description") if data.get("description") is not None else "").strip()
+    createtime = str(data.get("createtime") if data.get("createtime") is not None else "").strip()
     decrypt_key = data.get("decrypt_key") or data.get("key")
 
     if not video_url:
@@ -806,10 +806,10 @@ def get_favorites():
 def add_favorite():
     """添加视频号作者到收藏列表"""
     data = request.get_json() or {}
-    username = data.get("username", "").strip()
-    nickname = data.get("nickname", "").strip()
-    head_img_url = data.get("head_img_url", "").strip()
-    video_url = data.get("video_url", "").strip()
+    username = str(data.get("username") if data.get("username") is not None else "").strip()
+    nickname = str(data.get("nickname") if data.get("nickname") is not None else "").strip()
+    head_img_url = str(data.get("head_img_url") if data.get("head_img_url") is not None else "").strip()
+    video_url = str(data.get("video_url") if data.get("video_url") is not None else "").strip()
 
     if not username:
         return jsonify({"error": "作者 ID 不能为空"}), 400
@@ -1159,9 +1159,9 @@ def start_download_video_async():
     """开始异步下载视频"""
     global _download_tasks
     data = request.get_json() or {}
-    video_url = data.get("url", "").strip()
-    description = data.get("description", "").strip()
-    createtime = data.get("createtime", "").strip()
+    video_url = str(data.get("url") if data.get("url") is not None else "").strip()
+    description = str(data.get("description") if data.get("description") is not None else "").strip()
+    createtime = str(data.get("createtime") if data.get("createtime") is not None else "").strip()
     decrypt_key = data.get("decrypt_key") or data.get("key")
 
     if not video_url:
