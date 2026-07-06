@@ -12,6 +12,7 @@ import subprocess
 import urllib.parse
 import requests
 import struct
+import threading
 from pathlib import Path
 from flask import Blueprint, jsonify, request
 
@@ -22,6 +23,11 @@ channels_bp = Blueprint("channels", __name__, url_prefix="/api/channels")
 CHANNELS_HISTORY_FILE = DATA_DIR / "channels_history.json"
 CHANNELS_FAVORITES_FILE = DATA_DIR / "channels_favorites.json"
 CHANNELS_FEEDS_FILE = DATA_DIR / "channels_parsed_feeds.json"
+
+# 保护 channels_parsed_feeds.json 的读-改-写。采集(save_synced_feeds)与自动上传
+# (process_pending_uploads)分属不同线程,各自 load→改→save 会后写覆盖先写,
+# 造成新作品丢失 / uploaded 标记被抹掉后重复上传。所有 feeds_db 写入须持此锁。
+FEEDS_LOCK = threading.RLock()
 
 
 class ISAAC64:
@@ -1235,7 +1241,8 @@ def process_uploads():
         1
         for items in feeds_db.values()
         for item in items
-        if item.get("needs_upload") and not item.get("uploaded") and item.get("video_url")
+        if item.get("needs_upload") and not item.get("uploaded")
+        and not item.get("upload_failed") and item.get("video_url")
     )
 
     def bg_task():

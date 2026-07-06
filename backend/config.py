@@ -14,7 +14,7 @@ from pathlib import Path
 from backend.runtime import app_dir
 
 # ── 版本号 ────────────────────────────────────────────────
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.3"
 
 # ── 路径配置 ──────────────────────────────────────────────
 if getattr(sys, 'frozen', False):
@@ -62,7 +62,7 @@ DEFAULT_SETTINGS = {
     "channels_upload_enabled": False,
     "channels_upload_url": "",
     "channels_auto_harvest_enabled": False,
-    "channels_harvest_interval_hours": 6,
+    "channels_harvest_interval_minutes": 360,  # 定时采集间隔(分钟),下限 30;触发时刻由脚本随机抖动
     "channels_harvest_window_start_hour": 8,
     "channels_harvest_window_end_hour": 24,
     "channels_harvest_max_per_author": 30,  # 单作者单次采集上限，0 = 不限

@@ -124,12 +124,14 @@ const SettingsPage = {
                             <div class="form-group" style="flex: 1;">
                                 <label class="form-label" for="setting-channels-harvest-interval">采集间隔</label>
                                 <select class="form-input" id="setting-channels-harvest-interval">
-                                    <option value="1">每 1 小时</option>
-                                    <option value="2">每 2 小时</option>
-                                    <option value="4">每 4 小时</option>
-                                    <option value="6">每 6 小时</option>
-                                    <option value="12">每 12 小时</option>
+                                    <option value="30">每 30 分钟</option>
+                                    <option value="60">每 1 小时</option>
+                                    <option value="120">每 2 小时</option>
+                                    <option value="240">每 4 小时</option>
+                                    <option value="360">每 6 小时</option>
+                                    <option value="720">每 12 小时</option>
                                 </select>
+                                <div class="form-hint">实际触发时刻会在此间隔上随机抖动，避免每天固定钟点。</div>
                             </div>
                             <div class="form-group" style="flex: 1;">
                                 <label class="form-label" for="setting-channels-harvest-max">单作者上限（条/次）</label>
@@ -339,7 +341,7 @@ const SettingsPage = {
         const chHarvestStart = document.getElementById('setting-channels-harvest-start');
         const chHarvestEnd = document.getElementById('setting-channels-harvest-end');
         if (chAutoHarvest) chAutoHarvest.checked = !!data.channels_auto_harvest_enabled;
-        if (chHarvestInterval) chHarvestInterval.value = data.channels_harvest_interval_hours !== undefined ? data.channels_harvest_interval_hours : 6;
+        if (chHarvestInterval) chHarvestInterval.value = data.channels_harvest_interval_minutes !== undefined ? data.channels_harvest_interval_minutes : (data.channels_harvest_interval_hours !== undefined ? data.channels_harvest_interval_hours * 60 : 360);
         if (chHarvestStart) chHarvestStart.value = data.channels_harvest_window_start_hour !== undefined ? data.channels_harvest_window_start_hour : 8;
         if (chHarvestEnd) chHarvestEnd.value = data.channels_harvest_window_end_hour !== undefined ? data.channels_harvest_window_end_hour : 24;
         const chHarvestMax = document.getElementById('setting-channels-harvest-max');
@@ -435,7 +437,7 @@ const SettingsPage = {
             rss_upload_enabled: rssUploadEnabled ? rssUploadEnabled.checked : false,
             rss_upload_url: rssUploadUrl ? rssUploadUrl.value.trim() : '',
             channels_auto_harvest_enabled: (() => { const el = document.getElementById('setting-channels-auto-harvest'); return el ? el.checked : false; })(),
-            channels_harvest_interval_hours: (() => { const el = document.getElementById('setting-channels-harvest-interval'); return el ? parseInt(el.value) : 6; })(),
+            channels_harvest_interval_minutes: (() => { const el = document.getElementById('setting-channels-harvest-interval'); const v = el ? parseInt(el.value) : 360; return (isNaN(v) || v < 30) ? 30 : v; })(),
             channels_harvest_window_start_hour: (() => { const el = document.getElementById('setting-channels-harvest-start'); return el ? parseInt(el.value) : 8; })(),
             channels_harvest_window_end_hour: (() => { const el = document.getElementById('setting-channels-harvest-end'); return el ? parseInt(el.value) : 24; })(),
             channels_harvest_max_per_author: (() => { const el = document.getElementById('setting-channels-harvest-max'); const v = el ? parseInt(el.value) : 30; return (isNaN(v) || v < 0) ? 30 : v; })(),
@@ -528,7 +530,7 @@ const SettingsPage = {
                 rss_upload_enabled: false,
                 rss_upload_url: '',
                 channels_auto_harvest_enabled: false,
-                channels_harvest_interval_hours: 6,
+                channels_harvest_interval_minutes: 360,
                 channels_harvest_window_start_hour: 8,
                 channels_harvest_window_end_hour: 24,
                 channels_harvest_max_per_author: 30,

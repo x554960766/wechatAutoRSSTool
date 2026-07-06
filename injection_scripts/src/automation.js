@@ -363,6 +363,7 @@
   // ---- 自动定时采集调度 ----
   // 人工把视频号页面挂着，脚本随页面存活；这里定时检查配置 + 时间窗 + 间隔，到点自动跑 harvestAll。
   var LAST_RUN_KEY = "wx_harvest_last_run";
+  var INTERVAL_KEY = "wx_harvest_cur_interval_ms"; // 本周期随机抖动后的实际间隔(ms),打散固定钟点
   var POLL_MS = 5 * 60 * 1000; // 每 5 分钟检查一次
   var FIRST_TICK_MS = 30 * 1000; // 页面加载后 30s 先检查一次（便于刚开页就补跑到点任务）
   var autoCfg = null; // 最近一次拉到的配置，仅用于 idle 态状态展示
@@ -380,11 +381,25 @@
     if (!autoCfg.enabled) {
       return '<div style="font-size:12px;color:#bbb;margin-bottom:8px;">⏰ 自动采集：关闭</div>';
     }
-    var s = autoCfg.window_start_hour, e = autoCfg.window_end_hour, h = autoCfg.interval_hours;
+    var s = autoCfg.window_start_hour, e = autoCfg.window_end_hour;
     return (
       '<div style="font-size:12px;color:#9fe0b4;margin-bottom:8px;">' +
-      "⏰ 自动采集：开启 · 窗口 " + s + "–" + e + " 点 · 每 " + h + "h</div>"
+      "⏰ 自动采集：开启 · 窗口 " + s + "–" + e + " 点 · 每 " + fmtInterval(autoCfg.interval_minutes) + "(随机抖动)</div>"
     );
+  }
+
+  // 间隔展示：整点小时显示 Nh，否则显示分钟
+  function fmtInterval(m) {
+    m = m | 0;
+    if (m >= 60 && m % 60 === 0) return (m / 60) + "h";
+    return m + "分";
+  }
+
+  // 在配置间隔上加 0~50% 随机抖动(1.0x~1.5x),下限 30 分钟。
+  // 只往长了抖:实际间隔恒 ≥ 配置值(不会比设定更频繁),且触发时刻每周期往后漂移,打散固定钟点。
+  function pickIntervalMs(baseMinutes) {
+    var base = Math.max(30, baseMinutes | 0) * 60 * 1000;
+    return Math.floor(base * (1.0 + Math.random() * 0.5));
   }
 
   async function tick() {
@@ -405,16 +420,23 @@
     var now = new Date();
     if (!inWindow(now.getHours(), cfg.window_start_hour | 0, cfg.window_end_hour | 0)) return;
 
-    var last = 0;
+    var last = 0, curInterval = 0;
     try {
       last = parseInt(localStorage.getItem(LAST_RUN_KEY) || "0", 10) || 0;
+      curInterval = parseInt(localStorage.getItem(INTERVAL_KEY) || "0", 10) || 0;
     } catch (_) {}
-    var intervalMs = (cfg.interval_hours > 0 ? cfg.interval_hours : 6) * 3600 * 1000;
-    if (Date.now() - last < intervalMs) return; // 还没到点
+    // 本周期的随机间隔一旦定下就固定,避免每次 tick 重新随机导致阈值抖动
+    if (!curInterval) {
+      curInterval = pickIntervalMs(cfg.interval_minutes);
+      try { localStorage.setItem(INTERVAL_KEY, String(curInterval)); } catch (_) {}
+    }
+    if (Date.now() - last < curInterval) return; // 还没到点
 
     await harvestAll();
     try {
       localStorage.setItem(LAST_RUN_KEY, String(Date.now()));
+      // 为下个周期重新随机一个间隔,使触发时刻持续漂移
+      localStorage.setItem(INTERVAL_KEY, String(pickIntervalMs(cfg.interval_minutes)));
     } catch (_) {}
   }
 

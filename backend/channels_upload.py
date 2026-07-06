@@ -13,7 +13,10 @@ import requests
 from qcloud_cos import CosConfig, CosS3Client
 
 from backend.config import get_settings, load_json, save_json, DATA_DIR, get_proxies_dict
-from backend.channels import CHANNELS_FEEDS_FILE, CHANNELS_FAVORITES_FILE, decrypt_channels_data, add_channels_history_item
+from backend.channels import (
+    CHANNELS_FEEDS_FILE, CHANNELS_FAVORITES_FILE, FEEDS_LOCK,
+    decrypt_channels_data, add_channels_history_item,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +24,46 @@ CHANNELS_UPLOAD_LOG_FILE = DATA_DIR / "channels_upload_log.jsonl"
 
 _upload_lock = threading.Lock()
 _upload_running = False
+
+# 下载+COS+POST服务器 统一批大小:每批≤5,走完「下载→COS→推服务器」再下一批。
+# 服务器批次跟随 COS 批(而非攒到 30 再推),数据量小、每批容错独立、失败面更小。
+UPLOAD_BATCH_SIZE = 5
+# 单条累计失败达此次数 → 放弃:去掉 needs_upload、标 upload_failed,不再无限重试。
+# 视频号 CDN URL 带时效 token,过期后每轮都白下载,必须有放弃阈值。
+MAX_UPLOAD_ATTEMPTS = 5
+
+
+def _update_feed_item(username, feed_id, changes, pop_keys=()):
+    """在 FEEDS_LOCK 内 load → 按 (username, feed_id) 定点改 → save。
+
+    上传流程不再长时间持有 feeds_db 整体快照回写(会覆盖并发采集的写入),
+    而是每次状态变更都基于磁盘最新内容做定点更新,规避跨线程读改写竞态。
+    """
+    with FEEDS_LOCK:
+        feeds_db = load_json(CHANNELS_FEEDS_FILE, {})
+        items = feeds_db.get(username) or []
+        for it in items:
+            if str(it.get("id", "")) == str(feed_id):
+                it.update(changes)
+                for k in pop_keys:
+                    it.pop(k, None)
+                save_json(CHANNELS_FEEDS_FILE, feeds_db)
+                return
+
+
+def _bump_attempt(snap, err):
+    """失败计数 +1;达 MAX_UPLOAD_ATTEMPTS 则放弃(去 needs_upload、标 upload_failed)。"""
+    attempts = snap.get("attempts", 0) + 1
+    snap["attempts"] = attempts
+    if attempts >= MAX_UPLOAD_ATTEMPTS:
+        _update_feed_item(snap["username"], snap["feed_id"],
+                          {"upload_attempts": attempts, "upload_failed": True,
+                           "last_error": str(err)[:200]},
+                          pop_keys=("needs_upload",))
+        logger.warning(f"[视频号上传] feedId={snap['feed_id']} 连续失败 {attempts} 次,放弃重试")
+    else:
+        _update_feed_item(snap["username"], snap["feed_id"],
+                          {"upload_attempts": attempts, "last_error": str(err)[:200]})
 
 
 def _log_event(event: dict):
@@ -33,7 +76,7 @@ def _log_event(event: dict):
         logger.warning(f"[视频号上传] 写审计日志失败: {e}")
 
 def process_pending_uploads():
-    """扫描未上传项→批量下载+COS上传→按批POST服务器"""
+    """扫描未上传项 → 每批≤5:下载+解密+传COS,本批COS成功的立即POST服务器,再下一批。"""
     global _upload_running
 
     with _upload_lock:
@@ -69,139 +112,150 @@ def process_pending_uploads():
         device_id = str(settings.get("channels_device_id") if settings.get("channels_device_id") is not None else "视频号_caiji2").strip() or "视频号_caiji2"
         logger.info(f"[视频号上传] 配置加载完成 - 目标服务器: {server_url}, 设备ID: {device_id}, COS区域: {cos_cfg['region']}")
 
-        feeds_db = load_json(CHANNELS_FEEDS_FILE, {})
-        favs = load_json(CHANNELS_FAVORITES_FILE, [])
-        nick_map = {f.get("username"): f.get("nickname") for f in favs if isinstance(f, dict) and f.get("username")}
-
-        pending = []
-        for username, items in feeds_db.items():
-            for item in items:
-                # 仅处理本次新同步的作品（needs_upload）；历史积压不自动上传
-                if item.get("needs_upload") and not item.get("uploaded") and item.get("video_url"):
-                    pending.append((username, item))
+        # ---- 锁内快照本次待上传项:拷贝最小字段,不再长时间持有共享引用整体回写 ----
+        with FEEDS_LOCK:
+            feeds_db = load_json(CHANNELS_FEEDS_FILE, {})
+            favs = load_json(CHANNELS_FAVORITES_FILE, [])
+            nick_map = {f.get("username"): f.get("nickname") for f in favs if isinstance(f, dict) and f.get("username")}
+            pending = []
+            for username, items in feeds_db.items():
+                for item in items:
+                    # 仅处理本次新同步(needs_upload)、未成功、未放弃且有链接的作品
+                    if (item.get("needs_upload") and not item.get("uploaded")
+                            and not item.get("upload_failed") and item.get("video_url")):
+                        pending.append({
+                            "username": username,
+                            "feed_id": str(item.get("id", "")),
+                            "video_url": item.get("video_url_h265") or item.get("video_url_h264") or item.get("video_url"),
+                            "decode_key": item.get("decode_key", ""),
+                            "description": item.get("description", ""),
+                            "createtime": item.get("createtime") or 0,
+                            "cos_url": item.get("cos_url"),  # 上次已传成功则复用,重试不重复下载/传COS
+                            "nickname": nick_map.get(username) or item.get("nickname") or username,
+                            "comment_count": item.get("comment_count", 0),
+                            "fav_count": item.get("fav_count", 0),
+                            "forward_count": item.get("forward_count", 0),
+                            "like_count": item.get("like_count", 0),
+                            "attempts": int(item.get("upload_attempts", 0) or 0),
+                        })
 
         if not pending:
             logger.info("[视频号上传] 跳过：无本次新同步的待上传内容")
             return {"skipped": True, "reason": "no_pending"}
 
-        logger.info(f"[视频号上传] 发现 {len(pending)} 个待上传视频，分 {(len(pending) + 4) // 5} 批传COS")
+        batches = [pending[i:i+UPLOAD_BATCH_SIZE] for i in range(0, len(pending), UPLOAD_BATCH_SIZE)]
+        logger.info(f"[视频号上传] 发现 {len(pending)} 个待上传视频，分 {len(batches)} 批(每批≤{UPLOAD_BATCH_SIZE}:COS→服务器)")
         _log_event({"event": "start", "pending": len(pending)})
-        batches = [pending[i:i+5] for i in range(0, len(pending), 5)]
-
-        # ---- 阶段1：全部先传 COS（单个失败跳过，不阻塞其余；失败的保留 needs_upload 待下批重试）----
-        all_results = []  # [((username, item), cos_url_or_None, error_or_None)]
-        for batch_idx, batch in enumerate(batches, 1):
-            logger.info(f"[视频号上传] --- COS第 {batch_idx}/{len(batches)} 批，包含 {len(batch)} 个视频 ---")
-            all_results.extend(_batch_cos_upload(batch, cos_cfg))
-            save_json(CHANNELS_FEEDS_FILE, feeds_db)
-
-        # 每个视频（无论成败）都写入下载历史，带云端上传标识/地址/失败原因
-        for (username, item), cos_url, err in all_results:
-            feed_id = str(item.get("id", ""))
-            if cos_url:
-                item["cos_url"] = cos_url
-            try:
-                add_channels_history_item(
-                    item.get("description") or feed_id,
-                    "视频(自动上传)",
-                    cos_url or "",
-                    item.get("upload_size", 0),
-                    feed_id=feed_id,
-                    uploaded=bool(cos_url),
-                    cos_url=cos_url,
-                    upload_error=err,
-                )
-            except Exception as eh:
-                logger.warning(f"[视频号上传] 写历史记录失败: {eh}")
-            _log_event({"event": "item", "feedId": feed_id,
-                        "title": (item.get("description") or "")[:60],
-                        "cos_ok": bool(cos_url), "cos_url": cos_url, "error": err})
-
-        save_json(CHANNELS_FEEDS_FILE, feeds_db)
-
-        # ---- 阶段2：COS 全部处理完后，按 30 条一批 POST 服务器 ----
-        # 收集所有 COS 成功的 (item, record)，含本次新传成功 + 历史遗留（上次COS成功但服务器失败、
-        # 仍保留 needs_upload 而被重新捞回）的项。服务器每次最多接收 30 条，超出分批。
-        server_items = []  # [(item, record)]
-        for (username, item), cos_url, err in all_results:
-            if cos_url:
-                server_items.append((item, {
-                    "feedId": str(item.get("id", "")),
-                    "description": item.get("description", ""),
-                    "nickName": nick_map.get(username) or item.get("nickname") or username,
-                    "url": cos_url,
-                    "publishTime": int(item.get("createtime") or 0),
-                    "insertTime": int(time.time()),
-                    "id": 0,
-                    "commentCount": item.get("comment_count", 0),
-                    "favCount": item.get("fav_count", 0),
-                    "forwardCount": item.get("forward_count", 0),
-                    "likeCount": item.get("like_count", 0),
-                }))
 
         total_success = 0
-        cos_fail_count = len(all_results) - len(server_items)
-        SERVER_BATCH = 30
-        if server_items:
-            post_batches = [server_items[i:i+SERVER_BATCH] for i in range(0, len(server_items), SERVER_BATCH)]
-            logger.info(f"[视频号上传] COS完成（成功{len(server_items)}/失败{cos_fail_count}），"
-                        f"分 {len(post_batches)} 批(每批≤{SERVER_BATCH})POST服务器")
-            for pidx, pbatch in enumerate(post_batches, 1):
-                records = [rec for (_it, rec) in pbatch]
-                logger.info(f"[视频号上传] 服务器POST第 {pidx}/{len(post_batches)} 批，{len(records)} 条")
-                ok, server_err = _post_to_server(server_url, records, device_id)
-                _log_event({"event": "server_post", "batch": pidx, "total_batches": len(post_batches),
-                            "records": len(records), "ok": ok, "error": server_err})
-                if ok:
-                    logger.info(f"[视频号上传] ✓ 第 {pidx} 批服务器接受成功，标记 {len(records)} 个为已上传")
-                    for it, _rec in pbatch:
-                        it["uploaded"] = True
-                        it["upload_time"] = int(time.time())
-                        it.pop("needs_upload", None)
-                        total_success += 1
-                    save_json(CHANNELS_FEEDS_FILE, feeds_db)
-                else:
-                    # 本批不标记 uploaded，needs_upload 保留 → 下次触发时继续带上，直到成功
-                    # （cos_url 已缓存，重试不会重复下载/传COS）
-                    logger.warning(f"[视频号上传] ✗ 第 {pidx} 批服务器POST失败，{len(records)} 个保留待下次重试")
-        else:
-            logger.warning(f"[视频号上传] 无成功上传到COS的视频，跳过POST")
-            _log_event({"event": "server_post", "records": 0, "ok": None, "error": "no_cos_success"})
+        cos_fail_total = 0
 
-        logger.info(f"[视频号上传] ========== 上传完成：处理 {len(pending)} 个，成功 {total_success} 个 ==========")
+        for batch_idx, batch in enumerate(batches, 1):
+            logger.info(f"[视频号上传] --- 第 {batch_idx}/{len(batches)} 批，{len(batch)} 个 ---")
+            # 阶段1：本批并发下载+解密+传COS(单个失败跳过,不阻塞其余)
+            cos_results = _batch_cos_upload(batch, cos_cfg)  # [(snap, cos_url|None, err|None)]
+
+            server_snaps = []
+            for snap, cos_url, err in cos_results:
+                feed_id = snap["feed_id"]
+                if cos_url:
+                    snap["cos_url"] = cos_url
+                    _update_feed_item(snap["username"], feed_id,
+                                      {"cos_url": cos_url, "upload_size": snap.get("upload_size", 0)})
+                    server_snaps.append(snap)
+                else:
+                    cos_fail_total += 1
+                    _bump_attempt(snap, err)  # 失败计数,超阈值放弃
+                # 每个视频(无论成败)都写下载历史,带云端上传标识/地址/失败原因
+                try:
+                    add_channels_history_item(
+                        snap.get("description") or feed_id,
+                        "视频(自动上传)",
+                        cos_url or "",
+                        snap.get("upload_size", 0),
+                        feed_id=feed_id,
+                        uploaded=bool(cos_url),
+                        cos_url=cos_url,
+                        upload_error=err,
+                    )
+                except Exception as eh:
+                    logger.warning(f"[视频号上传] 写历史记录失败: {eh}")
+                _log_event({"event": "item", "feedId": feed_id,
+                            "title": (snap.get("description") or "")[:60],
+                            "cos_ok": bool(cos_url), "cos_url": cos_url, "error": err})
+
+            # 阶段2：本批 COS 成功的(≤5 条)立即 POST 服务器
+            if not server_snaps:
+                logger.warning(f"[视频号上传] 第 {batch_idx} 批无COS成功项，跳过POST")
+                _log_event({"event": "server_post", "batch": batch_idx, "total_batches": len(batches),
+                            "records": 0, "ok": None, "error": "no_cos_success"})
+                continue
+
+            records = [{
+                "feedId": s["feed_id"],
+                "description": s["description"],
+                "nickName": s["nickname"],
+                "url": s["cos_url"],
+                "publishTime": int(s["createtime"] or 0),
+                "insertTime": int(time.time()),
+                "id": 0,
+                "commentCount": s["comment_count"],
+                "favCount": s["fav_count"],
+                "forwardCount": s["forward_count"],
+                "likeCount": s["like_count"],
+            } for s in server_snaps]
+
+            logger.info(f"[视频号上传] 服务器POST第 {batch_idx}/{len(batches)} 批，{len(records)} 条")
+            ok, server_err = _post_to_server(server_url, records, device_id)
+            _log_event({"event": "server_post", "batch": batch_idx, "total_batches": len(batches),
+                        "records": len(records), "ok": ok, "error": server_err})
+            if ok:
+                for s in server_snaps:
+                    _update_feed_item(s["username"], s["feed_id"],
+                                      {"uploaded": True, "upload_time": int(time.time())},
+                                      pop_keys=("needs_upload", "upload_attempts", "last_error"))
+                    total_success += 1
+                logger.info(f"[视频号上传] ✓ 第 {batch_idx} 批服务器接受成功，标记 {len(records)} 个为已上传")
+            else:
+                # 本批不标记 uploaded；cos_url 已缓存,失败计数 +1,超阈值放弃,否则下轮重试(不重复下载)
+                for s in server_snaps:
+                    _bump_attempt(s, f"服务器: {server_err}")
+                logger.warning(f"[视频号上传] ✗ 第 {batch_idx} 批服务器POST失败，{len(records)} 个保留待下次重试")
+
+        logger.info(f"[视频号上传] ========== 上传完成：处理 {len(pending)} 个，成功 {total_success} 个，COS失败 {cos_fail_total} 个 ==========")
         _log_event({"event": "done", "processed": len(pending), "uploaded": total_success,
-                    "cos_fail": cos_fail_count})
+                    "cos_fail": cos_fail_total})
         return {"success": True, "processed": len(pending), "uploaded": total_success}
     finally:
         with _upload_lock:
             _upload_running = False
 
 def _batch_cos_upload(batch, cos_cfg):
-    """5个并发：下载+解密+COS上传，返回[((username,item), cos_url_or_None, error_or_None)]"""
+    """本批并发：下载+解密+COS上传，返回 [(snap, cos_url_or_None, error_or_None)]"""
     results = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(_download_and_cos, username, item, cos_cfg): (username, item) for username, item in batch}
+    with ThreadPoolExecutor(max_workers=UPLOAD_BATCH_SIZE) as executor:
+        futures = {executor.submit(_download_and_cos, snap, cos_cfg): snap for snap in batch}
         for future in as_completed(futures):
-            username, item = futures[future]
-            feed_id = item.get('id', 'unknown')
+            snap = futures[future]
+            feed_id = snap["feed_id"]
             try:
                 cos_url = future.result()
                 logger.info(f"[视频号上传] ✓ feedId={feed_id} COS上传成功: {cos_url}")
-                results.append(((username, item), cos_url, None))
+                results.append((snap, cos_url, None))
             except Exception as e:
                 logger.error(f"[视频号上传] ✗ feedId={feed_id} COS上传失败: {e}")
-                results.append(((username, item), None, str(e)))
+                results.append((snap, None, str(e)))
     return results
 
-def _download_and_cos(username, item, cos_cfg):
-    """下载CDN→解密→上传COS→返回公网URL"""
-    feed_id = item.get("id", "unknown")
+def _download_and_cos(snap, cos_cfg):
+    """下载CDN→解密(前128KB)→上传COS→返回公网URL。snap 为本地快照,可安全就地写 upload_size。"""
+    feed_id = snap["feed_id"]
 
-    if item.get("cos_url"):
-        logger.debug(f"[视频号上传] feedId={feed_id} 已有COS URL，跳过")
-        return item["cos_url"]
+    if snap.get("cos_url"):
+        logger.debug(f"[视频号上传] feedId={feed_id} 已有COS URL，跳过下载")
+        return snap["cos_url"]
 
-    video_url = item.get("video_url_h265") or item.get("video_url_h264") or item.get("video_url")
+    video_url = snap.get("video_url")
     if not video_url:
         raise ValueError("No video_url")
 
@@ -209,21 +263,23 @@ def _download_and_cos(username, item, cos_cfg):
     resp = requests.get(video_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=60)
     resp.raise_for_status()
     data = bytearray(resp.content)
-    item["upload_size"] = len(data)
+    snap["upload_size"] = len(data)
     logger.debug(f"[视频号上传] feedId={feed_id} 下载完成，大小: {len(data)} bytes")
 
-    decode_key = item.get("decode_key", "")
+    decode_key = snap.get("decode_key", "")
     if decode_key:
         try:
-            decrypt_channels_data(data, int(decode_key))
-            logger.debug(f"[视频号上传] feedId={feed_id} 解密完成")
+            key_val = int(decode_key)
+            if key_val > 0:  # 与本地下载一致:key<=0(未加密)不解密,避免 XOR 损坏前128KB
+                decrypt_channels_data(data, key_val)
+                logger.debug(f"[视频号上传] feedId={feed_id} 解密完成")
         except Exception as e:
             logger.warning(f"[视频号上传] feedId={feed_id} 解密失败: {e}")
 
     config = CosConfig(Region=cos_cfg["region"], SecretId=cos_cfg["secret_id"], SecretKey=cos_cfg["secret_key"])
     client = CosS3Client(config)
 
-    filename = f"{item.get('id', int(time.time()))}.mp4"
+    filename = f"{feed_id or int(time.time())}.mp4"
     key = cos_cfg["prefix"] + filename
 
     logger.debug(f"[视频号上传] feedId={feed_id} 开始上传到COS: {key}")

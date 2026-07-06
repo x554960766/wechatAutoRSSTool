@@ -509,7 +509,9 @@ class ChannelsAddon:
                     s = get_settings()
                     cfg = {
                         "enabled": bool(s.get("channels_auto_harvest_enabled", False)),
-                        "interval_hours": s.get("channels_harvest_interval_hours", 6),
+                        # 分钟制,下限 30;兼容旧版仅存 interval_hours 的配置
+                        "interval_minutes": int(s.get("channels_harvest_interval_minutes")
+                                                or s.get("channels_harvest_interval_hours", 6) * 60),
                         "window_start_hour": s.get("channels_harvest_window_start_hour", 8),
                         "window_end_hour": s.get("channels_harvest_window_end_hour", 24),
                         "max_per_author": s.get("channels_harvest_max_per_author", 30),
@@ -746,113 +748,123 @@ def save_synced_feeds(username, feeds):
         })
     save_json(CHANNELS_FAVORITES_FILE, favs)
     
-    # 2. Update/Merge Feeds DB
-    feeds_db = load_json(CHANNELS_FEEDS_FILE, {})
-    
-    # If there are old feeds saved under the nickname (placeholder), move/merge them
-    old_feeds = []
-    if nickname in feeds_db:
-        old_feeds = feeds_db.pop(nickname) # Extract and delete old key
-    if username in feeds_db and nickname != username:
-        pass
-        
-    if username not in feeds_db:
-        feeds_db[username] = []
-        
-    # Append old feeds if they are not already in the real list
-    for of in old_feeds:
-        of_id = of.get("id")
-        if not of_id:
-            continue
-        if not any(item.get("id") == of_id for item in feeds_db[username]):
-            feeds_db[username].append(of)
-        
-    for feed in feeds:
-        is_media = False
-        if feed.get("type") == "media":
-            is_media = True
-        elif feed.get("objectDesc", {}).get("mediaType") == 4:
-            is_media = True
-            
-        if not is_media:
-            continue # Sync videos only
-            
-        feed_id = feed.get("id")
-        if not feed_id:
-            continue
-            
-        # Try to parse as raw first, fallback to flat
-        object_desc = feed.get("objectDesc", {})
-        media_list = object_desc.get("media", [])
-        
-        description = object_desc.get("description") or feed.get("title") or feed.get("description") or ""
-        createtime = str(feed.get("createtime", 0))
-        
-        if media_list:
-            media = media_list[0]
-            video_url = media.get("url", "") + media.get("urlToken", "")
-            cover_url = media.get("coverUrl", "")
-            decode_key = media.get("decodeKey") or feed.get("key") or ""
-            spec_list = media.get("spec", [])
-        else:
-            # Flat structure fallback
-            video_url = feed.get("url", "")
-            cover_url = feed.get("cover_url", "")
-            decode_key = feed.get("key") or ""
-            spec_list = feed.get("spec", [])
-            
-        # Extract specs
-        video_url_h264 = ""
-        video_url_h265 = ""
-        if spec_list:
-            for s in spec_list:
-                ff = s.get("fileFormat")
-                if not ff:
-                    continue
-                url_with_flag = video_url + f"&X-snsvideoflag={ff}"
-                coding = s.get("codingFormat", 0)
-                if coding == 2:
-                    video_url_h265 = url_with_flag
-                elif coding == 1:
-                    video_url_h264 = url_with_flag
-                    
-            if not video_url_h265 and spec_list:
-                video_url_h265 = video_url + f"&X-snsvideoflag={spec_list[0].get('fileFormat')}"
-            if not video_url_h264 and len(spec_list) > 1:
-                video_url_h264 = video_url + f"&X-snsvideoflag={spec_list[1].get('fileFormat')}"
-        else:
-            video_url_h264 = video_url
-            video_url_h265 = video_url
-            
-        item = {
-            "id": feed_id,
-            "description": description,
-            "cover_url": cover_url,
-            "video_url": video_url,
-            "video_url_h264": video_url_h264,
-            "video_url_h265": video_url_h265,
-            "createtime": createtime,
-            "decode_key": decode_key,
-            # 上传服务器所需的统计字段（取自原始 feed），缺失则 0
-            "nickname": feed.get("contact", {}).get("nickname") or nickname,
-            "like_count": feed.get("likeCount", 0),
-            "comment_count": feed.get("commentCount", 0),
-            "forward_count": feed.get("forwardCount", 0),
-            "fav_count": feed.get("favCount", 0),
-        }
-        
-        found = False
-        for ex_item in feeds_db[username]:
-            if ex_item.get("id") == feed_id:
-                ex_item.update(item)
-                found = True
-                break
-        if not found:
-            # 仅本次新同步的作品标记待上传；历史积压（无此标志）不会被自动上传
-            item["needs_upload"] = True
-            feeds_db[username].append(item)
-            
-    save_json(CHANNELS_FEEDS_FILE, feeds_db)
+    # 2. Update/Merge Feeds DB（持 FEEDS_LOCK 定点合并，避免与自动上传流程并发读改写互相覆盖）
+    _merge_synced_feeds(username, nickname, feeds)
+
+
+def _merge_synced_feeds(username, nickname, feeds):
+    """把一批采集到的作品合并进 feeds_db。全程持 FEEDS_LOCK：与 process_pending_uploads
+    的定点写互斥，杜绝「后写覆盖先写」导致新作品丢失或 uploaded 标记被抹掉后重复上传。"""
+    from backend.config import load_json, save_json
+    from backend.channels import CHANNELS_FEEDS_FILE, FEEDS_LOCK
+
+    with FEEDS_LOCK:
+        feeds_db = load_json(CHANNELS_FEEDS_FILE, {})
+
+        # If there are old feeds saved under the nickname (placeholder), move/merge them
+        old_feeds = []
+        if nickname in feeds_db:
+            old_feeds = feeds_db.pop(nickname)  # Extract and delete old key
+        if username in feeds_db and nickname != username:
+            pass
+
+        if username not in feeds_db:
+            feeds_db[username] = []
+
+        # Append old feeds if they are not already in the real list
+        for of in old_feeds:
+            of_id = of.get("id")
+            if not of_id:
+                continue
+            if not any(item.get("id") == of_id for item in feeds_db[username]):
+                feeds_db[username].append(of)
+
+        for feed in feeds:
+            is_media = False
+            if feed.get("type") == "media":
+                is_media = True
+            elif feed.get("objectDesc", {}).get("mediaType") == 4:
+                is_media = True
+
+            if not is_media:
+                continue  # Sync videos only
+
+            feed_id = feed.get("id")
+            if not feed_id:
+                continue
+
+            # Try to parse as raw first, fallback to flat
+            object_desc = feed.get("objectDesc", {})
+            media_list = object_desc.get("media", [])
+
+            description = object_desc.get("description") or feed.get("title") or feed.get("description") or ""
+            createtime = str(feed.get("createtime", 0))
+
+            if media_list:
+                media = media_list[0]
+                video_url = media.get("url", "") + media.get("urlToken", "")
+                cover_url = media.get("coverUrl", "")
+                decode_key = media.get("decodeKey") or feed.get("key") or ""
+                spec_list = media.get("spec", [])
+            else:
+                # Flat structure fallback
+                video_url = feed.get("url", "")
+                cover_url = feed.get("cover_url", "")
+                decode_key = feed.get("key") or ""
+                spec_list = feed.get("spec", [])
+
+            # Extract specs
+            video_url_h264 = ""
+            video_url_h265 = ""
+            if spec_list:
+                for s in spec_list:
+                    ff = s.get("fileFormat")
+                    if not ff:
+                        continue
+                    url_with_flag = video_url + f"&X-snsvideoflag={ff}"
+                    coding = s.get("codingFormat", 0)
+                    if coding == 2:
+                        video_url_h265 = url_with_flag
+                    elif coding == 1:
+                        video_url_h264 = url_with_flag
+
+                if not video_url_h265 and spec_list:
+                    video_url_h265 = video_url + f"&X-snsvideoflag={spec_list[0].get('fileFormat')}"
+                if not video_url_h264 and len(spec_list) > 1:
+                    video_url_h264 = video_url + f"&X-snsvideoflag={spec_list[1].get('fileFormat')}"
+            else:
+                video_url_h264 = video_url
+                video_url_h265 = video_url
+
+            item = {
+                "id": feed_id,
+                "description": description,
+                "cover_url": cover_url,
+                "video_url": video_url,
+                "video_url_h264": video_url_h264,
+                "video_url_h265": video_url_h265,
+                "createtime": createtime,
+                "decode_key": decode_key,
+                # 上传服务器所需的统计字段（取自原始 feed），缺失则 0
+                "nickname": feed.get("contact", {}).get("nickname") or nickname,
+                "like_count": feed.get("likeCount", 0),
+                "comment_count": feed.get("commentCount", 0),
+                "forward_count": feed.get("forwardCount", 0),
+                "fav_count": feed.get("favCount", 0),
+            }
+
+            found = False
+            for ex_item in feeds_db[username]:
+                if ex_item.get("id") == feed_id:
+                    ex_item.update(item)
+                    found = True
+                    break
+            if not found:
+                # 仅本次新同步的作品标记待上传；历史积压（无此标志）不会被自动上传
+                item["needs_upload"] = True
+                feeds_db[username].append(item)
+
+        save_json(CHANNELS_FEEDS_FILE, feeds_db)
 
 
 # ── Custom Injected Script Content (注入 JS 模板) ───────────────
