@@ -1,6 +1,8 @@
 flask>=3.0
 flask-cors>=4.0
 requests>=2.31
+# CA 根证书:显式声明,保证打包时用最新证书链,避免 SSL CERTIFICATE_VERIFY_FAILED
+certifi>=2024.2.2
 curl_cffi>=0.7
 cryptography>=42.0
 playwright>=1.40
