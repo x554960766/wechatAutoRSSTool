@@ -44,31 +44,7 @@ def log_file() -> Path:
     return app_dir() / "wechat_mp_tools.log"
 
 
-def _configure_ca_bundle():
-    """将 HTTPS 校验用的 CA 根证书固定指向 certifi 打包进来的 cacert.pem。
-
-    打包后 requests/urllib3/httpx（及部分子进程）默认查找的证书路径可能失效或
-    不存在，导致在干净的目标电脑上出现:
-        SSL: CERTIFICATE_VERIFY_FAILED ... unable to get local issuer certificate
-    这里显式设置环境变量,让所有基于 openssl 的客户端都用同一份可用证书。
-    仅在文件真实存在、且用户未自行指定时设置,避免覆盖用户/代理的自定义配置。
-    """
-    try:
-        import certifi
-        ca_path = certifi.where()
-        if not os.path.exists(ca_path):
-            return
-        for var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
-            if not os.environ.get(var):
-                os.environ[var] = ca_path
-    except Exception:
-        # 证书兜底失败不应阻断启动;真正缺证书时请求层会自行报错
-        pass
-
-
 def configure_runtime():
-    _configure_ca_bundle()
-
     bundled_browsers = resource_dir() / "ms-playwright"
     if bundled_browsers.exists():
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(bundled_browsers)
@@ -87,6 +63,13 @@ def configure_runtime():
             if p not in paths and os.path.exists(p):
                 extra_paths.append(p)
                 
+    # Detect user-downloaded ffmpeg folder (created by one-click installer)
+    downloaded_ffmpeg_dir = app_dir() / "ffmpeg"
+    if downloaded_ffmpeg_dir.exists():
+        downloaded_path_str = str(downloaded_ffmpeg_dir.resolve())
+        if downloaded_path_str not in paths:
+            extra_paths.append(downloaded_path_str)
+
     # Detect bundled ffmpeg folder in subtitle_remover (if it exists)
     ffmpeg_base = Path(__file__).resolve().parent / "subtitle_remover" / "backend" / "ffmpeg"
     bundled_ffmpeg_dir = None

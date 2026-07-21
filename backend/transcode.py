@@ -51,9 +51,12 @@ def get_video_metadata(file_path: str) -> dict:
         file_path
     ]
     try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="ignore", timeout=10)
         if result.returncode != 0:
             return {"error": f"ffprobe 执行失败: {result.stderr}"}
+        
+        if not result.stdout or not result.stdout.strip():
+            return {"error": "ffprobe 未能解析出有效元数据 (输出为空)"}
         
         data = json.loads(result.stdout)
         format_info = data.get("format", {})
@@ -913,20 +916,21 @@ def open_parent():
         if not path.exists():
             return jsonify({"error": "文件不存在"}), 404
             
+        resolved_path = str(path.resolve())
         if path.is_file():
             if sys.platform == "darwin":
-                subprocess.run(["open", "-R", str(path)])
+                subprocess.run(["open", "-R", resolved_path])
             elif sys.platform == "win32":
-                subprocess.run(["explorer", f"/select,{path}"])
+                subprocess.run(f'explorer /select,"{resolved_path}"', shell=True)
             else:
-                subprocess.run(["xdg-open", str(path.parent)])
+                subprocess.run(["xdg-open", str(path.parent.resolve())])
         else:
             if sys.platform == "darwin":
-                subprocess.run(["open", str(path)])
+                subprocess.run(["open", resolved_path])
             elif sys.platform == "win32":
-                subprocess.run(["explorer", str(path)])
+                os.startfile(resolved_path)
             else:
-                subprocess.run(["xdg-open", str(path)])
+                subprocess.run(["xdg-open", resolved_path])
         return jsonify({"message": "已打开"})
     except Exception as e:
         return jsonify({"error": f"打开失败: {str(e)}"}), 500
@@ -991,6 +995,164 @@ def check_ffmpeg():
         "success": True,
         "available": has_ffmpeg and has_ffprobe
     })
+
+# ── FFmpeg 下载与安装状态 ────────────────────────────────────
+ffmpeg_download_status = {
+    "status": "idle",       # idle, downloading, unzipping, completed, failed
+    "progress": 0,          # 0 - 100
+    "error": None
+}
+ffmpeg_download_lock = threading.Lock()
+
+def download_ffmpeg_worker():
+    global ffmpeg_download_status
+    
+    import platform as plat_mod
+    
+    sys_platform = sys.platform
+    machine = plat_mod.machine().lower()  # arm64, x86_64, AMD64, etc.
+    
+    # Determine download URLs per platform + architecture
+    download_urls = None
+    
+    if sys_platform == "darwin":
+        if machine in ("arm64", "aarch64"):
+            # Apple Silicon: use martin-riedl.de native ARM64 builds
+            download_urls = {
+                "ffmpeg": "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/snapshot/ffmpeg.zip",
+                "ffprobe": "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/snapshot/ffprobe.zip",
+            }
+        else:
+            # Intel Mac: use ffbinaries
+            download_urls = {
+                "ffmpeg": "https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v4.4.1/ffmpeg-4.4.1-osx-64.zip",
+                "ffprobe": "https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v4.4.1/ffprobe-4.4.1-osx-64.zip",
+            }
+    elif sys_platform == "win32":
+        download_urls = {
+            "ffmpeg": "https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v4.4.1/ffmpeg-4.4.1-win-64.zip",
+            "ffprobe": "https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v4.4.1/ffprobe-4.4.1-win-64.zip",
+        }
+    elif "linux" in sys_platform:
+        download_urls = {
+            "ffmpeg": "https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v4.4.1/ffmpeg-4.4.1-linux-64.zip",
+            "ffprobe": "https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v4.4.1/ffprobe-4.4.1-linux-64.zip",
+        }
+        
+    if not download_urls:
+        with ffmpeg_download_lock:
+            ffmpeg_download_status = {"status": "failed", "progress": 0, "error": f"不支持的系统平台: {sys_platform} ({machine})"}
+        return
+
+    from backend.runtime import app_dir
+    dest_dir = app_dir() / "ffmpeg"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    
+    components = list(download_urls.keys())
+    
+    try:
+        import requests
+        import zipfile
+        import stat
+        
+        for idx, comp in enumerate(components):
+            download_url = download_urls[comp]
+            zip_path = app_dir() / f"{comp}_temp.zip"
+            
+            with ffmpeg_download_lock:
+                ffmpeg_download_status = {
+                    "status": "downloading",
+                    "progress": int((idx / len(components)) * 100),
+                    "error": None
+                }
+                
+            r = requests.get(download_url, stream=True, timeout=(15, 120), allow_redirects=True)
+            r.raise_for_status()
+            
+            total_size = int(r.headers.get('content-length', 0))
+            downloaded = 0
+            
+            with open(zip_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=128 * 1024):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total_size > 0:
+                            comp_percent = (downloaded / total_size) * 100
+                            overall_percent = int(((idx + (comp_percent / 100)) / len(components)) * 100)
+                            with ffmpeg_download_lock:
+                                ffmpeg_download_status["progress"] = overall_percent
+
+            with ffmpeg_download_lock:
+                ffmpeg_download_status = {
+                    "status": "unzipping",
+                    "progress": int(((idx + 0.9) / len(components)) * 100),
+                    "error": None
+                }
+                
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(dest_dir)
+                
+            if zip_path.exists():
+                zip_path.unlink()
+
+        # Set executable permissions (macOS / Linux)
+        for item in dest_dir.iterdir():
+            if item.is_file() and not item.name.endswith(".zip"):
+                try:
+                    st = os.stat(item)
+                    os.chmod(item, st.st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+                except Exception:
+                    pass
+        
+        # macOS: remove quarantine extended attribute to bypass Gatekeeper
+        if sys_platform == "darwin":
+            try:
+                import subprocess
+                subprocess.run(
+                    ["xattr", "-dr", "com.apple.quarantine", str(dest_dir)],
+                    capture_output=True, timeout=10
+                )
+            except Exception:
+                pass
+                    
+        # Update current process PATH
+        path_env = os.environ.get("PATH", "")
+        paths = path_env.split(os.pathsep) if path_env else []
+        dest_dir_str = str(dest_dir.resolve())
+        if dest_dir_str not in paths:
+            os.environ["PATH"] = os.pathsep.join([dest_dir_str] + paths)
+            
+        with ffmpeg_download_lock:
+            ffmpeg_download_status = {"status": "completed", "progress": 100, "error": None}
+            
+    except Exception as e:
+        for comp in components:
+            zip_path = app_dir() / f"{comp}_temp.zip"
+            if zip_path.exists():
+                try:
+                    zip_path.unlink()
+                except Exception:
+                    pass
+        with ffmpeg_download_lock:
+            ffmpeg_download_status = {"status": "failed", "progress": 0, "error": str(e)}
+
+@transcode_bp.route("/download-ffmpeg", methods=["POST"])
+def start_download_ffmpeg():
+    global ffmpeg_download_status
+    with ffmpeg_download_lock:
+        if ffmpeg_download_status["status"] in ("downloading", "unzipping"):
+            return jsonify({"success": True, "message": "正在下载中..."})
+        ffmpeg_download_status = {"status": "downloading", "progress": 0, "error": None}
+        
+    t = threading.Thread(target=download_ffmpeg_worker, daemon=True)
+    t.start()
+    return jsonify({"success": True, "message": "下载已启动"})
+
+@transcode_bp.route("/download-ffmpeg-status", methods=["GET"])
+def get_download_ffmpeg_status():
+    with ffmpeg_download_lock:
+        return jsonify(ffmpeg_download_status)
 
 # ── 垃圾清理 (临时上传文件) ───────────────────────────────────
 def cleanup_temp_uploads():

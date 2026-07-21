@@ -152,7 +152,7 @@ class KuaishouClient:
 
         # 加载用户设置中的 Cookie（登录后用于拉取用户主页列表）
         settings = get_settings()
-        cookie = str(settings.get("kuaishou_cookie") if settings.get("kuaishou_cookie") is not None else "").strip()
+        cookie = settings.get("kuaishou_cookie", "").strip()
         if cookie:
             self._load_cookie(cookie)
 
@@ -583,7 +583,7 @@ def _run_profile_download_task(user_id: str, max_pages: int, target_dir: Path):
 def download_single():
     """解析并下载单条快手作品（视频/图集）"""
     data = request.get_json() or {}
-    raw_url = str(data.get("url") if data.get("url") is not None else "").strip()
+    raw_url = data.get("url", "").strip()
 
     if not raw_url:
         return jsonify({"error": "请输入有效的链接"}), 400
@@ -623,7 +623,7 @@ def download_profile():
         return jsonify({"error": "当前已有正在运行的批量下载任务，请等待完成"}), 400
 
     data = request.get_json() or {}
-    profile_url = str(data.get("url") if data.get("url") is not None else "").strip()
+    profile_url = data.get("url", "").strip()
     max_pages = int(data.get("max_pages", 5))
 
     if not profile_url:
@@ -653,7 +653,7 @@ def download_profile():
 def user_feed():
     """获取用户主页作品列表（分页，不下载）"""
     data = request.get_json() or {}
-    profile_url = str(data.get("url") if data.get("url") is not None else "").strip()
+    profile_url = data.get("url", "").strip()
     pcursor = data.get("pcursor", "") or ""
 
     if not profile_url:
@@ -811,14 +811,14 @@ def open_parent():
             if sys.platform == "darwin":
                 subprocess.run(["open", "-R", str(path)])
             elif sys.platform == "win32":
-                subprocess.run(["explorer", f"/select,{path}"])
+                subprocess.run(f'explorer /select,"{path.resolve()}"', shell=True)
             else:
                 subprocess.run(["xdg-open", str(path.parent)])
         else:
             if sys.platform == "darwin":
                 subprocess.run(["open", str(path)])
             elif sys.platform == "win32":
-                subprocess.run(["explorer", str(path)])
+                subprocess.run(f'explorer "{path.resolve()}"', shell=True)
             else:
                 subprocess.run(["xdg-open", str(path)])
         return jsonify({"message": "已打开"})

@@ -32,6 +32,43 @@ UPLOAD_BATCH_SIZE = 5
 # 视频号 CDN URL 带时效 token,过期后每轮都白下载,必须有放弃阈值。
 MAX_UPLOAD_ATTEMPTS = 5
 
+# 缓存上一次成功获取的临时凭证,API 请求失败时用作兜底
+_last_cos_token: dict | None = None
+
+
+def _fetch_cos_token(token_api_url: str) -> dict:
+    """调用远程接口获取 COS 临时凭证(STS),失败时回退到上次缓存的凭证。
+
+    返回 dict 包含: secret_id, secret_key, token, region, bucket, prefix
+    """
+    global _last_cos_token
+
+    try:
+        logger.info(f"[视频号上传] 请求临时凭证: {token_api_url}")
+        resp = requests.get(token_api_url, timeout=10)
+        resp.raise_for_status()
+        body = resp.json()
+        logger.info(f"[视频号上传] 临时凭证接口响应: {json.dumps(body, ensure_ascii=False)[:500]}")
+        # 兼容接口格式: 直接返回 data 或嵌套在 data 字段中
+        data = body.get("data", body) if isinstance(body, dict) else body
+        token_info = {
+            "secret_id": data["tmpSecretId"],
+            "secret_key": data["tmpSecretKey"],
+            "token": data["sessionToken"],
+            "region": data["region"],
+            "bucket": data["bucket"],
+            "prefix": "channels/",
+        }
+        _last_cos_token = token_info
+        logger.info(f"[视频号上传] 获取临时凭证成功, region={token_info['region']}, bucket={token_info['bucket']}")
+        return token_info
+    except Exception as e:
+        logger.warning(f"[视频号上传] 获取临时凭证失败: {e}", exc_info=True)
+        if _last_cos_token:
+            logger.info("[视频号上传] 使用上次缓存的临时凭证")
+            return _last_cos_token
+        raise RuntimeError(f"获取COS临时凭证失败且无缓存可用: {e}") from e
+
 
 def _update_feed_item(username, feed_id, changes, pop_keys=()):
     """在 FEEDS_LOCK 内 load → 按 (username, feed_id) 定点改 → save。
@@ -97,17 +134,16 @@ def process_pending_uploads():
             logger.error("[视频号上传] 错误：未配置 channels_upload_url")
             return {"error": "channels_upload_url not configured"}
 
-        cos_cfg = {
-            "secret_id": str(settings.get("cos_secret_id") if settings.get("cos_secret_id") is not None else "").strip(),
-            "secret_key": str(settings.get("cos_secret_key") if settings.get("cos_secret_key") is not None else "").strip(),
-            "region": str(settings.get("cos_region") if settings.get("cos_region") is not None else "").strip(),
-            "bucket": str(settings.get("cos_bucket") if settings.get("cos_bucket") is not None else "").strip(),
-            "prefix": str(settings.get("cos_prefix") if settings.get("cos_prefix") is not None else "channels/").strip(),
-            "cds_domain": str(settings.get("cos_cds_domain") if settings.get("cos_cds_domain") is not None else "").strip(),
-        }
-        if not all([cos_cfg["secret_id"], cos_cfg["secret_key"], cos_cfg["region"], cos_cfg["bucket"]]):
-            logger.error("[视频号上传] 错误：COS凭证不完整")
-            return {"error": "COS credentials incomplete"}
+        token_api_url = (settings.get("cos_token_api_url") or "").strip()
+        if not token_api_url:
+            logger.error("[视频号上传] 错误：未配置 cos_token_api_url")
+            return {"error": "cos_token_api_url not configured"}
+
+        try:
+            cos_cfg = _fetch_cos_token(token_api_url)
+        except RuntimeError as e:
+            logger.error(f"[视频号上传] 错误：{e}")
+            return {"error": str(e)}
 
         device_id = str(settings.get("channels_device_id") if settings.get("channels_device_id") is not None else "视频号_caiji2").strip() or "视频号_caiji2"
         logger.info(f"[视频号上传] 配置加载完成 - 目标服务器: {server_url}, 设备ID: {device_id}, COS区域: {cos_cfg['region']}")
@@ -276,7 +312,14 @@ def _download_and_cos(snap, cos_cfg):
         except Exception as e:
             logger.warning(f"[视频号上传] feedId={feed_id} 解密失败: {e}")
 
-    config = CosConfig(Region=cos_cfg["region"], SecretId=cos_cfg["secret_id"], SecretKey=cos_cfg["secret_key"])
+    cos_config_kwargs = {
+        "Region": cos_cfg["region"],
+        "SecretId": cos_cfg["secret_id"],
+        "SecretKey": cos_cfg["secret_key"],
+    }
+    if cos_cfg.get("token"):
+        cos_config_kwargs["Token"] = cos_cfg["token"]
+    config = CosConfig(**cos_config_kwargs)
     client = CosS3Client(config)
 
     filename = f"{feed_id or int(time.time())}.mp4"
@@ -285,11 +328,7 @@ def _download_and_cos(snap, cos_cfg):
     logger.debug(f"[视频号上传] feedId={feed_id} 开始上传到COS: {key}")
     client.put_object(Bucket=cos_cfg["bucket"], Body=bytes(data), Key=key)
 
-    cds = cos_cfg.get("cds_domain")
-    if cds:
-        cos_url = cds.rstrip("/") + "/" + key
-    else:
-        cos_url = f"https://{cos_cfg['bucket']}.cos.{cos_cfg['region']}.myqcloud.com/{key}"
+    cos_url = f"https://{cos_cfg['bucket']}.cos.{cos_cfg['region']}.myqcloud.com/{key}"
 
     return cos_url
 

@@ -5,14 +5,12 @@
 
 import re
 import sys
-import json
 import time
 import random
 import subprocess
 import urllib.parse
 import requests
 import struct
-import threading
 from pathlib import Path
 from flask import Blueprint, jsonify, request
 
@@ -23,11 +21,6 @@ channels_bp = Blueprint("channels", __name__, url_prefix="/api/channels")
 CHANNELS_HISTORY_FILE = DATA_DIR / "channels_history.json"
 CHANNELS_FAVORITES_FILE = DATA_DIR / "channels_favorites.json"
 CHANNELS_FEEDS_FILE = DATA_DIR / "channels_parsed_feeds.json"
-
-# 保护 channels_parsed_feeds.json 的读-改-写。采集(save_synced_feeds)与自动上传
-# (process_pending_uploads)分属不同线程,各自 load→改→save 会后写覆盖先写,
-# 造成新作品丢失 / uploaded 标记被抹掉后重复上传。所有 feeds_db 写入须持此锁。
-FEEDS_LOCK = threading.RLock()
 
 
 class ISAAC64:
@@ -146,36 +139,17 @@ def decrypt_channels_data(data: bytearray, key: int, enc_len: int = 131072):
 
 
 
-def add_channels_history_item(title: str, item_type: str, file_path: str, size_bytes: int,
-                              feed_id: str = None, uploaded: bool = None, cos_url: str = None,
-                              upload_error: str = None):
-    """保存下载记录到视频号历史记录文件。
-
-    feed_id/uploaded/cos_url/upload_error 为自动上传流程专用：
-    传入 feed_id 时按其去重（重试成功后更新原条目而不是新增一条）。
-    """
+def add_channels_history_item(title: str, item_type: str, file_path: str, size_bytes: int):
+    """保存下载记录到视频号历史记录文件"""
     from backend.config import load_json, save_json
     history = load_json(CHANNELS_HISTORY_FILE, [])
-    entry = {
+    history.insert(0, {
         "title": title,
         "type": item_type,
         "path": str(file_path),
         "size": f"{size_bytes / (1024 * 1024):.2f} MB" if size_bytes else "未知",
         "time": time.strftime("%Y-%m-%d %H:%M:%S")
-    }
-    if feed_id is not None:
-        entry["feed_id"] = str(feed_id)
-        entry["uploaded"] = bool(uploaded)
-        if cos_url:
-            entry["cos_url"] = cos_url
-        if upload_error:
-            entry["upload_error"] = str(upload_error)[:200]
-        # 同一作品重试时更新旧条目，避免历史里堆积重复记录
-        for i, old in enumerate(history):
-            if old.get("feed_id") == entry["feed_id"]:
-                history.pop(i)
-                break
-    history.insert(0, entry)
+    })
     save_json(CHANNELS_HISTORY_FILE, history[:150])
 
 
@@ -510,8 +484,8 @@ def fetch_video_profile():
 
     # 获取系统配置，检测是否配置了本地解析凭证或私有 Worker
     settings = get_settings()
-    yuanbao_cookie = str(settings.get("yuanbao_cookie") if settings.get("yuanbao_cookie") is not None else "").strip()
-    custom_worker = str(settings.get("custom_channels_worker") if settings.get("custom_channels_worker") is not None else "").strip()
+    yuanbao_cookie = settings.get("yuanbao_cookie", "").strip()
+    custom_worker = settings.get("custom_channels_worker", "").strip()
 
     # ================= 模式 1: 100% 软件内部本地解析（如用户配置了元宝 Cookie） =================
     if yuanbao_cookie:
@@ -713,30 +687,6 @@ def get_history():
     return jsonify(history)
 
 
-@channels_bp.route("/upload-log", methods=["GET"])
-def get_upload_log():
-    """获取视频号自动上传日志（channels_upload_log.jsonl 最近 N 条，新→旧）"""
-    from backend.channels_upload import CHANNELS_UPLOAD_LOG_FILE
-    limit = request.args.get("limit", 100, type=int)
-    entries = []
-    try:
-        if CHANNELS_UPLOAD_LOG_FILE.exists():
-            with open(CHANNELS_UPLOAD_LOG_FILE, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-            for line in lines[-limit:]:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entries.append(json.loads(line))
-                except Exception:
-                    pass
-    except Exception as e:
-        return jsonify({"error": f"读取上传日志失败: {e}"}), 500
-    entries.reverse()
-    return jsonify(entries)
-
-
 @channels_bp.route("/history", methods=["DELETE"])
 def clear_history():
     """清除视频号下载历史记录"""
@@ -786,14 +736,14 @@ def open_parent():
             if sys.platform == "darwin":
                 subprocess.run(["open", "-R", str(path)])
             elif sys.platform == "win32":
-                subprocess.run(["explorer", f"/select,{path}"])
+                subprocess.run(f'explorer /select,"{path.resolve()}"', shell=True)
             else:
                 subprocess.run(["xdg-open", str(path.parent)])
         else:
             if sys.platform == "darwin":
                 subprocess.run(["open", str(path)])
             elif sys.platform == "win32":
-                subprocess.run(["explorer", str(path)])
+                subprocess.run(f'explorer "{path.resolve()}"', shell=True)
             else:
                 subprocess.run(["xdg-open", str(path)])
         return jsonify({"message": "已打开"})
@@ -1222,35 +1172,8 @@ def cancel_async_download(task_id):
         task = _download_tasks.get(task_id)
         if not task:
             return jsonify({"error": "未找到指定的下载任务"}), 404
-
+        
         task["cancel_event"].set()
         task["status"] = "cancelled"
         return jsonify({"success": True, "message": "下载已请求取消"})
-
-
-@channels_bp.route("/process-uploads", methods=["POST"])
-def process_uploads():
-    """处理待上传作品：下载→COS→服务器"""
-    from backend.channels_upload import process_pending_uploads
-    from backend.config import load_json
-
-    feeds_db = load_json(CHANNELS_FEEDS_FILE, {})
-    # 与 process_pending_uploads 的筛选条件保持一致：仅统计本次新同步、待上传的作品，
-    # 排除历史积压（无 needs_upload 标志）的旧作品，避免返回给前端的数量虚高。
-    pending_count = sum(
-        1
-        for items in feeds_db.values()
-        for item in items
-        if item.get("needs_upload") and not item.get("uploaded")
-        and not item.get("upload_failed") and item.get("video_url")
-    )
-
-    def bg_task():
-        try:
-            process_pending_uploads()
-        except Exception as e:
-            print(f"Upload process error: {e}")
-
-    threading.Thread(target=bg_task, daemon=True).start()
-    return jsonify({"started": True, "pending_count": pending_count})
 

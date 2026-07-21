@@ -285,7 +285,7 @@ def start_range_download():
     account_name = data.get("account_name", "unknown")
     start_time = data.get("start_time", 0)
     end_time = data.get("end_time", 0)
-    keyword = str(data.get("keyword") if data.get("keyword") is not None else "").strip()
+    keyword = data.get("keyword", "").strip()
     page_size = int(data.get("page_size", 10) or 10)
 
     if not fakeid:
@@ -884,7 +884,7 @@ def open_folder():
     import sys
     
     data = request.get_json() or {}
-    account = str(data.get("account") if data.get("account") is not None else "").strip()
+    account = data.get("account", "").strip()
     
     settings = get_settings()
     download_dir_str = settings.get("download_dir") or str(OUTPUT_DIR)
@@ -895,12 +895,13 @@ def open_folder():
     
     try:
         path.mkdir(parents=True, exist_ok=True)
+        resolved_path = str(path.resolve())
         if sys.platform == "darwin":
-            subprocess.run(["open", str(path)])
+            subprocess.run(["open", resolved_path])
         elif sys.platform == "win32":
-            subprocess.run(["explorer", str(path)])
+            os.startfile(resolved_path)
         else:
-            subprocess.run(["xdg-open", str(path)])
+            subprocess.run(["xdg-open", resolved_path])
         return jsonify({"message": "文件夹已打开"})
     except Exception as e:
         return jsonify({"error": f"打开文件夹失败: {str(e)}"}), 500
@@ -922,12 +923,13 @@ def open_file():
         if not path.exists():
             return jsonify({"error": "文件或文件夹不存在"}), 404
 
+        resolved_path = str(path.resolve())
         if sys.platform == "darwin":
-            subprocess.run(["open", str(path)])
+            subprocess.run(["open", resolved_path])
         elif sys.platform == "win32":
-            subprocess.run(["explorer", str(path)])
+            os.startfile(resolved_path)
         else:
-            subprocess.run(["xdg-open", str(path)])
+            subprocess.run(["xdg-open", resolved_path])
         return jsonify({"message": "已打开"})
     except Exception as e:
         return jsonify({"error": f"打开失败: {str(e)}"}), 500
@@ -949,20 +951,21 @@ def open_parent():
         if not path.exists():
             return jsonify({"error": "文件或文件夹不存在"}), 404
             
+        resolved_path = str(path.resolve())
         if path.is_file():
             if sys.platform == "darwin":
-                subprocess.run(["open", "-R", str(path)])
+                subprocess.run(["open", "-R", resolved_path])
             elif sys.platform == "win32":
-                subprocess.run(["explorer", f"/select,{path}"])
+                subprocess.run(f'explorer /select,"{resolved_path}"', shell=True)
             else:
-                subprocess.run(["xdg-open", str(path.parent)])
+                subprocess.run(["xdg-open", str(path.parent.resolve())])
         else:
             if sys.platform == "darwin":
-                subprocess.run(["open", str(path)])
+                subprocess.run(["open", resolved_path])
             elif sys.platform == "win32":
-                subprocess.run(["explorer", str(path)])
+                os.startfile(resolved_path)
             else:
-                subprocess.run(["xdg-open", str(path)])
+                subprocess.run(["xdg-open", resolved_path])
         return jsonify({"message": "已打开"})
     except Exception as e:
         return jsonify({"error": f"打开失败: {str(e)}"}), 500

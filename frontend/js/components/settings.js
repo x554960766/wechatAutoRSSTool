@@ -107,93 +107,32 @@ const SettingsPage = {
                     </div>
                 </div>
 
-                <!-- 视频号自动采集配置 -->
+                <!-- B站下载配置 -->
                 <div class="card">
                     <div class="card-header">
-                        <h3 class="card-title">⏰ 视频号自动采集</h3>
+                        <h3 class="card-title">📺 Bilibili 下载配置</h3>
                     </div>
                     <div class="card-body" style="padding: 0 var(--spacing-md) var(--spacing-md);">
                         <div class="form-group" style="margin-top: var(--spacing-md);">
-                            <label class="form-checkbox-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
-                                <input type="checkbox" id="setting-channels-auto-harvest" style="width: 18px; height: 18px; accent-color: var(--primary);" />
-                                <span>启用定时自动采集全部关注</span>
-                            </label>
-                            <div class="form-hint">需在微信里保持视频号页面（首页或主页）开着，注入脚本才会按时自动采集。</div>
+                            <label class="form-label" for="setting-bili-quality">默认视频分辨率</label>
+                            <select class="form-input" id="setting-bili-quality">
+                                <option value="vip">1080P 高码率 / 4K (需要登录大会员账号)</option>
+                                <option value="1080p">1080P 普通 (需要登录普通账号)</option>
+                                <option value="720p">720P 高清 (未登录默认)</option>
+                                <option value="360p">360P 标清 (省流/防卡顿)</option>
+                            </select>
+                            <div class="form-hint">未登录状态下，即便选择 1080P/4K，B站 接口也会降级返回 720P。</div>
                         </div>
-                        <div style="display: flex; gap: 16px;">
-                            <div class="form-group" style="flex: 1;">
-                                <label class="form-label" for="setting-channels-harvest-interval">采集间隔</label>
-                                <select class="form-input" id="setting-channels-harvest-interval">
-                                    <option value="30">每 30 分钟</option>
-                                    <option value="60">每 1 小时</option>
-                                    <option value="120">每 2 小时</option>
-                                    <option value="240">每 4 小时</option>
-                                    <option value="360">每 6 小时</option>
-                                    <option value="720">每 12 小时</option>
-                                </select>
-                                <div class="form-hint">实际触发时刻会在此间隔上随机抖动，避免每天固定钟点。</div>
-                            </div>
-                            <div class="form-group" style="flex: 1;">
-                                <label class="form-label" for="setting-channels-harvest-max">单作者上限（条/次）</label>
-                                <input type="number" class="form-input" id="setting-channels-harvest-max" min="0" step="1" placeholder="30" />
-                                <div class="form-hint">每个作者单次最多采集并上传多少条；0 = 不限。上传数据与采集一致。</div>
-                            </div>
-                        </div>
-                        <div style="display: flex; gap: 16px;">
-                            <div class="form-group" style="flex: 1;">
-                                <label class="form-label" for="setting-channels-harvest-start">允许开始时间</label>
-                                <select class="form-input" id="setting-channels-harvest-start">
-                                    ${startOptions}
-                                </select>
-                            </div>
-                            <div class="form-group" style="flex: 1;">
-                                <label class="form-label" for="setting-channels-harvest-end">允许结束时间</label>
-                                <select class="form-input" id="setting-channels-harvest-end">
-                                    ${endOptions}
-                                </select>
-                            </div>
-                        </div>
-                        <div class="form-hint">仅在设置的时间范围内才会触发自动采集，24 点表示当天结束。</div>
-                    </div>
-                </div>
 
-                <!-- 视频号上传服务器配置 -->
-                <div class="card">
-                    <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
-                        <h3 class="card-title">☁️ 视频号上传服务器配置</h3>
-                        <button class="btn btn-secondary btn-sm" onclick="SettingsPage.showChannelsUploadLog()" style="padding: 4px 12px; font-size: 0.82rem;">📋 查看上传日志</button>
-                    </div>
-                    <div class="card-body" style="padding: 0 var(--spacing-md) var(--spacing-md);">
-                        <div class="form-group" style="margin-top: var(--spacing-md);">
+                        <div class="form-group" style="display: flex; gap: 24px; margin-top: var(--spacing-md);">
                             <label class="form-checkbox-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
-                                <input type="checkbox" id="setting-channels-upload-enabled" style="width: 18px; height: 18px; accent-color: var(--primary);" />
-                                <span>启用自动上传到服务器</span>
+                                <input type="checkbox" id="setting-bili-danmaku" style="width: 18px; height: 18px; accent-color: var(--primary);" />
+                                <span>下载弹幕并转为 ASS 轴</span>
                             </label>
-                            <div class="form-hint">每次采集完成后，自动将新作品下载→上传腾讯云COS→推送到服务器。</div>
-                        </div>
-                        <div style="display: flex; gap: 12px;">
-                            <div class="form-group" style="flex: 2;">
-                                <label class="form-label" for="setting-channels-upload-url">服务器接收地址</label>
-                                <input type="text" class="form-input" id="setting-channels-upload-url" placeholder="https://your-server.com/api/data/submitVideos" />
-                            </div>
-                            <div class="form-group" style="flex: 1;">
-                                <label class="form-label" for="setting-channels-device-id">设备 ID (deviceId)</label>
-                                <input type="text" class="form-input" id="setting-channels-device-id" placeholder="视频号_caiji2" />
-                            </div>
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">腾讯云 COS 配置</label>
-                            <div style="display: grid; gap: 12px;">
-                                <input type="text" class="form-input" id="setting-cos-secret-id" placeholder="SecretId" />
-                                <input type="password" class="form-input" id="setting-cos-secret-key" placeholder="SecretKey" />
-                                <div style="display: flex; gap: 12px;">
-                                    <input type="text" class="form-input" id="setting-cos-region" placeholder="Region (如 ap-guangzhou)" style="flex: 1;" />
-                                    <input type="text" class="form-input" id="setting-cos-bucket" placeholder="Bucket (如 my-bucket-1234567890)" style="flex: 1;" />
-                                </div>
-                                <input type="text" class="form-input" id="setting-cos-cds-domain" placeholder="访问域名 (如 https://bucket.cos.ap-guangzhou.myqcloud.com/)" />
-                                <input type="text" class="form-input" id="setting-cos-prefix" placeholder="前缀路径 (如 channels/)" />
-                            </div>
-                            <div class="form-hint">视频先上传到COS获取公网地址（访问域名 + 前缀 + feedId.mp4），再将地址推送给服务器。</div>
+                            <label class="form-checkbox-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
+                                <input type="checkbox" id="setting-bili-subtitle" style="width: 18px; height: 18px; accent-color: var(--primary);" />
+                                <span>下载内置字幕并转为 SRT</span>
+                            </label>
                         </div>
                     </div>
                 </div>
@@ -210,10 +149,10 @@ const SettingsPage = {
                                 <label class="form-label" for="setting-rss-start-hour">开始时间</label>
                                 <div style="display: flex; gap: 8px;">
                                     <select class="form-input" id="setting-rss-start-hour" style="min-width: 0;">
-                                        ${startOptions}
+                                        \${startOptions}
                                     </select>
                                     <select class="form-input" id="setting-rss-start-minute" style="min-width: 0;">
-                                        ${minuteOptions}
+                                        \${minuteOptions}
                                     </select>
                                 </div>
                                 <div class="form-hint">自动采集开始时间，支持分钟</div>
@@ -222,10 +161,10 @@ const SettingsPage = {
                                 <label class="form-label" for="setting-rss-end-hour">结束时间</label>
                                 <div style="display: flex; gap: 8px;">
                                     <select class="form-input" id="setting-rss-end-hour" style="min-width: 0;" onchange="SettingsPage.syncRssEndMinute()">
-                                        ${endOptions}
+                                        \${endOptions}
                                     </select>
                                     <select class="form-input" id="setting-rss-end-minute" style="min-width: 0;">
-                                        ${minuteOptions}
+                                        \${minuteOptions}
                                     </select>
                                 </div>
                                 <div class="form-hint">自动采集结束时间，24 点仅支持 00 分</div>
@@ -317,6 +256,10 @@ const SettingsPage = {
         const rssEndMinute = document.getElementById('setting-rss-end-minute');
         const rssUploadEnabled = document.getElementById('setting-rss-upload-enabled');
         const rssUploadUrl = document.getElementById('setting-rss-upload-url');
+        
+        const biliQuality = document.getElementById('setting-bili-quality');
+        const biliDanmaku = document.getElementById('setting-bili-danmaku');
+        const biliSubtitle = document.getElementById('setting-bili-subtitle');
 
         if (dirInput) dirInput.value = data.download_dir || '';
         if (concurrentInput) concurrentInput.value = data.concurrent_downloads || 1;
@@ -335,37 +278,10 @@ const SettingsPage = {
         if (rssEndMinute) rssEndMinute.value = data.rss_end_minute !== undefined ? data.rss_end_minute : 0;
         if (rssUploadEnabled) rssUploadEnabled.checked = data.rss_upload_enabled !== undefined ? !!data.rss_upload_enabled : false;
         if (rssUploadUrl) rssUploadUrl.value = data.rss_upload_url || '';
-
-        const chAutoHarvest = document.getElementById('setting-channels-auto-harvest');
-        const chHarvestInterval = document.getElementById('setting-channels-harvest-interval');
-        const chHarvestStart = document.getElementById('setting-channels-harvest-start');
-        const chHarvestEnd = document.getElementById('setting-channels-harvest-end');
-        if (chAutoHarvest) chAutoHarvest.checked = !!data.channels_auto_harvest_enabled;
-        if (chHarvestInterval) chHarvestInterval.value = data.channels_harvest_interval_minutes !== undefined ? data.channels_harvest_interval_minutes : (data.channels_harvest_interval_hours !== undefined ? data.channels_harvest_interval_hours * 60 : 360);
-        if (chHarvestStart) chHarvestStart.value = data.channels_harvest_window_start_hour !== undefined ? data.channels_harvest_window_start_hour : 8;
-        if (chHarvestEnd) chHarvestEnd.value = data.channels_harvest_window_end_hour !== undefined ? data.channels_harvest_window_end_hour : 24;
-        const chHarvestMax = document.getElementById('setting-channels-harvest-max');
-        if (chHarvestMax) chHarvestMax.value = data.channels_harvest_max_per_author !== undefined ? data.channels_harvest_max_per_author : 30;
-
-        const chUploadEnabled = document.getElementById('setting-channels-upload-enabled');
-        const chUploadUrl = document.getElementById('setting-channels-upload-url');
-        const cosSecretId = document.getElementById('setting-cos-secret-id');
-        const cosSecretKey = document.getElementById('setting-cos-secret-key');
-        const cosRegion = document.getElementById('setting-cos-region');
-        const cosBucket = document.getElementById('setting-cos-bucket');
-        const cosPrefix = document.getElementById('setting-cos-prefix');
-        const cosCdsDomain = document.getElementById('setting-cos-cds-domain');
-        const chDeviceId = document.getElementById('setting-channels-device-id');
-        if (chUploadEnabled) chUploadEnabled.checked = !!data.channels_upload_enabled;
-        if (chUploadUrl) chUploadUrl.value = data.channels_upload_url || '';
-        if (cosSecretId) cosSecretId.value = data.cos_secret_id || '';
-        if (cosSecretKey) cosSecretKey.value = data.cos_secret_key || '';
-        if (cosRegion) cosRegion.value = data.cos_region || '';
-        if (cosBucket) cosBucket.value = data.cos_bucket || '';
-        if (cosPrefix) cosPrefix.value = data.cos_prefix !== undefined ? data.cos_prefix : 'channels/';
-        if (cosCdsDomain) cosCdsDomain.value = data.cos_cds_domain || '';
-        if (chDeviceId) chDeviceId.value = data.channels_device_id || '视频号_caiji2';
-
+        
+        if (biliQuality) biliQuality.value = data.bili_video_quality || '1080p';
+        if (biliDanmaku) biliDanmaku.checked = data.bili_download_danmaku !== undefined ? !!data.bili_download_danmaku : true;
+        if (biliSubtitle) biliSubtitle.checked = data.bili_download_subtitle !== undefined ? !!data.bili_download_subtitle : true;
         this.toggleRssUpload();
         this.syncRssEndMinute();
     },
@@ -411,6 +327,10 @@ const SettingsPage = {
         const rssEndMinute = document.getElementById('setting-rss-end-minute');
         const rssUploadEnabled = document.getElementById('setting-rss-upload-enabled');
         const rssUploadUrl = document.getElementById('setting-rss-upload-url');
+        
+        const biliQuality = document.getElementById('setting-bili-quality');
+        const biliDanmaku = document.getElementById('setting-bili-danmaku');
+        const biliSubtitle = document.getElementById('setting-bili-subtitle');
 
         const request_delay = parseFloat(delayInput.value);
         if (isNaN(request_delay) || request_delay < 0.1) {
@@ -436,20 +356,9 @@ const SettingsPage = {
             rss_end_minute: rssEndMinute && !rssEndMinute.disabled ? parseInt(rssEndMinute.value) : 0,
             rss_upload_enabled: rssUploadEnabled ? rssUploadEnabled.checked : false,
             rss_upload_url: rssUploadUrl ? rssUploadUrl.value.trim() : '',
-            channels_auto_harvest_enabled: (() => { const el = document.getElementById('setting-channels-auto-harvest'); return el ? el.checked : false; })(),
-            channels_harvest_interval_minutes: (() => { const el = document.getElementById('setting-channels-harvest-interval'); const v = el ? parseInt(el.value) : 360; return (isNaN(v) || v < 30) ? 30 : v; })(),
-            channels_harvest_window_start_hour: (() => { const el = document.getElementById('setting-channels-harvest-start'); return el ? parseInt(el.value) : 8; })(),
-            channels_harvest_window_end_hour: (() => { const el = document.getElementById('setting-channels-harvest-end'); return el ? parseInt(el.value) : 24; })(),
-            channels_harvest_max_per_author: (() => { const el = document.getElementById('setting-channels-harvest-max'); const v = el ? parseInt(el.value) : 30; return (isNaN(v) || v < 0) ? 30 : v; })(),
-            channels_upload_enabled: (() => { const el = document.getElementById('setting-channels-upload-enabled'); return el ? el.checked : false; })(),
-            channels_upload_url: (() => { const el = document.getElementById('setting-channels-upload-url'); return el ? el.value.trim() : ''; })(),
-            cos_secret_id: (() => { const el = document.getElementById('setting-cos-secret-id'); return el ? el.value.trim() : ''; })(),
-            cos_secret_key: (() => { const el = document.getElementById('setting-cos-secret-key'); return el ? el.value.trim() : ''; })(),
-            cos_region: (() => { const el = document.getElementById('setting-cos-region'); return el ? el.value.trim() : ''; })(),
-            cos_bucket: (() => { const el = document.getElementById('setting-cos-bucket'); return el ? el.value.trim() : ''; })(),
-            cos_prefix: (() => { const el = document.getElementById('setting-cos-prefix'); return el ? el.value.trim() : 'channels/'; })(),
-            cos_cds_domain: (() => { const el = document.getElementById('setting-cos-cds-domain'); return el ? el.value.trim() : ''; })(),
-            channels_device_id: (() => { const el = document.getElementById('setting-channels-device-id'); return el ? (el.value.trim() || '视频号_caiji2') : '视频号_caiji2'; })(),
+            bili_video_quality: biliQuality ? biliQuality.value : '1080p',
+            bili_download_danmaku: biliDanmaku ? biliDanmaku.checked : true,
+            bili_download_subtitle: biliSubtitle ? biliSubtitle.checked : true,
         };
 
         try {
@@ -462,54 +371,6 @@ const SettingsPage = {
     },
 
 
-
-    async showChannelsUploadLog() {
-        Modal.open({
-            title: '📋 视频号上传日志',
-            content: `<div id="channels-upload-log-body" style="max-height: 60vh; overflow-y: auto; font-size: 0.85rem;">
-                <div style="color: var(--text-muted); text-align: center; padding: 20px;">加载中...</div>
-            </div>`,
-            footer: '<button class="btn btn-secondary" onclick="Modal.close()" style="width: 100%;">关闭</button>'
-        });
-
-        const body = document.getElementById('channels-upload-log-body');
-        try {
-            const log = await API.channels.getUploadLog(200);
-            if (!log || log.length === 0) {
-                body.innerHTML = '<div style="color: var(--text-muted); text-align: center; padding: 20px;">暂无上传日志</div>';
-                return;
-            }
-            const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
-            body.innerHTML = log.map(r => {
-                const t = r.ts ? new Date(r.ts).toLocaleString('zh-CN', { hour12: false }) : '';
-                let line = '';
-                if (r.event === 'start') {
-                    line = `<span style="color: var(--text-primary); font-weight: 600;">▶ 开始上传流程</span>，待上传 ${r.pending} 个`;
-                } else if (r.event === 'item') {
-                    line = r.cos_ok
-                        ? `<span style="color: var(--primary);">✓ COS成功</span> ${esc(r.title || r.feedId)}<br><a href="${esc(r.cos_url)}" target="_blank" style="font-size: 0.78rem; color: var(--text-muted); word-break: break-all;">${esc(r.cos_url)}</a>`
-                        : `<span style="color: var(--error);">✗ COS失败</span> ${esc(r.title || r.feedId)}<br><span style="font-size: 0.78rem; color: var(--error); word-break: break-all;">原因: ${esc(r.error || '未知')}（将随下批采集重试）</span>`;
-                } else if (r.event === 'server_post') {
-                    const batchTag = r.total_batches ? `[第${r.batch}/${r.total_batches}批] ` : '';
-                    if (r.ok === true) line = `<span style="color: var(--primary); font-weight: 600;">✓ ${batchTag}服务器接收成功</span>，${r.records} 条`;
-                    else if (r.ok === false) line = `<span style="color: var(--error); font-weight: 600;">✗ ${batchTag}服务器POST失败</span>（${r.records} 条待下次重试）<br><span style="font-size: 0.78rem; color: var(--error);">原因: ${esc(r.error || '未知')}</span>`;
-                    else line = `<span style="color: var(--text-muted);">— 无COS成功视频，跳过服务器上传</span>`;
-                } else if (r.event === 'done') {
-                    line = `<span style="color: var(--text-primary); font-weight: 600;">■ 流程结束</span>：处理 ${r.processed} 个，成功 ${r.uploaded} 个${r.cos_fail ? `，COS失败 ${r.cos_fail} 个` : ''}`;
-                } else if (r.event === 'batch') {
-                    // 旧版日志格式兼容
-                    line = `第 ${r.idx}/${r.total_batches} 批：COS成功 ${r.cos_ok} 个，服务器 ${r.server_ok === true ? '✓成功' : r.server_ok === false ? '✗失败' : '未提交'}`;
-                } else {
-                    line = esc(JSON.stringify(r));
-                }
-                return `<div style="padding: 8px 4px; border-bottom: 1px solid var(--border-color); line-height: 1.5;">
-                    <span style="color: var(--text-muted); font-size: 0.75rem; display: block;">${t}</span>${line}
-                </div>`;
-            }).join('');
-        } catch (err) {
-            body.innerHTML = `<div style="color: var(--error); text-align: center; padding: 20px;">加载日志失败: ${err.message}</div>`;
-        }
-    },
 
     async resetDefaults() {
         Modal.confirm('恢复默认设置', '确定要将所有配置项恢复为系统默认吗？', async () => {
@@ -529,20 +390,9 @@ const SettingsPage = {
                 rss_end_minute: 0,
                 rss_upload_enabled: false,
                 rss_upload_url: '',
-                channels_auto_harvest_enabled: false,
-                channels_harvest_interval_minutes: 360,
-                channels_harvest_window_start_hour: 8,
-                channels_harvest_window_end_hour: 24,
-                channels_harvest_max_per_author: 30,
-                channels_upload_enabled: false,
-                channels_upload_url: '',
-                cos_secret_id: '',
-                cos_secret_key: '',
-                cos_region: '',
-                cos_bucket: '',
-                cos_prefix: 'channels/',
-                cos_cds_domain: '',
-                channels_device_id: '视频号_caiji2',
+                bili_video_quality: '1080p',
+                bili_download_danmaku: true,
+                bili_download_subtitle: true,
             };
             try {
                 await API.settings.save(defaults);

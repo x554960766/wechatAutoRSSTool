@@ -165,7 +165,7 @@ class DouyinClient:
         
         # 加载用户设置中的 Cookie
         settings = get_settings()
-        cookie = str(settings.get("douyin_cookie") if settings.get("douyin_cookie") is not None else "").strip()
+        cookie = settings.get("douyin_cookie", "").strip()
         
         headers = self._get_common_headers()
         if cookie:
@@ -1634,7 +1634,7 @@ def _run_batch_items_download_task(items: list, target_dir: Path, source_name: s
 def download_single():
     """解析并下载单条抖音视频/图文"""
     data = request.get_json() or {}
-    raw_url = str(data.get("url") if data.get("url") is not None else "").strip()
+    raw_url = data.get("url", "").strip()
 
     if not raw_url:
         return jsonify({"error": "请输入有效的链接"}), 400
@@ -1725,7 +1725,7 @@ def download_single():
 def detect_url():
     """检测并解析抖音链接类型"""
     data = request.get_json() or {}
-    raw_url = str(data.get("url") if data.get("url") is not None else "").strip()
+    raw_url = data.get("url", "").strip()
 
     if not raw_url:
         return jsonify({"error": "请输入有效的链接"}), 400
@@ -1843,7 +1843,7 @@ def download_user():
         return jsonify({"error": "当前已有正在运行的批量下载任务，请等待完成"}), 400
 
     data = request.get_json() or {}
-    sec_uid = str(data.get("sec_uid") if data.get("sec_uid") is not None else "").strip()
+    sec_uid = data.get("sec_uid", "").strip()
     types = data.get("types", []) # ["post", "like", "mix"]
     max_pages = int(data.get("max_pages", 10))
 
@@ -1879,7 +1879,7 @@ def download_profile():
         return jsonify({"error": "当前已有正在运行的批量下载任务，请等待完成"}), 400
 
     data = request.get_json() or {}
-    profile_url = str(data.get("url") if data.get("url") is not None else "").strip()
+    profile_url = data.get("url", "").strip()
     max_pages = int(data.get("scroll_depth", 10))
 
     if not profile_url:
@@ -1920,7 +1920,7 @@ def download_liked():
         return jsonify({"error": "当前已有正在运行的批量下载任务，请等待完成"}), 400
 
     data = request.get_json() or {}
-    sec_uid = str(data.get("sec_uid") if data.get("sec_uid") is not None else "").strip()
+    sec_uid = data.get("sec_uid", "").strip()
     max_pages = int(data.get("max_pages", 10))
 
     ensure_douyin_dirs()
@@ -2296,14 +2296,14 @@ def open_parent():
             if sys.platform == "darwin":
                 subprocess.run(["open", "-R", str(path)])
             elif sys.platform == "win32":
-                subprocess.run(["explorer", f"/select,{path}"])
+                subprocess.run(f'explorer /select,"{path.resolve()}"', shell=True)
             else:
                 subprocess.run(["xdg-open", str(path.parent)])
         else:
             if sys.platform == "darwin":
                 subprocess.run(["open", str(path)])
             elif sys.platform == "win32":
-                subprocess.run(["explorer", str(path)])
+                subprocess.run(f'explorer "{path.resolve()}"', shell=True)
             else:
                 subprocess.run(["xdg-open", str(path)])
         return jsonify({"message": "已打开"})
