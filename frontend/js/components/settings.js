@@ -149,10 +149,10 @@ const SettingsPage = {
                                 <label class="form-label" for="setting-rss-start-hour">开始时间</label>
                                 <div style="display: flex; gap: 8px;">
                                     <select class="form-input" id="setting-rss-start-hour" style="min-width: 0;">
-                                        \${startOptions}
+                                        ${startOptions}
                                     </select>
                                     <select class="form-input" id="setting-rss-start-minute" style="min-width: 0;">
-                                        \${minuteOptions}
+                                        ${minuteOptions}
                                     </select>
                                 </div>
                                 <div class="form-hint">自动采集开始时间，支持分钟</div>
@@ -161,10 +161,10 @@ const SettingsPage = {
                                 <label class="form-label" for="setting-rss-end-hour">结束时间</label>
                                 <div style="display: flex; gap: 8px;">
                                     <select class="form-input" id="setting-rss-end-hour" style="min-width: 0;" onchange="SettingsPage.syncRssEndMinute()">
-                                        \${endOptions}
+                                        ${endOptions}
                                     </select>
                                     <select class="form-input" id="setting-rss-end-minute" style="min-width: 0;">
-                                        \${minuteOptions}
+                                        ${minuteOptions}
                                     </select>
                                 </div>
                                 <div class="form-hint">自动采集结束时间，24 点仅支持 00 分</div>

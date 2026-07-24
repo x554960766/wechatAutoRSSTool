@@ -37,17 +37,6 @@ try:
 except Exception as _e:
     print(f"[spec] mitmproxy collect_all failed: {_e}")
 
-# ── certifi：requests/urllib3/httpx 校验 HTTPS 服务器证书所依赖的 CA 根证书
-#    (cacert.pem)。若不显式收集,打包后 certifi.where() 会指向解压目录里不存在
-#    的路径,导致在干净的目标电脑上出现:
-#      SSL: CERTIFICATE_VERIFY_FAILED ... unable to get local issuer certificate
-#    这是公众号采集在别人电脑上报 SSL 错误的根因,必须打包进去 ──
-try:
-    from PyInstaller.utils.hooks import collect_data_files
-    datas += collect_data_files('certifi')
-except Exception as _e:
-    print(f"[spec] certifi collect_data_files failed: {_e}")
-
 # ── 依赖配置 ──────────────────────────────────────────────
 hiddenimports = [
     'flask',

@@ -1,8 +1,6 @@
 flask>=3.0
 flask-cors>=4.0
 requests>=2.31
-# CA 根证书:显式声明,保证打包时用最新证书链,避免 SSL CERTIFICATE_VERIFY_FAILED
-certifi>=2024.2.2
 curl_cffi>=0.7
 cryptography>=42.0
 playwright>=1.40
@@ -19,5 +17,4 @@ httpx
 mitmproxy>=12.0
 # mitmproxy<=12.2.3 把 typing-extensions 锁在 <=4.14;固定该版本避免与 pydantic 的依赖解析冲突
 typing-extensions==4.14.0
-cos-python-sdk-v5>=1.9
 

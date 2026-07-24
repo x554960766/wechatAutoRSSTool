@@ -128,7 +128,7 @@ def _do_login():
 @xhs_login_bp.route("/status", methods=["GET"])
 def get_status():
     settings = get_settings()
-    cookie = str(settings.get("xhs_cookie") if settings.get("xhs_cookie") is not None else "").strip()
+    cookie = settings.get("xhs_cookie", "").strip()
     cookie_set = bool(cookie)
 
     # 扫码进行中时不做网络校验，避免与登录线程重复请求 /user/me（前端此时只读 login_state）。
@@ -159,7 +159,7 @@ def start_login():
 @xhs_login_bp.route("/save-cookie", methods=["POST"])
 def save_cookie_manually():
     data = request.get_json() or {}
-    cookie = str(data.get("cookie") if data.get("cookie") is not None else "").strip()
+    cookie = data.get("cookie", "").strip()
     if not cookie:
         return jsonify({"error": "Cookie 不能为空"}), 400
         

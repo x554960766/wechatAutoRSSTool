@@ -80,7 +80,6 @@ const ChannelsHistoryPage = {
                                     <th style="padding: 12px var(--spacing-md); color: var(--text-muted); font-weight: 600; width: 100px;">类型</th>
                                     <th style="padding: 12px var(--spacing-md); color: var(--text-muted); font-weight: 600; width: 120px;">大小</th>
                                     <th style="padding: 12px var(--spacing-md); color: var(--text-muted); font-weight: 600; width: 180px;">下载时间</th>
-                                    <th style="padding: 12px var(--spacing-md); color: var(--text-muted); font-weight: 600; width: 160px;">云端上传</th>
                                     <th style="padding: 12px var(--spacing-md); color: var(--text-muted); font-weight: 600; width: 120px; text-align: right;">操作</th>
                                 </tr>
                             </thead>
@@ -123,7 +122,7 @@ const ChannelsHistoryPage = {
         const content = document.getElementById('channels-downloads-content');
 
         const total = this.history.length;
-        const videos = this.history.filter(item => (item.type || '').startsWith('视频')).length;
+        const videos = this.history.filter(item => item.type === '视频').length;
 
         document.getElementById('channels-dl-stat-count').textContent = total + ' 个';
         document.getElementById('channels-dl-stat-videos').textContent = videos + ' 个';
@@ -140,18 +139,6 @@ const ChannelsHistoryPage = {
         tbody.innerHTML = this.history.map((item, index) => {
             const typeStyle = 'background: rgba(7, 193, 96, 0.1); color: var(--primary); padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; font-weight: 500;';
 
-            // 云端上传状态：仅自动上传条目有 uploaded 字段；手动下载显示 "-"
-            let cloudCell = '<span style="color: var(--text-muted);">-</span>';
-            if (item.uploaded !== undefined) {
-                if (item.uploaded && item.cos_url) {
-                    cloudCell = `<span style="color: var(--primary); font-weight: 500;">✓ 已上传</span>
-                        <a href="${item.cos_url}" target="_blank" title="${item.cos_url}" style="display: block; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.78rem; color: var(--text-muted); text-decoration: underline;">${item.cos_url}</a>`;
-                } else {
-                    cloudCell = `<span style="color: var(--error); font-weight: 500;" title="${(item.upload_error || '未知原因').replace(/"/g, '&quot;')}">✗ 失败</span>
-                        <span style="display: block; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.78rem; color: var(--text-muted);" title="${(item.upload_error || '').replace(/"/g, '&quot;')}">${item.upload_error || '待下批采集重试'}</span>`;
-                }
-            }
-
             return `
                 <tr style="border-bottom: 1px solid var(--border-color); vertical-align: middle; transition: background 0.2s;" onmouseenter="this.style.background='var(--bg-glass-hover)';" onmouseleave="this.style.background='transparent';">
                     <td style="padding: var(--spacing-md); max-width: 350px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
@@ -166,13 +153,7 @@ const ChannelsHistoryPage = {
                     <td style="padding: var(--spacing-md); color: var(--text-muted); font-size: 0.9rem;">
                         ${item.time}
                     </td>
-                    <td style="padding: var(--spacing-md); font-size: 0.9rem;">
-                        ${cloudCell}
-                    </td>
                     <td style="padding: var(--spacing-md); text-align: right; white-space: nowrap;">
-                        ${item.uploaded !== undefined ? `
-                        ${item.cos_url ? `<button class="btn btn-secondary btn-sm" onclick="window.open('${item.cos_url}', '_blank')" style="padding: 4px 10px; font-size: 0.85rem;">在线播放</button>` : '<span style="color: var(--text-muted); font-size: 0.85rem;">-</span>'}
-                        ` : `
                         <button class="btn btn-secondary btn-sm" onclick="ChannelsHistoryPage.openFile('${index}')" style="padding: 4px 10px; font-size: 0.85rem; margin-right: 4px;">
                             播放/打开
                         </button>
@@ -184,7 +165,6 @@ const ChannelsHistoryPage = {
                             导入转码
                         </button>
                         ` : ''}
-                        `}
                     </td>
                 </tr>
             `;

@@ -43,7 +43,7 @@ def list_accounts():
 def search_accounts():
     """搜索公众号"""
     data = request.get_json() or {}
-    keyword = str(data.get("keyword") if data.get("keyword") is not None else "").strip()
+    keyword = data.get("keyword", "").strip()
     if not keyword:
         return jsonify({"error": "请输入搜索关键字"}), 400
 
@@ -117,8 +117,8 @@ def search_accounts():
 def add_account():
     """添加公众号到收藏"""
     data = request.get_json() or {}
-    fakeid = str(data.get("fakeid") if data.get("fakeid") is not None else "").strip()
-    nickname = str(data.get("nickname") if data.get("nickname") is not None else "").strip()
+    fakeid = data.get("fakeid", "").strip()
+    nickname = data.get("nickname", "").strip()
 
     if not fakeid or not nickname:
         return jsonify({"error": "fakeid 和 nickname 不能为空"}), 400
