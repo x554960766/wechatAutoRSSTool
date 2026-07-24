@@ -32,42 +32,65 @@ UPLOAD_BATCH_SIZE = 5
 # 视频号 CDN URL 带时效 token,过期后每轮都白下载,必须有放弃阈值。
 MAX_UPLOAD_ATTEMPTS = 5
 
-# 缓存上一次成功获取的临时凭证,API 请求失败时用作兜底
+# 缓存上一次成功获取的临时凭证及获取时间戳 (凭证有效时间一般为 30 分钟)
 _last_cos_token: dict | None = None
+_last_cos_token_time: float = 0
 
 
-def _fetch_cos_token(token_api_url: str) -> dict:
-    """调用远程接口获取 COS 临时凭证(STS),失败时回退到上次缓存的凭证。
-
-    返回 dict 包含: secret_id, secret_key, token, region, bucket, prefix
+def _fetch_cos_token(token_api_url: str, force_refresh: bool = False) -> dict:
+    """调用远程接口获取 COS 临时凭证(STS)。
+    
+    - 正常情况下 5 分钟(300秒)内复用内存凭证，防止频繁请求接口打爆服务器；
+    - 当凭证超过 5 分钟，或在 COS 上传抛出凭证相关错误(force_refresh=True)时，立刻强行请求接口拉取最新 STS 凭证。
     """
-    global _last_cos_token
+    global _last_cos_token, _last_cos_token_time
+
+    now = time.time()
+    # 5 分钟(300s)内且非强刷新时，直接使用热凭证
+    if not force_refresh and _last_cos_token and (now - _last_cos_token_time < 300):
+        logger.debug("[视频号上传] 复用 5 分钟内获取的 COS 临时凭证")
+        return _last_cos_token
 
     try:
-        logger.info(f"[视频号上传] 请求临时凭证: {token_api_url}")
+        reason_msg = "强行刷新凭证" if force_refresh else ("凭证已超5分钟" if _last_cos_token else "首次获取凭证")
+        logger.info(f"[视频号上传] 向接口请求最新 COS 凭证 ({reason_msg}): {token_api_url}")
         resp = requests.get(token_api_url, timeout=10)
         resp.raise_for_status()
         body = resp.json()
         logger.info(f"[视频号上传] 临时凭证接口响应: {json.dumps(body, ensure_ascii=False)[:500]}")
-        # 兼容接口格式: 直接返回 data 或嵌套在 data 字段中
+
         data = body.get("data", body) if isinstance(body, dict) else body
+        creds = data.get("credentials", data) if isinstance(data, dict) else data
+
+        secret_id = creds.get("tmpSecretId") or creds.get("SecretId") or creds.get("secret_id") or (data.get("tmpSecretId") if isinstance(data, dict) else None)
+        secret_key = creds.get("tmpSecretKey") or creds.get("SecretKey") or creds.get("secret_key") or (data.get("tmpSecretKey") if isinstance(data, dict) else None)
+        token = creds.get("sessionToken") or creds.get("Token") or creds.get("token") or (data.get("sessionToken") if isinstance(data, dict) else None)
+        region = data.get("region") or creds.get("region") or "ap-guangzhou"
+        bucket = data.get("bucket") or creds.get("bucket") or ""
+
+        if not secret_id or not secret_key:
+            raise ValueError(f"COS临时凭证接口响应缺少 SecretId/SecretKey, 原始数据: {json.dumps(body, ensure_ascii=False)[:300]}")
+
         token_info = {
-            "secret_id": data["tmpSecretId"],
-            "secret_key": data["tmpSecretKey"],
-            "token": data["sessionToken"],
-            "region": data["region"],
-            "bucket": data["bucket"],
+            "secret_id": str(secret_id).strip(),
+            "secret_key": str(secret_key).strip(),
+            "token": str(token).strip() if token else None,
+            "region": str(region).strip(),
+            "bucket": str(bucket).strip(),
             "prefix": "channels/",
+            "token_api_url": token_api_url,
         }
         _last_cos_token = token_info
-        logger.info(f"[视频号上传] 获取临时凭证成功, region={token_info['region']}, bucket={token_info['bucket']}")
+        _last_cos_token_time = now
+        logger.info(f"[视频号上传] 获取最新临时凭证成功, region={token_info['region']}, bucket={token_info['bucket']}, tmpSecretId={token_info['secret_id'][:8]}***")
         return token_info
     except Exception as e:
-        logger.warning(f"[视频号上传] 获取临时凭证失败: {e}", exc_info=True)
-        if _last_cos_token:
-            logger.info("[视频号上传] 使用上次缓存的临时凭证")
+        logger.warning(f"[视频号上传] 获取最新临时凭证失败: {e}", exc_info=True)
+        # 仅当缓存凭证生成时间在 15 分钟(900秒)以内才允许兜底，防止误用已过期的旧 tmpSecretId
+        if _last_cos_token and (now - _last_cos_token_time < 900):
+            logger.info("[视频号上传] 接口请求异常，使用 15 分钟内的有效缓存凭证兜底")
             return _last_cos_token
-        raise RuntimeError(f"获取COS临时凭证失败且无缓存可用: {e}") from e
+        raise RuntimeError(f"获取最新 COS 临时凭证失败: {e}") from e
 
 
 def _update_feed_item(username, feed_id, changes, pop_keys=()):
@@ -135,15 +158,25 @@ def process_pending_uploads():
             return {"error": "channels_upload_url not configured"}
 
         token_api_url = (settings.get("cos_token_api_url") or "").strip()
-        if not token_api_url:
-            logger.error("[视频号上传] 错误：未配置 cos_token_api_url")
-            return {"error": "cos_token_api_url not configured"}
-
-        try:
-            cos_cfg = _fetch_cos_token(token_api_url)
-        except RuntimeError as e:
-            logger.error(f"[视频号上传] 错误：{e}")
-            return {"error": str(e)}
+        if token_api_url:
+            try:
+                cos_cfg = _fetch_cos_token(token_api_url)
+            except RuntimeError as e:
+                logger.error(f"[视频号上传] 获取动态凭证失败: {e}")
+                return {"error": str(e)}
+        else:
+            # 回退兼容：若未配置 cos_token_api_url，尝试使用本地静态 COS 凭证
+            cos_cfg = {
+                "secret_id": str(settings.get("cos_secret_id") if settings.get("cos_secret_id") is not None else "").strip(),
+                "secret_key": str(settings.get("cos_secret_key") if settings.get("cos_secret_key") is not None else "").strip(),
+                "region": str(settings.get("cos_region") if settings.get("cos_region") is not None else "").strip(),
+                "bucket": str(settings.get("cos_bucket") if settings.get("cos_bucket") is not None else "").strip(),
+                "prefix": str(settings.get("cos_prefix") if settings.get("cos_prefix") is not None else "channels/").strip(),
+                "cds_domain": str(settings.get("cos_cds_domain") if settings.get("cos_cds_domain") is not None else "").strip(),
+            }
+            if not all([cos_cfg["secret_id"], cos_cfg["secret_key"], cos_cfg["region"], cos_cfg["bucket"]]):
+                logger.error("[视频号上传] 错误：未配置 cos_token_api_url，也未配置完整静态 COS 凭证")
+                return {"error": "Neither cos_token_api_url nor complete COS credentials configured"}
 
         device_id = str(settings.get("channels_device_id") if settings.get("channels_device_id") is not None else "视频号_caiji2").strip() or "视频号_caiji2"
         logger.info(f"[视频号上传] 配置加载完成 - 目标服务器: {server_url}, 设备ID: {device_id}, COS区域: {cos_cfg['region']}")
@@ -326,11 +359,31 @@ def _download_and_cos(snap, cos_cfg):
     key = cos_cfg["prefix"] + filename
 
     logger.debug(f"[视频号上传] feedId={feed_id} 开始上传到COS: {key}")
-    client.put_object(Bucket=cos_cfg["bucket"], Body=bytes(data), Key=key)
-
-    cos_url = f"https://{cos_cfg['bucket']}.cos.{cos_cfg['region']}.myqcloud.com/{key}"
-
-    return cos_url
+    try:
+        client.put_object(Bucket=cos_cfg["bucket"], Body=bytes(data), Key=key)
+        cos_url = f"https://{cos_cfg['bucket']}.cos.{cos_cfg['region']}.myqcloud.com/{key}"
+        return cos_url
+    except Exception as e:
+        err_str = str(e)
+        # 检测是否为 COS 凭证失效类异常
+        is_cred_err = any(k in err_str for k in ("InvalidAccessKeyId", "AccessDenied", "ExpiredToken", "SignatureDoesNotMatch", "403", "AuthFailure"))
+        token_api_url = cos_cfg.get("token_api_url")
+        if is_cred_err and token_api_url:
+            logger.warning(f"[视频号上传] feedId={feed_id} COS上传遇到凭证错误 ({err_str})，立刻强行刷新 STS 凭证并重试...")
+            fresh_cfg = _fetch_cos_token(token_api_url, force_refresh=True)
+            fresh_kwargs = {
+                "Region": fresh_cfg["region"],
+                "SecretId": fresh_cfg["secret_id"],
+                "SecretKey": fresh_cfg["secret_key"],
+            }
+            if fresh_cfg.get("token"):
+                fresh_kwargs["Token"] = fresh_cfg["token"]
+            fresh_client = CosS3Client(CosConfig(**fresh_kwargs))
+            fresh_client.put_object(Bucket=fresh_cfg["bucket"], Body=bytes(data), Key=key)
+            logger.info(f"[视频号上传] ✓ feedId={feed_id} 强行刷新凭证后重试 COS 上传成功！")
+            cos_url = f"https://{fresh_cfg['bucket']}.cos.{fresh_cfg['region']}.myqcloud.com/{key}"
+            return cos_url
+        raise e
 
 def _post_to_server(url, records, device_id):
     """POST {data, deviceId} 到服务器，返回 (ok: bool, error: str|None)。

@@ -6,7 +6,9 @@
 import re
 import sys
 import time
+import json
 import random
+import threading
 import subprocess
 import urllib.parse
 import requests
@@ -21,6 +23,11 @@ channels_bp = Blueprint("channels", __name__, url_prefix="/api/channels")
 CHANNELS_HISTORY_FILE = DATA_DIR / "channels_history.json"
 CHANNELS_FAVORITES_FILE = DATA_DIR / "channels_favorites.json"
 CHANNELS_FEEDS_FILE = DATA_DIR / "channels_parsed_feeds.json"
+
+# 保护 channels_parsed_feeds.json 的读-改-写。采集(save_synced_feeds)与自动上传
+# (process_pending_uploads)分属不同线程,各自 load→改→save 会后写覆盖先写,
+# 造成新作品丢失 / uploaded 标记被抹掉后重复上传。所有 feeds_db 写入须持此锁。
+FEEDS_LOCK = threading.RLock()
 
 
 class ISAAC64:
@@ -1176,4 +1183,53 @@ def cancel_async_download(task_id):
         task["cancel_event"].set()
         task["status"] = "cancelled"
         return jsonify({"success": True, "message": "下载已请求取消"})
+
+
+@channels_bp.route("/upload-log", methods=["GET"])
+def get_upload_log():
+    """获取视频号自动上传日志（channels_upload_log.jsonl 最近 N 条，新→旧）"""
+    from backend.channels_upload import CHANNELS_UPLOAD_LOG_FILE
+    limit = request.args.get("limit", 100, type=int)
+    entries = []
+    try:
+        if CHANNELS_UPLOAD_LOG_FILE.exists():
+            with open(CHANNELS_UPLOAD_LOG_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            for line in lines[-limit:]:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except Exception:
+                    pass
+    except Exception as e:
+        return jsonify({"error": f"读取上传日志失败: {e}"}), 500
+    entries.reverse()
+    return jsonify(entries)
+
+
+@channels_bp.route("/process-uploads", methods=["POST"])
+def process_uploads():
+    """处理待上传作品：下载→COS→服务器"""
+    from backend.channels_upload import process_pending_uploads
+    from backend.config import load_json
+
+    feeds_db = load_json(CHANNELS_FEEDS_FILE, {})
+    pending_count = sum(
+        1
+        for items in feeds_db.values()
+        for item in items
+        if item.get("needs_upload") and not item.get("uploaded")
+        and not item.get("upload_failed") and item.get("video_url")
+    )
+
+    def bg_task():
+        try:
+            process_pending_uploads()
+        except Exception as e:
+            print(f"Upload process error: {e}")
+
+    threading.Thread(target=bg_task, daemon=True).start()
+    return jsonify({"started": True, "pending_count": pending_count})
 

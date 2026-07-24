@@ -497,6 +497,34 @@ class ChannelsAddon:
                     print(f"Error handling call-log: {ex}")
                 self._local_json(flow, 200, b'{"code":0,"data":true}')
                 return
+            if path == "/__wx_channels_api/harvest-config":
+                # 返回自动定时采集配置，供注入脚本 automation.js 的定时调度器读取。
+                # 包成 {code:0,data:{...}} 以匹配前端 WXU.request 的约定。
+                try:
+                    from backend.config import get_settings
+                    s = get_settings()
+                    cfg = {
+                        "enabled": bool(s.get("channels_auto_harvest_enabled", False)),
+                        "interval_hours": s.get("channels_harvest_interval_hours", 6),
+                        "window_start_hour": s.get("channels_harvest_window_start_hour", 8),
+                        "window_end_hour": s.get("channels_harvest_window_end_hour", 24),
+                        "max_per_author": s.get("channels_harvest_max_per_author", 30),
+                    }
+                    body = json.dumps(
+                        {"code": 0, "data": cfg}, ensure_ascii=False
+                    ).encode("utf-8")
+                    self._local_json(flow, 200, body)
+                except Exception as ex:
+                    print(f"Error handling harvest-config: {ex}")
+                    self._local_json(
+                        flow, 200, b'{"code":0,"data":{"enabled":false}}'
+                    )
+                return
+            if path == "/__wx_channels_api/process-uploads":
+                self._forward_to_flask(
+                    flow, "http://127.0.0.1:5200/api/channels/process-uploads"
+                )
+                return
             if path == "/__wx_channels_api/download":
                 self._forward_to_flask(
                     flow, "http://127.0.0.1:5200/api/channels/download"
@@ -800,7 +828,12 @@ def save_synced_feeds(username, feeds):
             "video_url_h264": video_url_h264,
             "video_url_h265": video_url_h265,
             "createtime": createtime,
-            "decode_key": decode_key
+            "decode_key": decode_key,
+            "nickname": feed.get("contact", {}).get("nickname") or nickname,
+            "like_count": feed.get("likeCount", 0),
+            "comment_count": feed.get("commentCount", 0),
+            "forward_count": feed.get("forwardCount", 0),
+            "fav_count": feed.get("favCount", 0),
         }
         
         found = False
@@ -810,6 +843,7 @@ def save_synced_feeds(username, feeds):
                 found = True
                 break
         if not found:
+            item["needs_upload"] = True
             feeds_db[username].append(item)
             
     save_json(CHANNELS_FEEDS_FILE, feeds_db)

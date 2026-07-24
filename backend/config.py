@@ -14,7 +14,7 @@ from pathlib import Path
 from backend.runtime import app_dir
 
 # ── 版本号 ────────────────────────────────────────────────
-APP_VERSION = "1.6.5"
+APP_VERSION = "1.6.6"
 
 # ── 路径配置 ──────────────────────────────────────────────
 if getattr(sys, 'frozen', False):
@@ -59,6 +59,22 @@ DEFAULT_SETTINGS = {
     "rss_end_minute": 0,
     "rss_upload_enabled": False,
     "rss_upload_url": "",
+    "channels_upload_enabled": False,
+    "channels_upload_url": "",
+    "channels_auto_harvest_enabled": False,
+    "channels_harvest_interval_hours": 6,
+    "channels_harvest_window_start_hour": 8,
+    "channels_harvest_window_end_hour": 24,
+    "channels_harvest_max_per_author": 30,  # 单作者单次采集上限，0 = 不限
+    # 腾讯云 COS 配置（支持向接口动态获取 STS 临时凭证，或填写静态 COS 凭证）
+    "cos_token_api_url": "",
+    "cos_secret_id": "",
+    "cos_secret_key": "",
+    "cos_region": "",
+    "cos_bucket": "",
+    "cos_prefix": "channels/",
+    "cos_cds_domain": "",
+    "channels_device_id": "视频号_caiji2",
 }
 
 

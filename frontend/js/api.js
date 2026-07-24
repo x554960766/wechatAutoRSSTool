@@ -200,6 +200,8 @@ const API = {
         cookieAcquisitionStatus() { return API.get('/api/channels/cookie_acquisition_status', { showError: false }); },
         getHistory() { return API.get('/api/channels/history'); },
         clearHistory() { return API.delete('/api/channels/history'); },
+        getUploadLog(limit = 100) { return API.get(`/api/channels/upload-log?limit=${limit}`); },
+        processUploads() { return API.post('/api/channels/process-uploads'); },
         openFile(path) { return API.post('/api/channels/open-file', { path }); },
         openParent(path) { return API.post('/api/channels/open-parent', { path }); },
         getFavorites() { return API.get('/api/channels/favorites'); },
