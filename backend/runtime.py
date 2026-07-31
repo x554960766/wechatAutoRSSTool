@@ -25,7 +25,9 @@ def app_dir() -> Path:
     to avoid App Translocation read-only filesystem errors that occur when
     the .app is launched from a DMG or unsigned download location.
 
-    On Windows (frozen), data is stored next to the executable.
+    On Windows (frozen), data is stored in APPDATA to preserve settings and
+    bookmarked accounts across version reinstalls.
+
     In dev mode, data is stored in the project root.
     """
     if is_frozen():
@@ -35,8 +37,20 @@ def app_dir() -> Path:
             support = Path.home() / "Library" / "Application Support" / "WeChat MP Tools"
             support.mkdir(parents=True, exist_ok=True)
             return support
-        # Windows / Linux: keep data next to the executable
-        return Path(sys.executable).resolve().parent
+        elif sys.platform == "win32":
+            # Windows: store user data in APPDATA
+            appdata = os.environ.get("APPDATA")
+            if appdata:
+                support = Path(appdata) / "WeChat MP Tools"
+            else:
+                support = Path.home() / "AppData" / "Roaming" / "WeChat MP Tools"
+            support.mkdir(parents=True, exist_ok=True)
+            return support
+        else:
+            # Linux: standard user config dir
+            config_dir = Path.home() / ".config" / "WeChat MP Tools"
+            config_dir.mkdir(parents=True, exist_ok=True)
+            return config_dir
     return Path(__file__).resolve().parent.parent
 
 

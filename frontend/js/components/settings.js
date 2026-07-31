@@ -267,7 +267,6 @@ const SettingsPage = {
                                 </div>
                                 <div class="form-hint">自动采集结束时间，24 点仅支持 00 分</div>
                             </div>
-                        </div>
                         <div class="form-hint" style="margin-top: 8px;">默认 00:00 到 24:00 整天采集，只有在设置的时间范围内才会执行 RSS 自动采集</div>
 
                         <hr style="border: 0; border-top: 1px solid var(--border-color); margin: var(--spacing-md) 0;" />
@@ -292,6 +291,31 @@ const SettingsPage = {
                                 <div class="form-hint">接口接收 articles 与 deviceId；正文 content 会以 base64 字符串上传</div>
                             </div>
                         </div>
+                    </div>
+                </div>
+
+            <!-- 缓存与备份管理 -->
+            <div class="card" style="margin-top: var(--spacing-lg);">
+                <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
+                    <h3 class="card-title">💾 采集配置与收藏公众号 缓存与备份管理</h3>
+                    <span class="badge badge-info" style="padding: 4px 8px; font-size: 0.8rem;">跨版本自动保留</span>
+                </div>
+                <div class="card-body">
+                    <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 16px; line-height: 1.6;">
+                        软件已支持跨版本持久化缓存。更新安装新版本时，自动化采集配置（时间段、上传开关等）与收藏公众号将自动保留在系统 AppData 目录中。
+                        您也可以随时导出备份 JSON 文件，在不同电脑或安装包之间一键迁移与恢复。
+                    </p>
+                    <div style="display: flex; flex-wrap: wrap; gap: 12px; align-items: center;">
+                        <button class="btn btn-primary" onclick="SettingsPage.exportBackup()" style="display: flex; align-items: center; gap: 6px;">
+                            📥 导出备份 (配置与收藏公众号)
+                        </button>
+                        <button class="btn btn-secondary" onclick="document.getElementById('import-backup-file-input').click()" style="display: flex; align-items: center; gap: 6px;">
+                            📤 导入恢复备份
+                        </button>
+                        <input type="file" id="import-backup-file-input" accept=".json" style="display: none;" onchange="SettingsPage.importBackup(event)" />
+                        <button class="btn btn-outline" onclick="SettingsPage.openDataFolder()" style="display: flex; align-items: center; gap: 6px;">
+                            📁 打开本地数据缓存目录
+                        </button>
                     </div>
                 </div>
             </div>
@@ -464,8 +488,8 @@ const SettingsPage = {
         const biliSubtitle = document.getElementById('setting-bili-subtitle');
 
         const request_delay = parseFloat(delayInput.value);
-        if (isNaN(request_delay) || request_delay < 0.1) {
-            Toast.warning('延迟时间输入不合法，最小为 0.1 秒');
+        if (isNaN(request_delay) || request_delay < 0.2 || request_delay > 5.0) {
+            Toast.error('请求延迟必须在 0.2 到 5.0 秒之间');
             return;
         }
 
@@ -516,7 +540,63 @@ const SettingsPage = {
         }
     },
 
+    async exportBackup() {
+        try {
+            const data = await API.settings.exportBackup();
+            const jsonStr = JSON.stringify(data, null, 2);
+            const blob = new Blob([jsonStr], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            const dateStr = new Date().toISOString().slice(0, 10);
+            a.download = `wechat_mp_tools_backup_${dateStr}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            Toast.success('配置与收藏公众号导出备份成功！');
+        } catch (err) {
+            Toast.error('导出备份失败: ' + (err.message || err));
+        }
+    },
 
+    async importBackup(event) {
+        const file = event.target.files && event.target.files[0];
+        if (!file) return;
+
+        const reader = new FileReader();
+        reader.onload = async (e) => {
+            try {
+                const data = JSON.parse(e.target.result);
+                if (!data || typeof data !== 'object') {
+                    throw new Error('无效的备份 JSON 文件');
+                }
+                Modal.confirm('确认导入恢复备份', '导入备份将覆盖当前的系统采集配置和收藏公众号列表，是否继续？', async () => {
+                    try {
+                        const res = await API.settings.importBackup(data);
+                        Toast.success('备份恢复成功！已导入 ' + (res.imported_count || 0) + ' 项配置/数据');
+                        await this.loadSettings();
+                    } catch (err) {
+                        Toast.error('恢复备份失败: ' + (err.message || err));
+                    }
+                });
+            } catch (err) {
+                Toast.error('读取备份文件失败: ' + (err.message || err));
+            } finally {
+                event.target.value = '';
+            }
+        };
+        reader.readAsText(file);
+    },
+
+    async openDataFolder() {
+        try {
+            const res = await API.settings.openDataFolder();
+            Toast.info('已打开数据缓存目录');
+        } catch (err) {
+            Toast.error('打开数据目录失败: ' + (err.message || err));
+        }
+    },
 
     async showChannelsUploadLog() {
         Modal.open({

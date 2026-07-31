@@ -148,6 +148,9 @@ const API = {
     settings: {
         get() { return API.get('/api/settings'); },
         save(settings) { return API.post('/api/settings', settings); },
+        exportBackup() { return API.get('/api/settings/backup/export'); },
+        importBackup(data) { return API.post('/api/settings/backup/import', data); },
+        openDataFolder() { return API.post('/api/settings/open-data-folder'); },
     },
 
     // ── Douyin Downloader API ────────────────────────

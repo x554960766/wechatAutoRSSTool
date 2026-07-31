@@ -14,7 +14,7 @@ from pathlib import Path
 from backend.runtime import app_dir
 
 # ── 版本号 ────────────────────────────────────────────────
-APP_VERSION = "1.6.7"
+APP_VERSION = "1.7.0"
 
 # ── 路径配置 ──────────────────────────────────────────────
 if getattr(sys, 'frozen', False):
@@ -33,6 +33,7 @@ DOWNLOAD_HISTORY_FILE = DATA_DIR / "download_history.json"
 
 # ── 微信 API 配置 ─────────────────────────────────────────
 BASE_URL = "https://mp.weixin.qq.com"
+WEREAD_PLATFORM_URL = "https://weread.111965.xyz"
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -52,6 +53,7 @@ DEFAULT_SETTINGS = {
     "concurrent_downloads": 1,
     "auto_save_images": True,
     "auto_save_videos": True,
+    "weread_platform_url": WEREAD_PLATFORM_URL,
     "device_id": "公众号_caiji100",
     "rss_start_hour": 0,
     "rss_start_minute": 0,
@@ -78,10 +80,29 @@ DEFAULT_SETTINGS = {
 }
 
 
+def _migrate_legacy_data_if_needed():
+    """如果是打包运行且数据保存在 APPDATA，从旧版 exe 同级 data 自动迁移配置和收藏，防止更新丢失"""
+    if getattr(sys, 'frozen', False):
+        try:
+            exe_dir = Path(sys.executable).resolve().parent
+            legacy_data_dir = exe_dir / "data"
+            if legacy_data_dir.exists() and legacy_data_dir.resolve() != DATA_DIR.resolve():
+                DATA_DIR.mkdir(parents=True, exist_ok=True)
+                for item in legacy_data_dir.iterdir():
+                    if item.is_file():
+                        target = DATA_DIR / item.name
+                        if not target.exists() or item.stat().st_mtime > target.stat().st_mtime:
+                            import shutil
+                            shutil.copy2(item, target)
+        except Exception as e:
+            print(f"[Migration] 旧版本数据自动迁移提示: {e}")
+
+
 def ensure_dirs():
     """确保必要的目录存在"""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    _migrate_legacy_data_if_needed()
 
 
 def load_json(filepath: Path, default=None):
@@ -118,6 +139,57 @@ def get_settings() -> dict:
 def save_settings(settings: dict):
     """保存应用设置"""
     save_json(APP_SETTINGS_FILE, settings)
+
+
+def export_backup_data() -> dict:
+    """导出包含所有自动化采集配置与收藏公众号的备份数据"""
+    return {
+        "version": APP_VERSION,
+        "export_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "app_settings": load_json(APP_SETTINGS_FILE, {}),
+        "accounts": load_json(ACCOUNTS_FILE, []),
+        "channels_favorites": load_json(DATA_DIR / "channels_favorites.json", []),
+        "account_pool": load_json(ACCOUNT_POOL_FILE, []),
+        "proxy_config": load_json(PROXY_CONFIG_FILE, {}),
+        "rss_subscriptions": load_json(DATA_DIR / "rss_subscriptions.json", []),
+        "wechat_mp_config": load_json(CONFIG_FILE, {}),
+    }
+
+
+def import_backup_data(data: dict) -> dict:
+    """导入并恢复自动化采集配置与收藏公众号"""
+    imported_count = 0
+    if isinstance(data.get("app_settings"), dict) and data["app_settings"]:
+        current_settings = get_settings()
+        current_settings.update(data["app_settings"])
+        save_settings(current_settings)
+        imported_count += 1
+    
+    if isinstance(data.get("accounts"), list):
+        save_json(ACCOUNTS_FILE, data["accounts"])
+        imported_count += 1
+
+    if isinstance(data.get("channels_favorites"), list):
+        save_json(DATA_DIR / "channels_favorites.json", data["channels_favorites"])
+        imported_count += 1
+
+    if isinstance(data.get("account_pool"), (list, dict)):
+        save_json(ACCOUNT_POOL_FILE, data["account_pool"])
+        imported_count += 1
+
+    if isinstance(data.get("proxy_config"), dict) and data["proxy_config"]:
+        save_json(PROXY_CONFIG_FILE, data["proxy_config"])
+        imported_count += 1
+
+    if isinstance(data.get("rss_subscriptions"), list):
+        save_json(DATA_DIR / "rss_subscriptions.json", data["rss_subscriptions"])
+        imported_count += 1
+
+    if isinstance(data.get("wechat_mp_config"), dict) and data["wechat_mp_config"]:
+        save_json(CONFIG_FILE, data["wechat_mp_config"])
+        imported_count += 1
+
+    return {"success": True, "imported_count": imported_count}
 
 
 # ── 代理管理器全局状态管理 ────────────────────────────────────

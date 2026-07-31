@@ -142,6 +142,37 @@ def save_settings():
     return jsonify({"message": "设置已保存"})
 
 
+@app.route("/api/settings/backup/export", methods=["GET"])
+def export_backup():
+    from backend.config import export_backup_data
+    from flask import jsonify
+    return jsonify(export_backup_data())
+
+
+@app.route("/api/settings/backup/import", methods=["POST"])
+def import_backup():
+    from backend.config import import_backup_data
+    from flask import request, jsonify
+    data = request.get_json() or {}
+    result = import_backup_data(data)
+    return jsonify(result)
+
+
+@app.route("/api/settings/open-data-folder", methods=["POST"])
+def open_data_folder():
+    from backend.config import DATA_DIR
+    from flask import jsonify
+    import sys, os
+    folder = str(DATA_DIR.resolve())
+    if sys.platform == "darwin":
+        os.system(f'open "{folder}"')
+    elif sys.platform == "win32":
+        os.startfile(folder)
+    else:
+        os.system(f'xdg-open "{folder}"')
+    return jsonify({"success": True, "path": folder})
+
+
 # ── 启动 ──────────────────────────────────────────────────
 
 def open_browser(port: int):
