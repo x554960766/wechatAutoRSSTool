@@ -53,18 +53,60 @@ def fetch_article_detail_content(url: str) -> str:
             img["src"] = img["data-src"]
             del img["data-src"]
 
-    return str(content_node)
+def _fetch_articles_via_appmsg_fallback(fakeid: str, begin: int, count: int, keyword: str, token: str, cookie_str: str):
+    """当 PC 微信 key 失效或缺失时，使用 Playwright/Web 获取到的 Web Token 自动走 /cgi-bin/appmsg 备用通道获取文章列表"""
+    if not token:
+        return None
+    headers = {**DEFAULT_HEADERS, "Cookie": cookie_str}
+    proxies = get_proxies_dict()
+    try:
+        resp = req.get(
+            f"{BASE_URL}/cgi-bin/appmsg",
+            params={
+                "action": "list_ex",
+                "token": token,
+                "lang": "zh_CN",
+                "f": "json",
+                "ajax": "1",
+                "type": "9",
+                "query": keyword,
+                "fakeid": fakeid,
+                "begin": str(begin),
+                "count": str(count),
+            },
+            headers=headers,
+            proxies=proxies,
+            timeout=20,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("base_resp", {}).get("ret") == 0:
+                articles = []
+                for item in data.get("app_msg_list", []):
+                    articles.append({
+                        "title": item.get("title", ""),
+                        "link": item.get("link", ""),
+                        "cover": item.get("cover", ""),
+                        "digest": item.get("digest", ""),
+                        "author": item.get("author_name", ""),
+                        "update_time": item.get("update_time", item.get("create_time", 0)),
+                        "is_original": False,
+                        "item_show_type": item.get("item_show_type", 0),
+                        "id": str(item.get("aid", "")),
+                    })
+                total_cnt = data.get("app_msg_cnt", len(articles))
+                can_continue = 1 if (begin + len(articles)) < total_cnt else 0
+                return articles, total_cnt, can_continue
+    except Exception as e:
+        print(f"appmsg fallback 尝试失败: {e}")
+    return None
 
 
 def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "") -> tuple:
-    """使用微信读书接口拉取指定公众号的文章列表 (page, total)
-    遇到失效 (WeReadError401) 或频繁 (WeReadError429) 时自动向账号池上报并无缝切换账号重试"""
+    """使用微信客户端历史消息原生接口 (profile_ext?action=getmsg) 获取文章列表 (articles, total_count)
+    支持从账号池提取 appmsg_token, key, pass_ticket, uin 与 Cookie 进行翻页抓取"""
     max_switch = 3
     last_exc = None
-    page = (begin // max(1, count)) + 1
-
-    from backend.config import get_settings, WEREAD_PLATFORM_URL
-    platform_url = get_settings().get("weread_platform_url") or WEREAD_PLATFORM_URL
 
     for _ in range(max_switch):
         try:
@@ -72,101 +114,182 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "")
         except RuntimeError as e:
             raise RuntimeError(str(e))
 
+        # 尝试从账号中提取三方库需要的客户端参数
+        account_data = {}
+        with account_pool._lock:
+            for acc in account_pool._load():
+                if acc.get("id") == account_id:
+                    account_data = acc
+                    break
+
+        appmsg_token = account_data.get("appmsg_token", token)
+        pass_ticket = account_data.get("pass_ticket", "")
+        key = account_data.get("key", "")
+        uin = account_data.get("uin", "")
+
+        import urllib.parse, re
+        appmsg_token = urllib.parse.unquote(appmsg_token) if appmsg_token else ""
+        pass_ticket = urllib.parse.unquote(pass_ticket) if pass_ticket else ""
+        key = urllib.parse.unquote(key) if key else ""
+        uin = urllib.parse.unquote(uin) if uin else ""
+
+        cookie_str = urllib.parse.unquote(cookie_str.replace(", ", "; "))
+
+        if not uin:
+            m = re.search(r'wxuin=([^;,\s]+)', cookie_str) or re.search(r'(?:^|;\s*)uin=([^;,\s]+)', cookie_str)
+            if m: uin = m.group(1)
+
+        if not key:
+            m = re.search(r'(?:^|;\s*)key=([^;,\s]+)', cookie_str)
+            if m: key = m.group(1)
+
+        if not pass_ticket:
+            m = re.search(r'pass_ticket=([^;,\s]+)', cookie_str)
+            if m: pass_ticket = m.group(1)
+
+        ua = account_data.get("user_agent") or "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.5304.110 Safari/537.36 NetType/WIFI MicroMessenger/6.8.0(0x16080000) MacWechat/store ClientCanvas/1.0.0"
         headers = {
-            "xid": str(account_id),
-            "Authorization": f"Bearer {token}",
+            "User-Agent": ua,
+            "Cookie": cookie_str,
+            "Accept": "application/json, text/plain, */*",
         }
         proxies = get_proxies_dict()
         proxy_url = proxies.get("http") if proxies else None
 
+        params = {
+            "action": "getmsg",
+            "__biz": fakeid,
+            "f": "json",
+            "offset": str(begin),
+            "count": str(count),
+            "is_ok": "1",
+            "scene": "126",
+            "uin": "",
+            "key": "",
+            "pass_ticket": "",
+            "appmsg_token": appmsg_token,
+            "x5": "0",
+        }
+
         try:
-            from curl_cffi import requests as c_req
-            resp = c_req.get(
-                f"{platform_url}/api/v2/platform/mps/{fakeid}/articles",
-                params={"page": page},
-                headers=headers,
-                proxies=proxies,
-                timeout=30,
-                impersonate="chrome",
-            )
-        except Exception as e:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
             try:
                 resp = req.get(
-                    f"{platform_url}/api/v2/platform/mps/{fakeid}/articles",
-                    params={"page": page},
+                    f"{BASE_URL}/mp/profile_ext",
+                    params=params,
                     headers=headers,
-                    proxies=proxies,
-                    timeout=30,
+                    proxies={"http": None, "https": None},
+                    timeout=25,
+                    verify=False,
                 )
-            except Exception as exc:
-                report_proxy_status(proxy_url, success=False)
-                account_pool.report(account_id, http_ok=False, error=str(exc))
-                last_exc = exc
-                continue
+            except Exception:
+                from curl_cffi import requests as c_req
+                resp = c_req.get(
+                    f"{BASE_URL}/mp/profile_ext",
+                    params=params,
+                    headers=headers,
+                    proxies={"http": None, "https": None},
+                    timeout=25,
+                    impersonate="chrome",
+                    verify=False,
+                )
+        except Exception as exc:
+            report_proxy_status(proxy_url, success=False)
+            account_pool.report(account_id, http_ok=False, error=str(exc))
+            last_exc = exc
+            continue
 
         if resp.status_code != 200:
-            err_body = resp.text
             report_proxy_status(proxy_url, success=False)
-            account_pool.report(account_id, http_ok=False, error=f"WeReadError: HTTP {resp.status_code} {err_body}")
-
-            if "WeReadError401" in err_body or resp.status_code == 401:
-                last_exc = PermissionError("微信读书账号登录失效，正在切换账号重试...")
-                continue
-            elif "WeReadError429" in err_body or resp.status_code == 429:
-                last_exc = RuntimeError("触发微信读书频率控制(429)，正在切换账号重试...")
-                continue
-            elif resp.status_code == 500 or "unknown error" in err_body:
-                raise RuntimeError("该公众号为旧版标识，微信读书接口无法识别。请重新粘贴该公众号的任意一篇文章链接解析添加，以升级订阅。")
-            else:
-                last_exc = RuntimeError(f"HTTP {resp.status_code}: {err_body}")
-                continue
+            account_pool.report(account_id, http_ok=False, error=f"HTTP {resp.status_code}")
+            last_exc = RuntimeError(f"HTTP {resp.status_code}")
+            continue
 
         report_proxy_status(proxy_url, success=True)
-        raw_data = resp.json()
-        account_pool.report(account_id, ret=0)
+        try:
+            data = resp.json()
+        except Exception:
+            last_exc = RuntimeError("返回数据非 JSON 格式（可能需要重新在微信电脑版打开历史消息更新 key/token）")
+            continue
 
-        if isinstance(raw_data, list):
-            items_list = raw_data
-        elif isinstance(raw_data, dict):
-            items_list = (
-                raw_data.get("articles") or
-                raw_data.get("items") or
-                raw_data.get("list") or
-                raw_data.get("data") or
-                raw_data.get("app_msg_list") or
-                []
-            )
-            if not items_list and raw_data.get("id"):
-                items_list = [raw_data]
-        else:
-            items_list = []
+        ret = data.get("ret", 0)
+        account_pool.report(account_id, ret=ret)
+
+        if ret != 0:
+            errmsg = data.get("errmsg", f"ret={ret}")
+
+            # 如果客户端接口失败，且拥有可用 Web Token，尝试通过 /cgi-bin/appmsg 备用通道拉取
+            if appmsg_token or token:
+                try:
+                    fallback_res = _fetch_articles_via_appmsg_fallback(fakeid, begin, count, keyword, appmsg_token or token, cookie_str)
+                    if fallback_res is not None:
+                        articles, total_cnt, can_continue = fallback_res
+                        return articles, total_cnt, can_continue
+                except Exception as fb_err:
+                    print(f"Appmsg 备用通道尝试失败: {fb_err}")
+
+            if ret in (-3, -4, -5, -6, 200003):
+                # 凭证失效，尝试发起探针请求触发 mitm_proxy 静默刷新
+                account_pool.try_refresh_account(account_id)
+                last_exc = PermissionError(f"客户端凭证已失效 ({errmsg})，请在 PC 微信或浏览器中刷新页面更新 key/token！")
+            elif ret == 200013:
+                last_exc = RuntimeError("触发微信频次控制(200013)，正在切换账号重试...")
+            else:
+                last_exc = RuntimeError(f"微信历史消息接口错误: {errmsg}")
+            continue
 
         articles = []
-        for item in items_list:
-            art_id = str(item.get("id", "") or item.get("aid", "") or item.get("docid", ""))
-            title = item.get("title", "") or item.get("name", "")
-            cover = item.get("picUrl", "") or item.get("cover", "") or item.get("pic_url", "")
-            pub_time = item.get("publishTime") or item.get("update_time") or item.get("create_time") or item.get("updateTime") or 0
+        msg_list_str = data.get("general_msg_list", "")
+        if msg_list_str:
+            try:
+                msg_data = json.loads(msg_list_str)
+                for msg in msg_data.get("list", []):
+                    comm_info = msg.get("comm_msg_info", {})
+                    pub_time = comm_info.get("datetime", 0)
+                    msg_id = str(comm_info.get("id", ""))
 
-            link = item.get("link") or item.get("url") or ""
-            if not link:
-                link = f"https://mp.weixin.qq.com/s/{art_id}" if art_id and not art_id.startswith("http") else art_id
+                    app_msg = msg.get("app_msg_ext_info", {})
+                    if app_msg and app_msg.get("title"):
+                        link = app_msg.get("content_url", "").replace("\\/", "/")
+                        if link.startswith("//"):
+                            link = "https:" + link
 
-            articles.append({
-                "title": title,
-                "link": link,
-                "cover": cover,
-                "digest": item.get("digest", "") or title,
-                "author": item.get("author", "") or item.get("author_name", ""),
-                "update_time": pub_time,
-                "is_original": False,
-                "item_show_type": 0,
-                "id": art_id,
-            })
+                        articles.append({
+                            "title": app_msg.get("title", ""),
+                            "link": link,
+                            "cover": app_msg.get("cover", ""),
+                            "digest": app_msg.get("digest", ""),
+                            "author": app_msg.get("author", ""),
+                            "update_time": pub_time,
+                            "is_original": False,
+                            "item_show_type": 0,
+                            "id": msg_id,
+                        })
 
-        # 计算估算 total 数量
-        total_estimate = begin + len(articles) + (10 if len(articles) >= count else 0)
-        return articles, total_estimate
+                        # 多图文处理
+                        for sub in app_msg.get("multi_app_msg_item_list", []):
+                            if sub.get("title"):
+                                sub_link = sub.get("content_url", "").replace("\\/", "/")
+                                if sub_link.startswith("//"):
+                                    sub_link = "https:" + sub_link
+                                articles.append({
+                                    "title": sub.get("title", ""),
+                                    "link": sub_link,
+                                    "cover": sub.get("cover", ""),
+                                    "digest": sub.get("digest", ""),
+                                    "author": sub.get("author", ""),
+                                    "update_time": pub_time,
+                                    "is_original": False,
+                                    "item_show_type": 0,
+                                    "id": msg_id,
+                                })
+            except Exception as parse_err:
+                print(f"解析 general_msg_list 异常: {parse_err}")
+
+        total_cnt = data.get("total_count", len(articles))
+        can_continue = data.get("can_msg_continue", 1) if isinstance(data, dict) else (1 if len(articles) > 0 else 0)
+        return articles, total_cnt, can_continue
 
     if isinstance(last_exc, PermissionError):
         raise last_exc
@@ -181,11 +304,12 @@ def get_articles(fakeid):
     keyword = request.args.get("keyword", "").strip()
 
     try:
-        articles, total_count = _fetch_articles_page(fakeid, begin, count, keyword)
+        articles, total_count, can_continue = _fetch_articles_page(fakeid, begin, count, keyword)
 
         return jsonify({
             "articles": articles,
             "total": total_count,
+            "can_msg_continue": can_continue,
             "begin": begin,
             "count": len(articles),
         })

@@ -37,3 +37,4 @@ def get_events():
     """取走踢出事件队列"""
     events = account_pool.pop_kick_events()
     return jsonify({"events": events})
+

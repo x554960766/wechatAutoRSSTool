@@ -33,7 +33,6 @@ DOWNLOAD_HISTORY_FILE = DATA_DIR / "download_history.json"
 
 # ── 微信 API 配置 ─────────────────────────────────────────
 BASE_URL = "https://mp.weixin.qq.com"
-WEREAD_PLATFORM_URL = "https://weread.111965.xyz"
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -53,7 +52,6 @@ DEFAULT_SETTINGS = {
     "concurrent_downloads": 1,
     "auto_save_images": True,
     "auto_save_videos": True,
-    "weread_platform_url": WEREAD_PLATFORM_URL,
     "device_id": "公众号_caiji100",
     "rss_start_hour": 0,
     "rss_start_minute": 0,

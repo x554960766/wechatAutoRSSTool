@@ -37,6 +37,7 @@ PROXY_SESSION_ID = str(int(time.time()))
 
 # 保存 MITM 启动前的 NO_PROXY 环境变量，用于停止时还原
 _original_no_proxy = None
+_last_captured_cred_hash = None
 
 # ── 证书管理 (Certificate Management) ──────────────────────────
 
@@ -578,6 +579,72 @@ class ChannelsAddon:
                 )
                 return
 
+            if path == "/__wx_official_api/log":
+                try:
+                    payload = json.loads(flow.request.get_text())
+                    msg = payload.get("message", "")
+                    print(f"[AutoRSSTool JS] {msg}", flush=True)
+                except Exception as ex:
+                    print(f"[AutoRSSTool JS LOG FAILED] {ex}", flush=True)
+                self._local_json(flow, 200, b'{"success":true}')
+                return
+
+            # 静默截获 mp.weixin.qq.com 各端 (Web/PC 微信/公众号后台) 客户端凭证参数与 Cookie
+            try:
+                import urllib.parse, re
+                parsed = urllib.parse.urlparse(flow.request.url)
+                qs = urllib.parse.parse_qs(parsed.query)
+
+                token = (qs.get("token") or qs.get("appmsg_token") or [""])[0]
+                key = (qs.get("key") or [""])[0]
+                pass_ticket = (qs.get("pass_ticket") or [""])[0]
+                uin = (qs.get("uin") or [""])[0]
+                cookie_str = flow.request.headers.get("Cookie", "")
+                if cookie_str:
+                    cookie_str = cookie_str.replace(", ", "; ")
+
+                if token:
+                    token = urllib.parse.unquote(token)
+
+                if not token and cookie_str:
+                    m = re.search(r'(?:^|;\s*)appmsg_token=([^;,\s]+)', cookie_str) or re.search(r'(?:^|;\s*)token=([^;,\s]+)', cookie_str)
+                    if m:
+                        token = urllib.parse.unquote(m.group(1))
+
+                if not pass_ticket and cookie_str:
+                    m = re.search(r'(?:^|;\s*)pass_ticket=([^;,\s]+)', cookie_str)
+                    if m:
+                        pass_ticket = urllib.parse.unquote(m.group(1))
+
+                if not uin and cookie_str:
+                    m = re.search(r'wxuin=([^;,\s]+)', cookie_str) or re.search(r'(?:^|;\s*)uin=([^;,\s]+)', cookie_str) or re.search(r'data_bizuin=([^;,\s]+)', cookie_str)
+                    if m:
+                        uin = urllib.parse.unquote(m.group(1))
+
+                user_agent = flow.request.headers.get("User-Agent", "")
+
+                if (token or pass_ticket or cookie_str) and (uin or "slave=" in cookie_str or "wxuin=" in cookie_str or "pass_ticket=" in cookie_str):
+                    from backend.account_pool import account_pool, _normalize_uin
+                    norm_uin = _normalize_uin(uin)
+                    cred_hash = f"{norm_uin}_{token}_{key}_{pass_ticket}"
+                    global _last_captured_cred_hash
+                    if cred_hash != _last_captured_cred_hash:
+                        _last_captured_cred_hash = cred_hash
+                        account_pool.add_or_update({
+                            "token": token,
+                            "appmsg_token": token,
+                            "key": key,
+                            "pass_ticket": pass_ticket,
+                            "uin": norm_uin,
+                            "cookie_str": cookie_str,
+                            "user_agent": user_agent,
+                            "nickname": "动态微信凭证",
+                            "save_time": time.time(),
+                        })
+                        print(f"[MITM Captured Credential] uin={norm_uin} token={token[:8] if token else ''}... key={key[:8] if key else ''}...", flush=True)
+            except Exception as cap_err:
+                print(f"[MITM Capture Error] {cap_err}")
+
     def response(self, flow):
         host = flow.request.pretty_host
         if host not in TARGET_HOSTS:
@@ -729,8 +796,17 @@ class ChannelsAddon:
             except Exception as ex:
                 print(f"[Proxy] Error reading injection scripts: {ex}", flush=True)
                 inject_script = ""
-        else:
+        elif host == "mp.weixin.qq.com":
             inject_script = f"<script>{get_injected_official_js()}</script>"
+            print(f"[Proxy Injected Official JS] path={flow.request.path}", flush=True)
+        else:
+            return
+
+        if host == "mp.weixin.qq.com":
+            meta_csp = re.search(r"<meta[^>]+http-equiv=[\"']?Content-Security-Policy[\"']?[^>]*>", html, flags=re.IGNORECASE)
+            if meta_csp:
+                print(f"[DIAG CSP] Found <meta CSP> tag, stripping: {meta_csp.group(0)}", flush=True)
+                html = html.replace(meta_csp.group(0), "")
 
         m = re.search(r"<head\b[^>]*>", html, flags=re.IGNORECASE)
         if m:
@@ -747,6 +823,13 @@ class ChannelsAddon:
                 del flow.response.headers[h]
         flow.response.headers["cache-control"] = "no-store, no-cache, must-revalidate, max-age=0"
         flow.response.headers["pragma"] = "no-cache"
+
+        if host == "mp.weixin.qq.com":
+            for h in ("content-security-policy", "x-content-security-policy", "x-webkit-csp"):
+                if h in flow.response.headers:
+                    csp_val = flow.response.headers[h]
+                    del flow.response.headers[h]
+                    print(f"[DIAG CSP] Stripped response header {h}: {csp_val}", flush=True)
 
 
 # ── Synced Data Saving (同步数据持久化) ──────────────────────────
@@ -1374,6 +1457,182 @@ def get_injected_official_js():
             document.body.appendChild(btn);
         }
         
+        // 3. Inject Auto-Refresh Keep-Alive Loop for Official Account Credentials inside PC WeChat WebView
+        function startAutoCredentialRefreshLoop() {
+            // 生产配置：动态随机区间 (探针 4~6 分钟，兜底 45~55 分钟)
+            function getNextPingInterval() {
+                return Math.floor(240000 + Math.random() * 120000); // 240s ~ 360s (4 ~ 6分钟)
+            }
+
+            function getNextSafetyReloadInterval() {
+                return Math.floor(2700000 + Math.random() * 600000); // 2700s ~ 3300s (45 ~ 55分钟)
+            }
+
+            function remoteLog(message) {
+                try {
+                    fetch('/__wx_official_api/log', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ message: message })
+                    }).catch(() => {});
+                } catch (e) {}
+            }
+
+            remoteLog('凭证自动续期已激活 (动态随机模式：探针4-6分钟/兜底45-55分钟)');
+
+            function findArticleLinkFromDom() {
+                // 1. 尝试从 window.msgList 或 window.cgiData 中读取 JSON
+                try {
+                    let rawList = window.msgList || (window.cgiData && window.cgiData.msgList);
+                    if (typeof rawList === 'string' && rawList.trim()) {
+                        let txt = rawList.replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+                        rawList = JSON.parse(txt);
+                    }
+                    if (rawList && rawList.list && rawList.list.length > 0) {
+                        for (const item of rawList.list) {
+                            const info = item.app_msg_ext_info;
+                            if (info && info.content_url) {
+                                let u = info.content_url.replace(/\\/g, '').replace(/&amp;/g, '&');
+                                if (u.startsWith('http://') || u.startsWith('https://') || u.startsWith('/s')) {
+                                    if (u.startsWith('/s')) u = 'https://mp.weixin.qq.com' + u;
+                                    return u;
+                                }
+                            }
+                        }
+                    }
+                } catch(e) {}
+
+                // 2. 尝试从 DOM 元素中提取
+                try {
+                    const selectors = ['a[href]', '[href_src]', '[data-link]', '[data-url]', '.weui_media_title', '.msg_title', '.appmsg_title', '.appmsg_title_link'];
+                    for (const sel of selectors) {
+                        const els = document.querySelectorAll(sel);
+                        for (const el of els) {
+                            let val = el.getAttribute('href') || el.getAttribute('href_src') || el.getAttribute('data-link') || el.getAttribute('data-url') || '';
+                            if (el.tagName === 'A' && el.href && !el.href.startsWith('javascript:')) {
+                                val = el.href;
+                            }
+                            val = val.replace(/&amp;/g, '&');
+                            if (val && (val.includes('/s?') || val.includes('/s/')) && !val.startsWith('javascript:')) {
+                                if (val.startsWith('/s')) val = 'https://mp.weixin.qq.com' + val;
+                                return val;
+                            }
+                        }
+                    }
+                } catch(e) {}
+
+                // 3. 尝试直接在 outerHTML 匹配 /s?__biz= 文章链接
+                try {
+                    const html = document.documentElement ? document.documentElement.outerHTML : '';
+                    const match = html.match(/(?:https?:\/\/mp\.weixin\.qq\.com)?\/s\?__biz=[^"'\s<>&]+(?:&amp;[^"'\s<>]+)*/i);
+                    if (match && match[0]) {
+                        let u = match[0].replace(/\\/g, '').replace(/&amp;/g, '&');
+                        if (u.startsWith('/s')) u = 'https://mp.weixin.qq.com' + u;
+                        return u;
+                    }
+                } catch(e) {}
+
+                return null;
+            }
+
+            function forceReloadPage() {
+                const urlParams = new URLSearchParams(window.location.search);
+                const biz = urlParams.get('__biz') || window.biz || '';
+                const onArticlePage = window.location.pathname.includes('/s');
+
+                if (onArticlePage && biz) {
+                    // 文章详情页 -> 跳转到该公众号文章列表页（不同页面，PC 微信重新签发凭证）
+                    remoteLog('导航至列表页获取新凭证');
+                    try {
+                        window.location.href = '/mp/profile_ext?action=home&__biz=' + biz + '&scene=124&_t=' + Date.now();
+                        return;
+                    } catch(e) {}
+                } else {
+                    // 列表页 -> 从页面中提取一篇文章链接跳转过去
+                    const articleUrl = findArticleLinkFromDom();
+                    if (articleUrl) {
+                        remoteLog('导航至文章页获取新凭证: ' + articleUrl);
+                        try {
+                            window.location.href = articleUrl;
+                            return;
+                        } catch(e) {}
+                    }
+                }
+                // 兜底：剥除旧 key 重载当前页面
+                remoteLog('剥除旧 key 重载当前页面');
+                try {
+                    const u = new URL(window.location.href);
+                    u.searchParams.delete('key');
+                    u.searchParams.delete('pass_ticket');
+                    u.searchParams.delete('uin');
+                    u.searchParams.delete('exportkey');
+                    u.searchParams.set('_t', Date.now());
+                    window.location.href = u.toString();
+                    return;
+                } catch(e) {}
+                try { window.location.href = window.location.href; return; } catch(e) {}
+                try { window.location.reload(); } catch(e) {}
+            }
+
+            function doPing() {
+                try {
+                    const urlParams = new URLSearchParams(window.location.search);
+                    let biz = urlParams.get('__biz') || window.biz || (window.cgiData && window.cgiData.biz) || '';
+                    let appmsg_token = urlParams.get('appmsg_token') || window.appmsg_token || '';
+                    let key = urlParams.get('key') || window.key || '';
+                    let pass_ticket = urlParams.get('pass_ticket') || window.pass_ticket || '';
+                    let uin = urlParams.get('uin') || window.uin || '';
+
+                    if (!biz && document.documentElement) {
+                        const m = document.documentElement.outerHTML.match(/(?:var\s+biz\s*=\s*|__biz=)"?([^"&'\s]+)"?/);
+                        if (m && m[1]) biz = m[1];
+                    }
+
+                    if (!biz) return;
+
+                    let pingUrl = `/mp/profile_ext?action=getmsg&__biz=${encodeURIComponent(biz)}&f=json&offset=0&count=1&is_ok=1&scene=126`;
+                    if (appmsg_token) pingUrl += `&appmsg_token=${encodeURIComponent(appmsg_token)}`;
+                    if (key) pingUrl += `&key=${encodeURIComponent(key)}`;
+                    if (pass_ticket) pingUrl += `&pass_ticket=${encodeURIComponent(pass_ticket)}`;
+                    if (uin) pingUrl += `&uin=${encodeURIComponent(uin)}`;
+
+                    fetch(pingUrl, { method: 'GET', cache: 'no-cache', headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+                        .then(r => r.json())
+                        .then(data => {
+                            if (data && (data.ret === -3 || data.ret === -4 || data.ret === 200003)) {
+                                remoteLog('凭证已过期 (ret=' + data.ret + ')，立即刷新');
+                                forceReloadPage();
+                            }
+                        })
+                        .catch(() => {});
+                } catch (e) {}
+            }
+
+            function scheduleNextPing() {
+                const nextMs = getNextPingInterval();
+                setTimeout(() => {
+                    doPing();
+                    scheduleNextPing();
+                }, nextMs);
+            }
+
+            function scheduleNextSafetyReload() {
+                const nextMs = getNextSafetyReloadInterval();
+                setTimeout(() => {
+                    forceReloadPage();
+                    scheduleNextSafetyReload();
+                }, nextMs);
+            }
+
+            setTimeout(doPing, 1000);
+            scheduleNextPing();
+            scheduleNextSafetyReload();
+
+            document.addEventListener('visibilitychange', () => {
+                if (!document.hidden) doPing();
+            });
+        }
+
         const interval = setInterval(() => {
             if (document.body) {
                 clearInterval(interval);
@@ -1383,6 +1642,7 @@ def get_injected_official_js():
                 }
                 // Always try to scan and inject buttons next to article links (e.g. list pages)
                 setInterval(injectListDownloadButtons, 1000);
+                startAutoCredentialRefreshLoop();
             }
         }, 100);
     })();

@@ -53,7 +53,7 @@ const LoginPage = {
             <div class="page-header" style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;">
                 <div>
                     <h2 class="page-title">账号池</h2>
-                    <p class="page-description">管理微信读书采集账号，支持多账号自动轮换</p>
+                    <p class="page-description">管理微信公众号与微信读书采集凭证，自动代理静默注入刷新</p>
                 </div>
                 <button class="btn btn-primary" id="btn-add-account" onclick="LoginPage.startLogin()">
                     <svg viewBox="0 0 24 24" fill="none" width="18" height="18">
@@ -95,8 +95,9 @@ const LoginPage = {
                     for (const ev of data.events) {
                         Toast.warning(`账号【${ev.nickname || '未知'}】${ev.reason}，已被移出账号池`);
                     }
-                    this.loadAccounts();
                 }
+                // 无论是否有事件都刷新，确保 mitmproxy 后台静默更新凭证后 UI 能同步
+                await this.loadAccounts();
             } catch (e) { /* silent */ }
         }, 15000);
     },
@@ -169,7 +170,6 @@ const LoginPage = {
     _renderCard(acc) {
         const statusColor = this.statusColor(acc.status);
         const statusText = this.statusLabel(acc.status);
-        const remaining = this.formatRemaining(acc.remaining_seconds);
         const isKicked = acc.status === 'banned' || acc.status === 'invalid';
         const isCooldown = acc.status === 'cooldown';
         const initial = (acc.nickname || '?').charAt(0);
@@ -220,14 +220,14 @@ const LoginPage = {
                     <div>失败: <strong>${acc.failures}</strong></div>
                     <div>风控: <strong>${acc.risk_hits}</strong></div>
                     <div style="grid-column: span 2;">
-                        有效期: <strong style="color: ${acc.remaining_seconds > 86400 ? 'var(--success)' : acc.remaining_seconds > 0 ? 'var(--warning)' : 'var(--error)'};">${remaining}</strong>
+                        凭证状态: <strong style="color: var(--success);">长期有效</strong>${acc.save_time ? `<span style="color: var(--text-muted); font-size: 0.76rem; margin-left: 6px;">(${this.formatDate(acc.save_time)} 添加)</span>` : ''}
                     </div>
                 </div>
 
                 ${extraInfo}
 
                 <!-- 操作按钮 -->
-                <div style="display: flex; gap: 8px; margin-top: 12px;">
+                <div style="display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap;">
                     ${isKicked ? `
                         <button class="btn btn-primary btn-sm" onclick="LoginPage.startLogin()" style="flex: 1; font-size: 0.8rem;">重新登录</button>
                     ` : ''}

@@ -184,17 +184,33 @@ def download_resource(url: str, path: Path) -> bool:
         proxies = get_proxies_dict()
         if proxies:
             proxy_url = proxies.get("http")
-        r = requests.get(
-            url,
-            headers={
-                "Referer": "https://mp.weixin.qq.com/",
-                "User-Agent": DEFAULT_HEADERS["User-Agent"],
-            },
-            proxies=proxies,
-            timeout=60,
-            stream=True,
-        )
-        r.raise_for_status()
+        try:
+            r = requests.get(
+                url,
+                headers={
+                    "Referer": "https://mp.weixin.qq.com/",
+                    "User-Agent": DEFAULT_HEADERS["User-Agent"],
+                },
+                proxies=proxies,
+                timeout=30,
+                stream=True,
+            )
+            r.raise_for_status()
+        except Exception:
+            if proxies:
+                r = requests.get(
+                    url,
+                    headers={
+                        "Referer": "https://mp.weixin.qq.com/",
+                        "User-Agent": DEFAULT_HEADERS["User-Agent"],
+                    },
+                    proxies={"http": None, "https": None},
+                    timeout=30,
+                    stream=True,
+                )
+                r.raise_for_status()
+            else:
+                raise
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
             for chunk in r.iter_content(8192):
@@ -357,6 +373,7 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "") -> di
     Returns:
         dict: {"success": bool, "title": str, "path": str, "error": str}
     """
+    url = normalize_url(url)
     settings = get_settings()
     save_images = settings.get("auto_save_images", True)
     save_videos = settings.get("auto_save_videos", True)
@@ -372,16 +389,33 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "") -> di
         proxies = get_proxies_dict()
         if proxies:
             proxy_url = proxies.get("http")
-        resp = requests.get(
-            url,
-            headers={
-                "User-Agent": DEFAULT_HEADERS["User-Agent"],
-                "Referer": "https://mp.weixin.qq.com/",
-            },
-            proxies=proxies,
-            timeout=60,
-        )
-        resp.raise_for_status()
+        try:
+            resp = requests.get(
+                url,
+                headers={
+                    "User-Agent": DEFAULT_HEADERS["User-Agent"],
+                    "Referer": "https://mp.weixin.qq.com/",
+                },
+                proxies=proxies,
+                timeout=30,
+            )
+            resp.raise_for_status()
+        except Exception as net_err:
+            if proxies:
+                # 代理请求失败，退回直连模式重试
+                resp = requests.get(
+                    url,
+                    headers={
+                        "User-Agent": DEFAULT_HEADERS["User-Agent"],
+                        "Referer": "https://mp.weixin.qq.com/",
+                    },
+                    proxies={"http": None, "https": None},
+                    timeout=30,
+                )
+                resp.raise_for_status()
+            else:
+                raise net_err
+
         report_proxy_status(proxy_url, success=True)
         resp.encoding = "utf-8"
         raw_html = resp.text

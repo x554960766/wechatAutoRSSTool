@@ -30,6 +30,22 @@ def _gen_id() -> str:
     return f"acc_{int(time.time())}_{suffix}"
 
 
+def _normalize_uin(uin_str: str) -> str:
+    """规范化 UIN：自动把 base64 编码的 UIN (如 MTQ1NDk1MDMyMA==) 解码为纯数字文本"""
+    if not uin_str:
+        return ""
+    uin_str = str(uin_str).strip()
+    if uin_str.endswith("==") or (len(uin_str) >= 12 and uin_str.isalnum()):
+        try:
+            import base64
+            decoded = base64.b64decode(uin_str).decode('utf-8', errors='ignore').strip()
+            if decoded.isdigit():
+                return decoded
+        except Exception:
+            pass
+    return uin_str
+
+
 class AccountPool:
     """账号池：存储、调度、状态上报、增删改查。全局单例。"""
 
@@ -196,96 +212,97 @@ class AccountPool:
         return result
 
     def add_or_update(self, cred: dict) -> dict:
-        """登录成功后写入/更新（按 token 或 nickname 去重）"""
+        """登录成功或动态抓包后写入/更新凭证（按 uin, token 或 nickname 去重与更新）"""
         with self._lock:
             accounts = self._load()
             token = cred.get("token", "")
+            raw_uin = cred.get("uin", "")
+            uin = _normalize_uin(raw_uin)
             nickname = cred.get("nickname", "公众号未命名")
+
+            # 0. 尝试按 uin 匹配
+            uin_match_acc = None
+            if uin:
+                for acc in accounts:
+                    acc_uin = _normalize_uin(acc.get("uin", ""))
+                    if acc_uin and acc_uin == uin:
+                        uin_match_acc = acc
+                        break
 
             # 1. 尝试按 token 匹配
             token_match_acc = None
-            for acc in accounts:
-                if acc.get("token") == token:
-                    token_match_acc = acc
-                    break
-
-            # 2. 如果 nickname 不是默认未命名，尝试按 nickname 匹配其他账号
-            nickname_match_acc = None
-            if nickname and nickname != "公众号未命名":
+            if token:
                 for acc in accounts:
-                    # 排除当前 token_match_acc 本身
-                    if acc.get("nickname") == nickname and (token_match_acc is None or acc != token_match_acc):
+                    if acc.get("token") and acc.get("token") == token:
+                        token_match_acc = acc
+                        break
+
+            # 2. 如果 nickname 不是默认值，尝试按 nickname 匹配其他账号
+            nickname_match_acc = None
+            if nickname and nickname not in ("公众号未命名", "动态微信凭证", "PC微信动态凭证"):
+                for acc in accounts:
+                    if acc.get("nickname") == nickname:
                         nickname_match_acc = acc
                         break
 
-            if token_match_acc and nickname_match_acc:
-                # 这种情况发生在：之前新增了 token_match_acc（当时名字是"公众号未命名"），
-                # 现在拿到了真实名字，发现和已有账号 nickname_match_acc 冲突。
-                # 此时把 token_match_acc 的凭证合并到 nickname_match_acc（保留旧ID），并删除 token_match_acc。
-                nickname_match_acc["token"] = token
-                nickname_match_acc["cookie_str"] = cred.get("cookie_str", "")
-                nickname_match_acc["cookies"] = cred.get("cookies", [])
-                nickname_match_acc["avatar"] = cred.get("avatar") or nickname_match_acc.get("avatar", "")
-                nickname_match_acc["save_time"] = cred.get("save_time", time.time())
-                nickname_match_acc["status"] = "active"
-                nickname_match_acc["failures"] = 0
-                nickname_match_acc["risk_hits"] = 0
-                nickname_match_acc["last_error"] = None
-                nickname_match_acc["cooldown_until"] = 0
-                nickname_match_acc["kicked_time"] = 0
-                
-                # 删除临时创建的 token_match_acc
-                accounts = [a for a in accounts if a != token_match_acc]
-                self._save(accounts)
-                logger.info("账号池合并: [%s] (保留旧ID %s, 删除临时ID %s)", nickname, nickname_match_acc["id"], token_match_acc["id"])
-                return nickname_match_acc
+            target_acc = uin_match_acc or token_match_acc or nickname_match_acc or (accounts[0] if accounts else None)
 
-            elif token_match_acc:
-                # 只有 token 匹配（可能是刚才新建的，或者是正在更新当前同 token 账号）
-                token_match_acc["cookie_str"] = cred.get("cookie_str", "")
-                token_match_acc["cookies"] = cred.get("cookies", [])
-                token_match_acc["nickname"] = nickname
+            if target_acc:
+                # 覆盖并升级已有账号的凭证（自愈恢复为 active）
+                if token:
+                    target_acc["token"] = token
+                if cred.get("appmsg_token"):
+                    target_acc["appmsg_token"] = cred.get("appmsg_token")
+                if cred.get("cookie_str"):
+                    target_acc["cookie_str"] = cred.get("cookie_str")
+                if cred.get("cookies"):
+                    target_acc["cookies"] = cred.get("cookies")
+                if nickname and nickname not in ("公众号未命名", "动态微信凭证", "PC微信动态凭证"):
+                    target_acc["nickname"] = nickname
                 if cred.get("avatar"):
-                    token_match_acc["avatar"] = cred.get("avatar")
-                token_match_acc["save_time"] = cred.get("save_time", time.time())
-                token_match_acc["status"] = "active"
-                token_match_acc["failures"] = 0
-                token_match_acc["risk_hits"] = 0
-                token_match_acc["last_error"] = None
-                token_match_acc["cooldown_until"] = 0
-                token_match_acc["kicked_time"] = 0
-                self._save(accounts)
-                logger.info("账号池更新: [%s]", nickname)
-                return token_match_acc
+                    target_acc["avatar"] = cred.get("avatar")
+                if cred.get("key"):
+                    target_acc["key"] = cred.get("key")
+                if cred.get("pass_ticket"):
+                    target_acc["pass_ticket"] = cred.get("pass_ticket")
+                if uin:
+                    target_acc["uin"] = uin
+                if cred.get("user_agent"):
+                    target_acc["user_agent"] = cred.get("user_agent")
 
-            elif nickname_match_acc:
-                # 只有 nickname 匹配（没有匹配到 token，说明是新登录的旧账号，直接更新老账号凭证）
-                nickname_match_acc["token"] = token
-                nickname_match_acc["cookie_str"] = cred.get("cookie_str", "")
-                nickname_match_acc["cookies"] = cred.get("cookies", [])
-                if cred.get("avatar"):
-                    nickname_match_acc["avatar"] = cred.get("avatar")
-                nickname_match_acc["save_time"] = cred.get("save_time", time.time())
-                nickname_match_acc["status"] = "active"
-                nickname_match_acc["failures"] = 0
-                nickname_match_acc["risk_hits"] = 0
-                nickname_match_acc["last_error"] = None
-                nickname_match_acc["cooldown_until"] = 0
-                nickname_match_acc["kicked_time"] = 0
-                self._save(accounts)
-                logger.info("账号池更新(按昵称): [%s]", nickname)
-                return nickname_match_acc
+                target_acc["save_time"] = cred.get("save_time", time.time())
+                target_acc["status"] = "active"
+                target_acc["failures"] = 0
+                target_acc["risk_hits"] = 0
+                target_acc["last_error"] = None
+                target_acc["cooldown_until"] = 0
+                target_acc["kicked_time"] = 0
+
+                # 自动清理由于格式不同产生的多余重复条目
+                cleaned_accounts = [a for a in accounts if a == target_acc or not (
+                    (_normalize_uin(a.get("uin")) and _normalize_uin(a.get("uin")) == uin) or
+                    (a.get("token") and a.get("token") == token)
+                )]
+
+                self._save(cleaned_accounts)
+                logger.info("账号池更新凭证并恢复: [%s] (ID: %s, UIN: %s)", target_acc.get("nickname"), target_acc["id"], target_acc.get("uin"))
+                return target_acc
 
             else:
                 # 全新账号，新增
                 new_acc = {
                     "id": _gen_id(),
                     "token": token,
+                    "appmsg_token": cred.get("appmsg_token", token),
                     "cookie_str": cred.get("cookie_str", ""),
                     "cookies": cred.get("cookies", []),
                     "nickname": nickname,
                     "avatar": cred.get("avatar", ""),
                     "save_time": cred.get("save_time", time.time()),
+                    "key": cred.get("key", ""),
+                    "pass_ticket": cred.get("pass_ticket", ""),
+                    "uin": uin,
+                    "user_agent": cred.get("user_agent", ""),
                     "status": "active",
                     "failures": 0,
                     "risk_hits": 0,
@@ -361,6 +378,48 @@ class AccountPool:
             self._kick_events.clear()
             return events
 
+    def try_refresh_account(self, account_id: str) -> bool:
+        """当账号失效时，尝试通过代理对微信后台发起轻量探针请求，触发 mitm_proxy 捕获最新的 Set-Cookie / Token"""
+        with self._lock:
+            accounts = self._load()
+            acc = next((a for a in accounts if a["id"] == account_id), None)
+            if not acc:
+                return False
+            cookie_str = acc.get("cookie_str", "")
+            ua = acc.get("user_agent") or "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) MicroMessenger/6.8.0 MacWechat/store"
+
+        if not cookie_str:
+            return False
+
+        try:
+            from backend.config import get_proxies_dict
+            import requests
+            headers = {"User-Agent": ua, "Cookie": cookie_str}
+            proxies = get_proxies_dict()
+            resp = requests.get(
+                "https://mp.weixin.qq.com/cgi-bin/home?t=home/index",
+                headers=headers,
+                proxies=proxies,
+                timeout=8,
+                verify=False
+            )
+            if resp.status_code == 200:
+                with self._lock:
+                    accs = self._load()
+                    for a in accs:
+                        if a["id"] == account_id:
+                            a["save_time"] = time.time()
+                            a["status"] = "active"
+                            a["failures"] = 0
+                            a["last_error"] = None
+                            break
+                    self._save(accs)
+                return True
+        except Exception as e:
+            logger.debug("账号 [%s] HTTP 刷新探针执行失败: %s", account_id, e)
+
+        return False
+
 
 # ── 全局单例 ──────────────────────────────────────────
 
@@ -397,3 +456,4 @@ def migrate_legacy_config():
             "save_time": legacy.get("save_time", time.time()),
         })
         logger.info("已将旧 wechat_mp_config.json 迁移到账号池")
+
