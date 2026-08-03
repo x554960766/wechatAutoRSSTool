@@ -696,11 +696,11 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "") -> di
         "publish_time": publish_time,
         "content": raw_localized
     }
-    (art_dir / "data.json").write_text(json.dumps(new_json_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    (art_dir / "data.json").write_text(json.dumps(new_json_data, ensure_ascii=False, indent=2), encoding="utf-8", errors="replace")
 
     # 保存纯文本内容（用于 AI 一键转写）
     clean_text = clean_html_to_text(content_html)
-    (art_dir / "content.txt").write_text(clean_text, encoding="utf-8")
+    (art_dir / "content.txt").write_text(clean_text, encoding="utf-8", errors="replace")
 
     # 保存元数据
     meta = {
@@ -718,7 +718,8 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "") -> di
     }
     (art_dir / "metadata.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2),
-        encoding="utf-8"
+        encoding="utf-8",
+        errors="replace"
     )
 
     return {

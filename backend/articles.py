@@ -637,7 +637,7 @@ def _sync_history_from_disk(history: list) -> bool:
                     continue
 
                 try:
-                    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                    meta = json.loads(meta_file.read_bytes().decode("utf-8-sig", errors="replace"))
                     link = meta.get("url", "")
                     mtime = art_dir.stat().st_mtime
                     time_val = mtime
@@ -1307,7 +1307,7 @@ def get_rss(account=None):
             try:
                 txt_path = Path(path_str) / "content.txt"
                 if txt_path.exists():
-                    clean_text = txt_path.read_text(encoding="utf-8")
+                    clean_text = txt_path.read_bytes().decode("utf-8-sig", errors="replace")
                     clean_text = clean_text.replace("]]>", "]]&gt;")
                     content_encoded = f"<content:encoded><![CDATA[{clean_text}]]></content:encoded>"
             except Exception:

@@ -50,7 +50,7 @@ HEADERS     = {
 # ============================================================
 
 def load_credentials():
-    cfg = json.loads(CONFIG_FILE.read_text())
+    cfg = json.loads(CONFIG_FILE.read_bytes().decode("utf-8-sig", errors="replace"))
     return cfg["token"], cfg["cookie_str"]
 
 

@@ -54,7 +54,7 @@ def load_credentials():
     pool_file = DATA_DIR / "account_pool.json"
     if pool_file.exists():
         try:
-            accounts = json.loads(pool_file.read_text(encoding="utf-8"))
+            accounts = json.loads(pool_file.read_bytes().decode("utf-8-sig", errors="replace"))
             active = [a for a in accounts if a.get("status") == "active" and (a.get("token") or a.get("cookie_str"))]
             if active:
                 acc = active[0]
@@ -66,7 +66,7 @@ def load_credentials():
             pass
 
     if CONFIG_FILE.exists():
-        cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        cfg = json.loads(CONFIG_FILE.read_bytes().decode("utf-8-sig", errors="replace"))
         token = cfg.get("token", "")
         cookie_str = cfg.get("cookie_str", "") or cfg.get("cookie", "")
         if token:
