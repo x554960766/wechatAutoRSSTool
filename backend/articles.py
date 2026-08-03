@@ -983,7 +983,8 @@ def _do_range_download(
                         return
                     task["current"] = f"正在获取第 {begin // page_size + 1} 页"
 
-                articles, total_count = _fetch_articles_page(fakeid, begin, page_size, keyword)
+                res = _fetch_articles_page(fakeid, begin, page_size, keyword)
+                articles, total_count = res[0], res[1]
                 if not articles:
                     stop = True
                     with _download_lock:

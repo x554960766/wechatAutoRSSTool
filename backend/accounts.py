@@ -68,32 +68,93 @@ def search_accounts():
             "error": "请粘贴该公众号的任意文章链接（例如 https://mp.weixin.qq.com/s/...）以解析添加"
         }), 400
 
+    import urllib.parse, re, html
     try:
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
+
+        # 1. 尝试从输入 URL Query 中提取 __biz
+        parsed = urllib.parse.urlparse(keyword)
+        qs = urllib.parse.parse_qs(parsed.query)
+        fakeid = None
+        if qs.get("__biz") and qs.get("__biz")[0]:
+            b = qs.get("__biz")[0].strip()
+            if not b.startswith("${") and len(b) >= 8:
+                fakeid = b
+
+        # 2. 借用账号池 Session Cookie 请求文章页面，规避 verify 验证码重定向
+        cookie_str = ""
         try:
-            resp = req.get(keyword, headers=headers, timeout=15, verify=False)
+            _, _, cookie_str = borrow_session()
         except Exception:
+            pass
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.5304.110 Safari/537.36 NetType/WIFI MicroMessenger/6.8.0(0x16080000) MacWechat/store ClientCanvas/1.0.0"
+        }
+        if cookie_str:
+            headers["Cookie"] = cookie_str
+
+        try:
             from curl_cffi import requests as c_req
-            resp = c_req.get(keyword, headers=headers, timeout=15, impersonate="chrome", verify=False)
+            resp = c_req.get(keyword, headers=headers, impersonate="chrome", allow_redirects=True, timeout=15, verify=False)
+        except Exception:
+            resp = req.get(keyword, headers=headers, timeout=15, verify=False)
+
         if resp.status_code != 200:
             return jsonify({"error": f"请求文章页面失败 (HTTP {resp.status_code})"}), 400
 
-        html = resp.text
-        import re
-        biz_match = re.search(r'__biz=([^&"#\s]+)', html) or re.search(r'var\s+biz\s*=\s*"([^"]+)"', html)
-        nickname_match = re.search(r'var\s+nickname\s*=\s*"([^"]+)"', html) or re.search(r'class="profile_nickname">([^<]+)<', html) or re.search(r'id="js_name">\s*([^\s<]+)', html)
-        head_img_match = re.search(r'var\s+hd_head_img\s*=\s*"([^"]+)"', html) or re.search(r'var\s+msg_cdn_url\s*=\s*"([^"]+)"', html)
+        html_text = resp.text
 
-        if not biz_match:
-            return jsonify({"error": "未能从文章页面解析出公众号标识 (__biz)，请确认链接是否为公众号文章！"}), 400
+        # 3. 若 URL 无 __biz，从重定向后的 URL 中提取
+        if not fakeid:
+            resp_qs = urllib.parse.parse_qs(urllib.parse.urlparse(resp.url).query)
+            if resp_qs.get("__biz") and resp_qs.get("__biz")[0]:
+                b = resp_qs.get("__biz")[0].strip()
+                if not b.startswith("${") and len(b) >= 8:
+                    fakeid = b
 
-        fakeid = biz_match.group(1)
-        nickname = nickname_match.group(1).strip() if nickname_match else "公众号"
-        head_img = head_img_match.group(1) if head_img_match else ""
+        # 4. 从 HTML 源码中正则匹配干净的 base64 __biz
+        if not fakeid:
+            m = (re.search(r'__biz=([A-Za-z0-9+/=]{10,})', html_text) or
+                 re.search(r'var\s+biz\s*=\s*"([A-Za-z0-9+/=]{10,})"', html_text) or
+                 re.search(r'biz\s*:\s*"([A-Za-z0-9+/=]{10,})"', html_text))
+            if m:
+                fakeid = m.group(1)
+
+        # 5. 清理 fakeid 中可能的尾部转义符或多余参数
+        if fakeid:
+            fakeid = re.split(r'[\\&"\'#\s]', fakeid)[0].strip()
+
+        if not fakeid or is_legacy_fakeid(fakeid):
+            return jsonify({"error": "未能从文章页面解析出有效的公众号标识 (__biz)，请确认链接是否为真实的微信公众号文章！"}), 400
+
+        # 6. 解析公众号昵称
+        nickname = "公众号"
+        m_nick = (re.search(r'var\s+nickname\s*=\s*htmlDecode\("([^"]+)"\)', html_text) or
+                  re.search(r'var\s+nickname\s*=\s*"([^"]+)"', html_text) or
+                  re.search(r'nickname\s*:\s*\'([^\']+)\'', html_text) or
+                  re.search(r'class="profile_nickname">([^<]+)<', html_text) or
+                  re.search(r'id="js_name">\s*([^\s<]+)', html_text) or
+                  re.search(r'class="account_nickname_inner">([^<]+)<', html_text) or
+                  re.search(r'<meta\s+property="og:article:author"\s+content="([^"]+)"', html_text))
+        if m_nick and m_nick.group(1).strip():
+            nickname = html.unescape(m_nick.group(1).strip())
+
+        # 7. 解析头像
+        head_img = ""
+        m_img = (re.search(r'var\s+hd_head_img\s*=\s*"([^"]+)"', html_text) or
+                 re.search(r'var\s+msg_cdn_url\s*=\s*"([^"]+)"', html_text) or
+                 re.search(r'class="account_avatar">\s*<img\s+src="([^"]+)"', html_text) or
+                 re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', html_text))
+        if m_img and m_img.group(1).strip():
+            head_img = m_img.group(1).strip().replace("\\/", "/")
+
+        # 8. 解析签名
+        signature = ""
+        m_sig = re.search(r'var\s+profile_signature\s*=\s*"([^"]+)"', html_text)
+        if m_sig and m_sig.group(1).strip():
+            signature = html.unescape(m_sig.group(1).strip()).replace("\\x0a", " ")
 
         results = [{
             "fakeid": fakeid,
@@ -101,7 +162,7 @@ def search_accounts():
             "alias": fakeid,
             "round_head_img": head_img,
             "service_type": 1,
-            "signature": "",
+            "signature": signature,
             "update_time": int(time.time()),
         }]
         return jsonify({"results": results, "total": len(results)})

@@ -62,9 +62,7 @@ class RssScheduler:
         if not fakeid:
             return True
         fid = str(fakeid).strip()
-        if fid.endswith("="):
-            return True
-        if not fid.startswith("MP_WXS_") and len(fid) >= 16 and not fid.isdigit():
+        if fid == "${window.biz}" or "${" in fid:
             return True
         return False
 
@@ -586,7 +584,8 @@ class RssScheduler:
             
             try:
                 for page_idx in range(max_pages):
-                    page_articles, _total = _fetch_articles_page(fakeid, begin=begin, count=count)
+                    res = _fetch_articles_page(fakeid, begin=begin, count=count)
+                    page_articles, _total = res[0], res[1]
                     if not page_articles:
                         break
                     
