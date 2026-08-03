@@ -55,13 +55,21 @@ const LoginPage = {
                     <h2 class="page-title">账号池</h2>
                     <p class="page-description">管理微信读书采集账号，支持多账号自动轮换</p>
                 </div>
-                <button class="btn btn-primary" id="btn-add-account" onclick="LoginPage.startLogin()">
-                    <svg viewBox="0 0 24 24" fill="none" width="18" height="18">
-                        <line x1="12" y1="5" x2="12" y2="19" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-                        <line x1="5" y1="12" x2="19" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-                    </svg>
-                    添加账号
-                </button>
+                <div style="display: flex; gap: 10px;">
+                    <button class="btn btn-secondary" id="btn-import-cookie" onclick="LoginPage.showImportModal()">
+                        <svg viewBox="0 0 24 24" fill="none" width="18" height="18" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 4px; vertical-align: middle;">
+                            <path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>
+                        </svg>
+                        导入凭证/Cookie
+                    </button>
+                    <button class="btn btn-primary" id="btn-add-account" onclick="LoginPage.startLogin()">
+                        <svg viewBox="0 0 24 24" fill="none" width="18" height="18" style="margin-right: 4px; vertical-align: middle;">
+                            <line x1="12" y1="5" x2="12" y2="19" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                            <line x1="5" y1="12" x2="19" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                        </svg>
+                        扫码添加
+                    </button>
+                </div>
             </div>
 
             <div id="pool-summary" style="margin-bottom: 20px;"></div>
@@ -410,4 +418,80 @@ const LoginPage = {
             }
         });
     },
+
+    showImportModal() {
+        const isWhite = document.body.classList.contains('dy-theme');
+        Modal.open({
+            title: '🔗 导入 Web Cookie 或 官方 API Key',
+            content: `
+                <div style="display: flex; flex-direction: column; gap: 12px; text-align: left;">
+                    <div>
+                        <label style="font-weight: 600; font-size: 0.9rem; color: ${isWhite ? '#1e293b' : 'var(--text-primary)'}; display: block; margin-bottom: 6px;">
+                            选项 A：官方 API Key (永远有效，免中转)
+                        </label>
+                        <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 8px;">
+                            形式如 <code>wrk-xxxxxx</code>。获取方式：手机微信读书 App -> “我” -> “设置” -> “开发者技能” 中生成并复制。
+                        </p>
+                    </div>
+                    <hr style="border: 0; border-top: 1px solid var(--border-color); margin: 4px 0;" />
+                    <div>
+                        <label style="font-weight: 600; font-size: 0.9rem; color: ${isWhite ? '#1e293b' : 'var(--text-primary)'}; display: block; margin-bottom: 6px;">
+                            选项 B：微信读书网页版 Cookie (自动续期保活，直连)
+                        </label>
+                        <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 8px;">
+                            包含 <code>wr_vid=xxx; wr_skey=xxx</code> 的 Cookie 字符串。获取方式：电脑登录 <a href="https://weread.qq.com" target="_blank" style="color: #07c160; text-decoration: underline;">微信读书网页版</a>，打开 F12 控制台输入 <code>document.cookie</code> 回车并复制全部。
+                        </p>
+                    </div>
+                    <div style="display: flex; flex-direction: column; gap: 6px;">
+                        <textarea id="import-cookie-input" class="form-input" rows="4" 
+                            placeholder="请在这里粘贴官方 API Key (wrk-...) 或 微信读书网页版整个 Cookie 字符串..."
+                            style="font-family: monospace; font-size: 0.85rem; width: 100%; box-sizing: border-box; resize: vertical;"></textarea>
+                    </div>
+                    <div style="display: flex; flex-direction: column; gap: 6px;">
+                        <label style="font-size: 0.85rem; font-weight: 600; color: ${isWhite ? '#1e293b' : 'var(--text-primary)'};">账号备注 (可选)</label>
+                        <input id="import-nickname-input" type="text" class="form-input" placeholder="例如：我的小号 (留空自动生成)" style="width: 100%; box-sizing: border-box;" />
+                    </div>
+                    <div id="import-cookie-error" style="color: var(--error); font-size: 0.82rem; display: none; margin-top: 4px;"></div>
+                </div>
+            `,
+            footer: `
+                <button class="btn btn-secondary" onclick="Modal.close()">取消</button>
+                <button class="btn btn-primary" id="btn-import-submit" onclick="LoginPage.submitImportedCookie()">确定导入</button>
+            `,
+            theme: isWhite ? 'white' : ''
+        });
+    },
+
+    async submitImportedCookie() {
+        const inputVal = document.getElementById('import-cookie-input').value.trim();
+        const nicknameVal = document.getElementById('import-nickname-input').value.trim();
+        const errorEl = document.getElementById('import-cookie-error');
+        const submitBtn = document.getElementById('btn-import-submit');
+
+        if (!inputVal) {
+            errorEl.textContent = '输入内容不能为空';
+            errorEl.style.display = 'block';
+            return;
+        }
+
+        submitBtn.disabled = true;
+        submitBtn.textContent = '正在导入并验证...';
+        errorEl.style.display = 'none';
+
+        try {
+            const resp = await API.post('/api/account-pool/import-cookie', {
+                cookie_str: inputVal,
+                nickname: nicknameVal
+            });
+            Toast.success(resp.message || '导入成功！');
+            Modal.close(true);
+            this.loadAccounts();
+            App.checkAuthStatus();
+        } catch (err) {
+            errorEl.textContent = err.message || '验证失败，请确认凭证/Cookie 正确有效';
+            errorEl.style.display = 'block';
+            submitBtn.disabled = false;
+            submitBtn.textContent = '确定导入';
+        }
+    }
 };

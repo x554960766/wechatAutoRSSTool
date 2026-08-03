@@ -562,6 +562,7 @@ class RssScheduler:
         from backend.articles import _fetch_articles_page
         from backend.downloader import download_single_article
         from backend.config import load_json, save_json, DOWNLOAD_HISTORY_FILE, OUTPUT_DIR, get_settings
+        import random
 
         fakeid = sub["fakeid"]
         nickname = sub["nickname"]
@@ -570,6 +571,9 @@ class RssScheduler:
         new_count = 0
         total_articles = sub.get("total_articles", 0)
         upload_result = None
+
+        # 错峰延时：随机等待 3 到 8 秒，分散高并发请求，避免触发微信风控
+        time.sleep(random.uniform(3.0, 8.0))
 
         try:
             existing = self.get_articles(nickname)
@@ -600,13 +604,13 @@ class RssScheduler:
                             else:
                                 new_articles.append(art)
                     
-                    # 如果当前页中包含了已有的老文章，或者新文章总数已经太多了，就不需要再往后翻页了
-                    if has_old_article or len(page_articles) < count:
+                    # 如果当前页中包含了已有的老文章，或者新文章总数已经满足，或者返回的文章长度小于请求数，或者已抓完总数
+                    if has_old_article or len(page_articles) < count or (begin + len(page_articles) >= _total):
                         break
                     
                     begin += count
                     # 翻页间稍作延时，避免被微信风控
-                    time.sleep(1.5)
+                    time.sleep(random.uniform(2.0, 4.5))
 
                 if new_articles:
                     # 准备下载目录

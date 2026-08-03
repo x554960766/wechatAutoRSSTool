@@ -85,8 +85,75 @@ class AccountPool:
             selected["last_used"] = now
             changed = True
 
+            # Web Cookie 自动保活：如果 save_time 超过 1 小时，进行自动刷新
+            token = selected.get("token", "")
+            is_jwt = token.startswith("eyJ")
+            is_official = token.startswith("wrk-")
+            if not is_jwt and not is_official and selected.get("cookie_str"):
+                if now - selected.get("save_time", 0) >= 3600:
+                    self._renew_web_cookie_in_place(selected)
+
             self._save(accounts)
             return dict(selected)  # 返回副本
+
+    def _renew_web_cookie_in_place(self, acc: dict) -> bool:
+        """对 Web Cookie 账号发起保活请求，更新其 wr_skey 和 save_time"""
+        cookie_str = acc.get("cookie_str", "")
+        if not cookie_str:
+            return False
+        
+        url = "https://weread.qq.com/web/login/renewal"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://weread.qq.com/",
+            "Content-Type": "application/json",
+            "Cookie": cookie_str
+        }
+        
+        logger.info("正在为账号 [%s] 发起 Web Cookie 续期保活...", acc.get("nickname"))
+        try:
+            import requests as req
+            resp = req.post(url, json={}, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                # 寻找返回的 wr_skey Cookie
+                new_skey = resp.cookies.get("wr_skey")
+                if not new_skey:
+                    # 尝试从 headers 解析
+                    for cookie in resp.headers.get("Set-Cookie", "").split(","):
+                        if "wr_skey=" in cookie:
+                            new_skey = cookie.split("wr_skey=")[1].split(";")[0].strip()
+                            break
+                
+                if new_skey:
+                    # 更新 cookie_str 中的 wr_skey
+                    parts = []
+                    has_skey = False
+                    for p in cookie_str.split(";"):
+                        p = p.strip()
+                        if not p:
+                            continue
+                        if p.startswith("wr_skey="):
+                            parts.append(f"wr_skey={new_skey}")
+                            has_skey = True
+                        else:
+                            parts.append(p)
+                    if not has_skey:
+                        parts.append(f"wr_skey={new_skey}")
+                    
+                    new_cookie_str = "; ".join(parts)
+                    acc["cookie_str"] = new_cookie_str
+                    acc["save_time"] = time.time()
+                    acc["failures"] = 0
+                    acc["last_error"] = None
+                    logger.info("账号 [%s] Web Cookie 续期成功！新的 wr_skey: %s", acc.get("nickname"), new_skey[:6] + "...")
+                    return True
+                else:
+                    logger.warning("账号 [%s] 续期请求成功，但未返回新的 wr_skey", acc.get("nickname"))
+            else:
+                logger.warning("账号 [%s] 续期请求失败: HTTP %d", acc.get("nickname"), resp.status_code)
+        except Exception as e:
+            logger.error("账号 [%s] 续期请求异常: %s", acc.get("nickname"), e)
+        return False
 
     def report(self, account_id: str, *, ret: int | None = None,
                http_ok: bool = True, error: str | None = None):
@@ -131,18 +198,28 @@ class AccountPool:
                     acc["cooldown_until"] = now + COOLDOWN_SECONDS
                     logger.info("账号 [%s] 进入冷却 %ds", acc.get("nickname"), COOLDOWN_SECONDS)
             elif ret == 200003 or "WeReadError401" in err_str:
-                # 登录态失效
-                acc["status"] = "invalid"
-                acc["kicked_time"] = now
+                # 登录态异常（可能是微信风控限制频率时的401假报错）
+                # 为了防止临时风控导致账号直接被踢，我们增加失败重试阈值
+                acc["failures"] = acc.get("failures", 0) + 1
                 acc["last_error"] = error or "登录态失效 (WeRead401)"
-                self._kick_events.append({
-                    "id": acc["id"],
-                    "nickname": acc.get("nickname", ""),
-                    "reason": acc["last_error"],
-                    "time": now,
-                    "status": "invalid",
-                })
-                logger.warning("账号 [%s] 被踢出(invalid): %s", acc.get("nickname"), acc["last_error"])
+                if acc["failures"] >= 3:
+                    acc["status"] = "invalid"
+                    acc["kicked_time"] = now
+                    acc["last_error"] = f"连续登录失效 {acc['failures']} 次，判定已过期"
+                    self._kick_events.append({
+                        "id": acc["id"],
+                        "nickname": acc.get("nickname", ""),
+                        "reason": acc["last_error"],
+                        "time": now,
+                        "status": "invalid",
+                    })
+                    logger.warning("账号 [%s] 判定已失效被踢出: %s", acc.get("nickname"), acc["last_error"])
+                else:
+                    # 放入冷却状态，等待自动恢复（应对微信临时频率风控）
+                    acc["status"] = "cooldown"
+                    acc["cooldown_until"] = now + COOLDOWN_SECONDS
+                    logger.info("账号 [%s] 登录态异常 (%s)，第 %d 次，进入冷却 %ds", 
+                                acc.get("nickname"), acc["last_error"], acc["failures"], COOLDOWN_SECONDS)
             elif not http_ok:
                 # 网络层失败
                 acc["failures"] = acc.get("failures", 0) + 1

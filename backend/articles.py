@@ -72,6 +72,8 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "")
         except RuntimeError as e:
             raise RuntimeError(str(e))
 
+        is_official = token.startswith("wrk-")
+        
         headers = {
             "xid": str(account_id),
             "Authorization": f"Bearer {token}",
@@ -81,23 +83,60 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "")
 
         try:
             from curl_cffi import requests as c_req
-            resp = c_req.get(
-                f"{platform_url}/api/v2/platform/mps/{fakeid}/articles",
-                params={"page": page},
-                headers=headers,
-                proxies=proxies,
-                timeout=30,
-                impersonate="chrome",
-            )
-        except Exception as e:
-            try:
-                resp = req.get(
+            if is_official:
+                resp = c_req.post(
+                    "https://i.weread.qq.com/api/agent/gateway",
+                    json={
+                        "api_name": "/book/articles",
+                        "bookId": fakeid,
+                        "offset": begin,
+                        "count": count,
+                        "skill_version": "1.0.4"
+                    },
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json"
+                    },
+                    proxies=proxies,
+                    timeout=30,
+                    impersonate="chrome",
+                )
+            else:
+                resp = c_req.get(
                     f"{platform_url}/api/v2/platform/mps/{fakeid}/articles",
                     params={"page": page},
                     headers=headers,
                     proxies=proxies,
                     timeout=30,
+                    impersonate="chrome",
                 )
+        except Exception as e:
+            try:
+                if is_official:
+                    resp = req.post(
+                        "https://i.weread.qq.com/api/agent/gateway",
+                        json={
+                            "api_name": "/book/articles",
+                            "bookId": fakeid,
+                            "offset": begin,
+                            "count": count,
+                            "skill_version": "1.0.4"
+                        },
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "Content-Type": "application/json"
+                        },
+                        proxies=proxies,
+                        timeout=30,
+                    )
+                else:
+                    resp = req.get(
+                        f"{platform_url}/api/v2/platform/mps/{fakeid}/articles",
+                        params={"page": page},
+                        headers=headers,
+                        proxies=proxies,
+                        timeout=30,
+                    )
             except Exception as exc:
                 report_proxy_status(proxy_url, success=False)
                 account_pool.report(account_id, http_ok=False, error=str(exc))
