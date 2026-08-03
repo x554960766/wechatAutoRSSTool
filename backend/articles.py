@@ -80,7 +80,11 @@ def _fetch_articles_via_appmsg_fallback(fakeid: str, begin: int, count: int, key
             timeout=20,
         )
         if resp.status_code == 200:
-            data = resp.json()
+            try:
+                resp_text = resp.content.decode("utf-8", errors="replace") if hasattr(resp, "content") and resp.content else (resp.text or "")
+                data = json.loads(resp_text)
+            except Exception:
+                data = {}
             if data.get("base_resp", {}).get("ret") == 0:
                 articles = []
                 for item in data.get("app_msg_list", []):
@@ -210,7 +214,8 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "")
 
         report_proxy_status(proxy_url, success=True)
         try:
-            data = resp.json()
+            resp_text = resp.content.decode("utf-8", errors="replace") if hasattr(resp, "content") and resp.content else (resp.text or "")
+            data = json.loads(resp_text)
         except Exception:
             last_exc = RuntimeError("返回数据非 JSON 格式（可能需要重新在微信电脑版打开历史消息更新 key/token）")
             continue

@@ -104,13 +104,14 @@ def ensure_dirs():
 
 
 def load_json(filepath: Path, default=None):
-    """安全地加载 JSON 文件"""
+    """安全地加载 JSON 文件（兼容 Windows BOM 头部与非法字符）"""
     if default is None:
         default = {}
     try:
         if filepath.exists():
-            return json.loads(filepath.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, IOError):
+            content = filepath.read_bytes().decode("utf-8-sig", errors="replace")
+            return json.loads(content)
+    except Exception:
         pass
     return default
 
@@ -120,7 +121,8 @@ def save_json(filepath: Path, data):
     filepath.parent.mkdir(parents=True, exist_ok=True)
     filepath.write_text(
         json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8"
+        encoding="utf-8",
+        errors="replace"
     )
 
 

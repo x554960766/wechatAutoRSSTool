@@ -148,9 +148,9 @@ class RssScheduler:
         if not isinstance(value, str) or not value or len(value) % 4 != 0:
             return False
         try:
-            base64.b64decode(value.encode("ascii"), validate=True).decode("utf-8")
+            base64.b64decode(value.encode("utf-8", errors="ignore"), validate=True).decode("utf-8", errors="replace")
             return True
-        except (binascii.Error, UnicodeError, ValueError):
+        except Exception:
             return False
 
     def _normalize_upload_article(self, article: dict, encode_content: bool = True) -> dict | None:
@@ -267,15 +267,15 @@ class RssScheduler:
                 headers={"Content-Type": "application/json"},
                 proxies=get_proxies_dict(), timeout=30,
             )
-            # 记录网关响应（状态码+正文），用于排查「已标记上传但服务器没有」的静默丢弃
-            self._last_upload_response = f"HTTP {resp.status_code} | {(resp.text or '')[:500]}"
+            resp_text = resp.content.decode("utf-8", errors="replace") if hasattr(resp, "content") and resp.content else (resp.text or "")
+            self._last_upload_response = f"HTTP {resp.status_code} | {resp_text[:500]}"
             logger.info("RSS 上传响应[%d篇]: %s", len(articles), self._last_upload_response[:300])
             resp.raise_for_status()
             try:
-                data = resp.json()
+                data = json.loads(resp_text)
                 if isinstance(data, dict) and data.get("success") is False:
                     return False, (data.get("message") or data.get("error") or "远端接口返回失败")
-            except ValueError:
+            except Exception:
                 pass
             return True, None
         except Exception as e:
