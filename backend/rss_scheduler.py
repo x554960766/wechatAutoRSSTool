@@ -14,7 +14,7 @@ import random
 import requests
 from pathlib import Path
 
-from backend.config import DATA_DIR, load_json, save_json
+from backend.config import DATA_DIR, load_json, save_json, normalize_wechat_url
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +179,10 @@ class RssScheduler:
         return normalized
 
     def _article_upload_key(self, article: dict) -> str:
-        return article.get("url") or article.get("link") or json.dumps(article, ensure_ascii=False, sort_keys=True)
+        url = article.get("url") or article.get("link")
+        if url:
+            return normalize_wechat_url(url)
+        return json.dumps(article, ensure_ascii=False, sort_keys=True)
 
     def _dedupe_upload_articles(self, articles: list, encode_content: bool = True) -> list:
         seen = set()
@@ -571,11 +574,12 @@ class RssScheduler:
 
         try:
             existing = self.get_articles(nickname)
-            existing_links = {a.get("link") for a in existing}
+            existing_links = {normalize_wechat_url(a.get("link")) for a in existing if a.get("link")}
             
-            # 加载历史记录，用于去重和录入
+            # 加载历史记录，用于归一化链接去重和 (账号, 标题) 双重兜底去重（仅针对已成功下载的记录去重，失败记录允许重新尝试下载）
             history = load_json(DOWNLOAD_HISTORY_FILE, [])
-            history_links = {item.get("link") for item in history if isinstance(item, dict) and item.get("link")}
+            history_links = {normalize_wechat_url(item.get("link")) for item in history if isinstance(item, dict) and item.get("link") and item.get("success")}
+            history_titles = {(item.get("account"), item.get("title")) for item in history if isinstance(item, dict) and item.get("account") and item.get("title") and item.get("success")}
 
             new_articles = []
             begin = 0
@@ -591,13 +595,23 @@ class RssScheduler:
                     
                     has_old_article = False
                     for art in page_articles:
-                        link = art.get("link")
-                        if link:
-                            # 如果已经在 RSS 缓存或下载历史中，说明后面的文章都是已下载过的老文章了
-                            if link in existing_links or link in history_links:
-                                has_old_article = True
-                            else:
-                                new_articles.append(art)
+                        link = art.get("link", "")
+                        title = art.get("title", "")
+                        norm_link = normalize_wechat_url(link)
+                        
+                        # 查重：若规范化 URL 在 RSS/历史记录中，或者 (公众号, 标题) 已存在，均判定为老文章
+                        is_duplicate = (
+                            (norm_link and (norm_link in existing_links or norm_link in history_links))
+                            or ((nickname, title) in history_titles)
+                        )
+                        if is_duplicate:
+                            has_old_article = True
+                        else:
+                            new_articles.append(art)
+                            if norm_link:
+                                existing_links.add(norm_link)
+                            if title:
+                                history_titles.add((nickname, title))
                     
                     # 如果当前页中包含了已有的老文章，或者新文章总数已经太多了，就不需要再往后翻页了
                     if has_old_article or len(page_articles) < count:
@@ -623,6 +637,8 @@ class RssScheduler:
                         if not link:
                             continue
 
+                        norm_link = normalize_wechat_url(link)
+
                         # 尝试下载
                         success = False
                         downloaded_path = None
@@ -641,12 +657,14 @@ class RssScheduler:
                                 error_msg = str(e)
                             time.sleep(1)
 
-                        # 寻找历史记录中是否已存在该链接
+                        # 寻找历史记录中是否已存在该链接或标题
                         existing_history_item = None
                         for item in history:
-                            if isinstance(item, dict) and item.get("link") == link:
-                                existing_history_item = item
-                                break
+                            if isinstance(item, dict):
+                                item_link = normalize_wechat_url(item.get("link", ""))
+                                if (norm_link and item_link == norm_link) or (item.get("account") == nickname and item.get("title") == title):
+                                    existing_history_item = item
+                                    break
 
                         is_permanent = result.get("is_permanent", False) if isinstance(result, dict) else False
 
@@ -677,7 +695,10 @@ class RssScheduler:
                                 "publish_time": result.get("publish_time") or art.get("update_time", int(time.time())),
                             }
                             history.append(existing_history_item)
-                            history_links.add(link)
+                            if norm_link:
+                                history_links.add(norm_link)
+                            if title:
+                                history_titles.add((nickname, title))
 
                         # 仅在下载成功，或该失败是永久性失败（如作者已删除/内容被屏蔽）时，才加入到订阅缓存列表中（防止重复重试）
                         if success or is_permanent:

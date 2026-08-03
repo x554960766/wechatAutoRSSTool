@@ -390,3 +390,47 @@ def report_proxy_status(proxy_url: str, success: bool):
             state["failures"] += 1
             if state["failures"] >= 5:
                 state["cooldown_until"] = current_time + 600  # 连续失败 5 次，进入 10 分钟冷却期
+
+
+def normalize_wechat_url(url: str) -> str:
+    """归一化微信文章链接，消除 HTML 转义实体(&amp;)与动态追踪参数（如 chksm, scene, pass_ticket 等），提取规范 URL"""
+    if not url or not isinstance(url, str):
+        return ""
+
+    import html
+    from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+
+    url = html.unescape(url).strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    elif not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
+
+    try:
+        parsed = urlparse(url)
+        if "mp.weixin.qq.com" in parsed.netloc:
+            query = parse_qs(parsed.query)
+            biz = query.get("__biz", [""])[0]
+            mid = query.get("mid", [""])[0]
+            idx = query.get("idx", [""])[0]
+            sn = query.get("sn", [""])[0]
+
+            if biz and mid and idx and sn:
+                return f"https://mp.weixin.qq.com/s?__biz={biz}&mid={mid}&idx={idx}&sn={sn}"
+            elif biz and mid and idx:
+                return f"https://mp.weixin.qq.com/s?__biz={biz}&mid={mid}&idx={idx}"
+            elif sn:
+                return f"https://mp.weixin.qq.com/s?sn={sn}"
+
+            ignore_keys = {
+                "chksm", "scene", "subscene", "sessionid", "key", "pass_ticket",
+                "uin", "devicetype", "version", "x5", "src", "asc", "clicktime",
+                "enterid", "rd2exitd", "sharer_sharetime", "sharer_shareid", "item_show_type"
+            }
+            clean_query = {k: v for k, v in query.items() if k not in ignore_keys}
+            new_qs = urlencode(clean_query, doseq=True)
+            return urlunparse((parsed.scheme or "https", parsed.netloc, parsed.path, "", new_qs, ""))
+    except Exception:
+        pass
+    return url
+

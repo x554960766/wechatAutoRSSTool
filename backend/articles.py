@@ -15,7 +15,8 @@ from pathlib import Path
 from backend.config import (
     CONFIG_FILE, BASE_URL, DEFAULT_HEADERS, OUTPUT_DIR,
     DOWNLOAD_HISTORY_FILE,
-    load_json, save_json, get_settings, get_proxies_dict, report_proxy_status
+    load_json, save_json, get_settings, get_proxies_dict, report_proxy_status,
+    normalize_wechat_url
 )
 from backend.account_pool import borrow_session, account_pool
 
@@ -83,9 +84,10 @@ def _fetch_articles_via_appmsg_fallback(fakeid: str, begin: int, count: int, key
             if data.get("base_resp", {}).get("ret") == 0:
                 articles = []
                 for item in data.get("app_msg_list", []):
+                    link = html.unescape(item.get("link", "")).strip()
                     articles.append({
                         "title": item.get("title", ""),
-                        "link": item.get("link", ""),
+                        "link": link,
                         "cover": item.get("cover", ""),
                         "digest": item.get("digest", ""),
                         "author": item.get("author_name", ""),
@@ -251,7 +253,8 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "")
 
                     app_msg = msg.get("app_msg_ext_info", {})
                     if app_msg and app_msg.get("title"):
-                        link = app_msg.get("content_url", "").replace("\\/", "/")
+                        import html
+                        link = html.unescape(app_msg.get("content_url", "")).replace("\\/", "/").strip()
                         if link.startswith("//"):
                             link = "https:" + link
 
@@ -270,7 +273,7 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "")
                         # 多图文处理
                         for sub in app_msg.get("multi_app_msg_item_list", []):
                             if sub.get("title"):
-                                sub_link = sub.get("content_url", "").replace("\\/", "/")
+                                sub_link = html.unescape(sub.get("content_url", "")).replace("\\/", "/").strip()
                                 if sub_link.startswith("//"):
                                     sub_link = "https:" + sub_link
                                 articles.append({
