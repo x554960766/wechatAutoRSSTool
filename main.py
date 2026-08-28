@@ -15,14 +15,15 @@ def ensure_virtualenv():
     if getattr(sys, 'frozen', False):
         return
     project_root = os.path.dirname(os.path.abspath(__file__))
-    if sys.platform == 'win32':
-        venv_python = os.path.join(project_root, 'venv312', 'Scripts', 'python.exe')
-    else:
-        venv_python = os.path.join(project_root, 'venv312', 'bin', 'python')
-    if os.path.exists(venv_python):
-        current_exe = os.path.abspath(sys.executable)
-        target_exe = os.path.abspath(venv_python)
-        if current_exe != target_exe:
+    venv_dir = os.path.join(project_root, 'venv312')
+    if os.path.exists(venv_dir):
+        if os.path.abspath(sys.prefix) == os.path.abspath(venv_dir) or os.environ.get("VIRTUAL_ENV") == venv_dir:
+            return
+        if sys.platform == 'win32':
+            venv_python = os.path.join(venv_dir, 'Scripts', 'python.exe')
+        else:
+            venv_python = os.path.join(venv_dir, 'bin', 'python')
+        if os.path.exists(venv_python):
             print(f"[Env Auto-Switch] 检测到虚拟环境，正在自动切换至: {venv_python}", flush=True)
             args = [venv_python] + sys.argv
             os.execv(venv_python, args)

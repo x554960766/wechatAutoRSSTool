@@ -40,6 +40,7 @@ wx_channels_download_temp/
 updates/
 scratch/
 scratch_*
+temp_*
 wechat-mp-server/
 
 *.recovered

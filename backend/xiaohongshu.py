@@ -11,6 +11,9 @@ import shutil
 import threading
 import queue
 import atexit
+import json
+import base64
+import html
 import requests
 import httpx
 import math
@@ -82,8 +85,8 @@ def write_note_text(note_dir: Path, detail: dict) -> int:
         print(f"写入文案失败: {e}")
         return 0
 
-def write_note_html(note_dir: Path, detail: dict, video_file: str = None, image_items: list = None) -> int:
-    """生成与原文相似、可直接双击打开的 index.html，引用本地已下载的媒体文件（离线可看）。
+def write_note_html(note_dir: Path, detail: dict, video_file: str = None, image_items: list = None, cos_url: str = None) -> int:
+    """生成与原文相似、可直接双击打开的 index.html，包含完整图文/视频媒体链接。
     返回写入字节数；失败不抛异常。"""
     try:
         from html import escape
@@ -96,15 +99,23 @@ def write_note_html(note_dir: Path, detail: dict, video_file: str = None, image_
         ptime = escape(detail.get("publish_time", ""))
         link = escape(detail.get("note_url", ""))
         desc = escape(detail.get("desc", "") or "")
+        images = detail.get("images", []) or []
 
         media_html = ""
-        if video_file:
-            media_html += f'<video controls src="{escape(video_file)}"></video>'
-        for it in image_items:
-            if it.get("img"):
-                media_html += f'<img src="{escape(it["img"])}" />'
-            if it.get("live"):
-                media_html += f'<video controls src="{escape(it["live"])}"></video>'
+        effective_video = cos_url or detail.get("cos_url") or detail.get("video_url") or video_file or detail.get("video")
+        if effective_video:
+            media_html += f'<video controls src="{escape(str(effective_video))}"></video>'
+
+        if images:
+            for img_url in images:
+                if img_url:
+                    media_html += f'<img src="{escape(img_url)}" referrerpolicy="no-referrer" />'
+        elif image_items:
+            for it in image_items:
+                if it.get("img"):
+                    media_html += f'<img src="{escape(it["img"])}" />'
+                if it.get("live"):
+                    media_html += f'<video controls src="{escape(it["live"])}"></video>'
 
         tags_html = " ".join(f'<span class="tag">#{escape(t)}</span>' for t in tags)
         stats_line = (f"赞 {escape(str(stats.get('liked','')))} · 藏 {escape(str(stats.get('collected','')))}"
@@ -145,6 +156,231 @@ img,video{{width:100%;border-radius:8px;margin:8px 0;display:block;}}
     except Exception as e:
         print(f"写入 HTML 失败: {e}")
         return 0
+
+def upload_xhs_video_to_cos(video_path: Path, note_id: str) -> str | None:
+    """把本地下载的小红书视频文件上传到腾讯云 COS，返回公网链接。
+    未配置 COS 或上传失败时记录警告并返回 None（不影响本地保存）。"""
+    if not video_path or not video_path.exists():
+        return None
+
+    settings = get_settings()
+    token_api_url = (settings.get("cos_token_api_url") or "").strip()
+
+    cos_cfg = None
+    if token_api_url:
+        try:
+            from backend.channels_upload import _fetch_cos_token
+            cos_cfg = _fetch_cos_token(token_api_url)
+        except Exception as e:
+            print(f"[小红书 COS] 获取 STS 临时凭证失败: {e}")
+
+    if not cos_cfg:
+        # 回退使用静态凭证
+        s_id = str(settings.get("cos_secret_id") if settings.get("cos_secret_id") is not None else "").strip()
+        s_key = str(settings.get("cos_secret_key") if settings.get("cos_secret_key") is not None else "").strip()
+        region = str(settings.get("cos_region") if settings.get("cos_region") is not None else "").strip()
+        bucket = str(settings.get("cos_bucket") if settings.get("cos_bucket") is not None else "").strip()
+        if s_id and s_key and region and bucket:
+            cos_cfg = {
+                "secret_id": s_id,
+                "secret_key": s_key,
+                "region": region,
+                "bucket": bucket,
+                "prefix": str(settings.get("xhs_cos_prefix") or "xhs/").strip(),
+                "cds_domain": str(settings.get("cos_cds_domain") or "").strip(),
+            }
+
+    if not cos_cfg or not all([cos_cfg.get("secret_id"), cos_cfg.get("secret_key"), cos_cfg.get("region"), cos_cfg.get("bucket")]):
+        return None
+
+    try:
+        from qcloud_cos import CosConfig, CosS3Client
+
+        prefix = cos_cfg.get("prefix") or "xhs/"
+        if not prefix.endswith("/"):
+            prefix += "/"
+        key = f"{prefix}{note_id or int(time.time())}.mp4"
+
+        data = video_path.read_bytes()
+
+        cos_config_kwargs = {
+            "Region": cos_cfg["region"],
+            "SecretId": cos_cfg["secret_id"],
+            "SecretKey": cos_cfg["secret_key"],
+        }
+        if cos_cfg.get("token"):
+            cos_config_kwargs["Token"] = cos_cfg["token"]
+
+        config = CosConfig(**cos_config_kwargs)
+        client = CosS3Client(config)
+        client.put_object(Bucket=cos_cfg["bucket"], Body=data, Key=key)
+
+        cds_domain = cos_cfg.get("cds_domain") or settings.get("cos_cds_domain") or ""
+        if cds_domain:
+            cos_url = f"{cds_domain.rstrip('/')}/{key}"
+        else:
+            cos_url = f"https://{cos_cfg['bucket']}.cos.{cos_cfg['region']}.myqcloud.com/{key}"
+
+        print(f"[小红书 COS] 视频上传成功: {cos_url}")
+        return cos_url
+    except Exception as e:
+        print(f"[小红书 COS] 上传视频到 COS 失败: {e}")
+        return None
+
+def generate_note_content(detail: dict, cos_url: str = None) -> str:
+    """区分视频和图文生成 content：
+    - 视频：文案描述 + 标签 + <video src="腾讯云视频链接"></video>
+    - 图文：纯正文 HTML 片段格式，包含段落 <p> 与所有高清原图 <p><img src="..." referrerpolicy="no-referrer" /></p>
+    """
+    note_type = detail.get("type", "图文")
+    desc = detail.get("desc") or ""
+    tags = detail.get("tags") or []
+    images = detail.get("images") or []
+    effective_video_url = cos_url or detail.get("cos_url") or detail.get("video_url") or detail.get("video") or ""
+
+    is_video = (note_type == "视频") or bool(effective_video_url)
+
+    if is_video:
+        # 视频笔记：文案描述 + 标签 + <video src="..."></video> 拼接到最后
+        parts = []
+        if desc:
+            parts.append(desc)
+        if tags:
+            tags_str = " ".join("#" + t for t in tags)
+            parts.append(tags_str)
+        if effective_video_url:
+            parts.append(f'<video src="{effective_video_url}"></video>')
+        return "\n\n".join(parts) if parts else (f'<video src="{effective_video_url}"></video>' if effective_video_url else desc)
+
+    # 图文笔记：纯正文 HTML 片段（包含文字段落、标签与所有图片标签）
+    html_parts = []
+    if desc:
+        lines = [line.strip() for line in desc.split("\n") if line.strip()]
+        for line in lines:
+            html_parts.append(f"<p>{html.escape(line)}</p>")
+
+    if tags:
+        tags_str = " ".join("#" + html.escape(t) for t in tags)
+        html_parts.append(f"<p>{tags_str}</p>")
+
+    if images:
+        for img_url in images:
+            if img_url:
+                html_parts.append(f'<p><img src="{html.escape(img_url)}" referrerpolicy="no-referrer" /></p>')
+
+    return "".join(html_parts) if html_parts else (f"<p>{html.escape(desc)}</p>" if desc else "")
+
+def write_note_data_json(note_dir: Path, detail: dict, cos_url: str = None, video_file: str = None, image_items: list = None) -> dict:
+    """生成与公众号对齐的 data.json，视频与图文分别使用对应的 content 格式"""
+    try:
+        author = detail.get("author", {}) or {}
+        author_nick = author.get("nickname") or author.get("nickName") or "未知博主"
+        title = detail.get("title") or detail.get("note_id") or "无标题"
+        note_url = detail.get("note_url") or f"https://www.xiaohongshu.com/explore/{detail.get('note_id', '')}"
+        cover_url = detail.get("cover") or (detail.get("images", [""])[0] if detail.get("images") else "")
+        publish_time = detail.get("publish_time") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        desc = detail.get("desc") or ""
+        tags = detail.get("tags") or []
+        images = detail.get("images") or []
+
+        # 区分视频与图文生成 content 内容
+        content = generate_note_content(detail, cos_url=cos_url)
+
+        data = {
+            "source": author_nick,
+            "title": title,
+            "url": note_url,
+            "cover_url": cover_url,
+            "publish_time": publish_time,
+            "content": content,
+            "desc": desc,
+            "type": detail.get("type", "图文"),
+            "tags": tags,
+            "images": images,
+            "stats": detail.get("stats", {}),
+            "video_url": cos_url or detail.get("video") or "",
+            "cos_url": cos_url or "",
+            "note_id": detail.get("note_id", ""),
+            "author": author,
+            "local_dir": str(note_dir),
+            "created_time": time.time(),
+        }
+
+        data_path = note_dir / "data.json"
+        data_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8", errors="replace")
+        return data
+    except Exception as e:
+        print(f"写入 data.json 失败: {e}")
+        return {}
+
+def post_xhs_note_to_server(data_json: dict) -> tuple[bool, str | None]:
+    """把小红书笔记（以公众号相同的格式）推送到远端服务器"""
+    if not data_json or not isinstance(data_json, dict):
+        return False, "缺少有效的笔记数据"
+
+    settings = get_settings()
+    upload_enabled = settings.get("xhs_upload_enabled")
+    if upload_enabled is None:
+        upload_enabled = settings.get("rss_upload_enabled", False)
+
+    if not upload_enabled:
+        return False, "服务器上传功能未启用"
+
+    upload_url = (settings.get("xhs_upload_url") or settings.get("rss_upload_url") or "").strip()
+    if not upload_url:
+        return False, "未配置上传接口地址 (xhs_upload_url / rss_upload_url)"
+
+    content_str = data_json.get("content") or data_json.get("desc") or ""
+    content_b64 = base64.b64encode(content_str.encode("utf-8")).decode("ascii")
+
+    device_id = settings.get("xhs_device_id") or settings.get("device_id") or "小红书_caiji100"
+
+    article_item = {
+        "source": data_json.get("source", ""),
+        "title": data_json.get("title", ""),
+        "url": data_json.get("url", ""),
+        "cover_url": data_json.get("cover_url", ""),
+        "publish_time": data_json.get("publish_time", ""),
+        "content": content_b64,
+        "video_url": data_json.get("video_url") or data_json.get("cos_url") or "",
+        "cos_url": data_json.get("cos_url") or "",
+        "desc": data_json.get("desc", ""),
+        "type": data_json.get("type", "图文"),
+        "tags": data_json.get("tags", []),
+        "images": data_json.get("images", []),
+        "note_id": data_json.get("note_id", ""),
+    }
+
+    payload = {
+        "articles": [article_item],
+        "deviceId": device_id,
+    }
+
+    try:
+        resp = requests.post(
+            upload_url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            proxies=get_proxies_dict(),
+            timeout=30
+        )
+        resp_text = resp.content.decode("utf-8", errors="replace") if hasattr(resp, "content") and resp.content else (resp.text or "")
+        print(f"[小红书服务器POST] 上传响应状态码: {resp.status_code}, 响应: {resp_text[:300]}")
+        resp.raise_for_status()
+
+        try:
+            body = json.loads(resp_text)
+            if isinstance(body, dict) and body.get("success") is False:
+                return False, body.get("message") or body.get("error") or "远端接口返回失败"
+        except Exception:
+            pass
+
+        return True, None
+    except Exception as e:
+        err_msg = str(e)
+        print(f"[小红书服务器POST] 上传失败: {err_msg}")
+        return False, err_msg
+
 
 # ── 小红书 API 客户端 ─────────────────────────────────────
 class XhsClient:
@@ -344,10 +580,17 @@ class XhsClient:
         if state_json_str.endswith(";"):
             state_json_str = state_json_str[:-1].strip()
             
-        cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", state_json_str)
-        
+        cleaned = state_json_str
+        cleaned = re.sub(r"\bundefined\b", "null", cleaned)
+        cleaned = re.sub(r"new\s+Map\(\s*(?:\[[^\]]*\])?\s*\)", "{}", cleaned)
+        cleaned = re.sub(r"new\s+Set\(\s*(?:\[[^\]]*\])?\s*\)", "[]", cleaned)
+        cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", cleaned)
+
         try:
-            state = yaml.safe_load(cleaned)
+            try:
+                state = json.loads(cleaned)
+            except Exception:
+                state = yaml.safe_load(cleaned)
             if not isinstance(state, dict):
                 raise ValueError("解析得到的数据类型不是 dict")
             return state
@@ -425,11 +668,8 @@ class XhsClient:
         if not isinstance(image_list, list):
             image_list = []
             
-        if note_type_raw == "video":
-            if len(image_list) > 1:
-                note_type = "图集"
-            else:
-                note_type = "视频"
+        if note_type_raw == "video" or note.get("video"):
+            note_type = "视频"
         else:
             note_type = "图文"
             
@@ -475,32 +715,62 @@ class XhsClient:
                 lives.append(live_url)
                 
         video = None
-        if note_type == "视频":
-            video_info = note.get("video")
-            if isinstance(video_info, dict):
-                origin_key = video_info.get("consumer", {}).get("originVideoKey")
-                if origin_key:
-                    video = f"https://sns-video-bd.xhscdn.com/{origin_key}"
-                else:
-                    media = video_info.get("media", {})
-                    stream = media.get("stream", {})
-                    h264_list = stream.get("h264", [])
-                    h265_list = stream.get("h265", [])
-                    all_streams = []
-                    if isinstance(h264_list, list):
-                        all_streams.extend(h264_list)
-                    if isinstance(h265_list, list):
-                        all_streams.extend(h265_list)
-                    
-                    valid_streams = [s for s in all_streams if isinstance(s, dict) and s.get("height")]
-                    if valid_streams:
-                        valid_streams.sort(key=lambda s: float(s.get("height", 0)), reverse=True)
-                        best_stream = valid_streams[0]
-                        backup_urls = best_stream.get("backupUrls", [])
-                        if isinstance(backup_urls, list) and len(backup_urls) > 0:
-                            video = backup_urls[0]
-                        else:
-                            video = best_stream.get("masterUrl")
+        video_candidates = []
+        video_info = note.get("video") or note.get("media") or {}
+        if isinstance(video_info, dict) and video_info:
+            media = video_info.get("media", {}) if isinstance(video_info.get("media"), dict) else (video_info if "stream" in video_info else {})
+            stream = media.get("stream", {}) if isinstance(media.get("stream"), dict) else (video_info.get("stream", {}) if isinstance(video_info.get("stream"), dict) else (note.get("stream", {}) if isinstance(note.get("stream"), dict) else {}))
+            
+            all_streams = []
+            if isinstance(stream, dict):
+                for k, v in stream.items():
+                    if isinstance(v, list):
+                        all_streams.extend(v)
+                    elif isinstance(v, dict):
+                        all_streams.append(v)
+
+            def stream_sort_key(s):
+                if not isinstance(s, dict):
+                    return (-1, 0, 0)
+                v_codec = str(s.get("videoCodec", "")).lower()
+                s_desc = str(s.get("streamDesc", "")).lower()
+                # 优先 H.264/AVC 编码（EF4 或包含 264），全设备与浏览器完美播放绝不黑屏
+                is_h264 = 1 if (v_codec in ("ef4", "h264", "avc", "avc1") or "264" in s_desc or s.get("streamType") == 259) else 0
+                res = float(s.get("height") or 0) * float(s.get("width") or 0) or float(s.get("height") or 0)
+                size = float(s.get("size") or s.get("videoBitrate") or 0)
+                return (is_h264, res, size)
+
+            valid_streams = [s for s in all_streams if isinstance(s, dict)]
+            if valid_streams:
+                valid_streams.sort(key=stream_sort_key, reverse=True)
+                for s in valid_streams:
+                    master_url = s.get("masterUrl")
+                    if master_url and master_url not in video_candidates:
+                        video_candidates.append(master_url)
+                    backup_urls = s.get("backupUrls", [])
+                    if isinstance(backup_urls, list):
+                        for bu in backup_urls:
+                            if bu and bu not in video_candidates:
+                                video_candidates.append(bu)
+                    url_field = s.get("url") or s.get("mainUrl")
+                    if url_field and url_field not in video_candidates:
+                        video_candidates.append(url_field)
+
+            origin_key = video_info.get("consumer", {}).get("originVideoKey")
+            if origin_key:
+                for host in ["sns-video-bd.xhscdn.com", "sns-video-al.xhscdn.com", "sns-video-hw.xhscdn.com", "sns-video-qc.xhscdn.com"]:
+                    u = f"https://{host}/{origin_key}"
+                    if u not in video_candidates:
+                        video_candidates.append(u)
+
+            for k in ["masterUrl", "url", "videoUrl", "mainUrl"]:
+                u = video_info.get(k) or media.get(k)
+                if u and u not in video_candidates:
+                    video_candidates.append(u)
+
+        if video_candidates:
+            video = video_candidates[0]
+            note_type = "视频"
                             
         cover = images[0] if images else ""
         if note_type == "视频":
@@ -533,27 +803,67 @@ class XhsClient:
             "images": images,
             "lives": lives,
             "video": video,
+            "video_candidates": video_candidates,
             "cover": cover
         }
 
     def _parse_note_item(self, it: dict) -> dict | None:
-        """把 user_posted API 的单条 note 解析成前端列表项；非 dict 返回 None。"""
+        """把 user_posted API 或 SSR / DOM 的单条 note 解析成前端列表项；非 dict 返回 None。"""
         if not isinstance(it, dict):
             return None
-        cover_obj = it.get("cover") or {}
-        cover = cover_obj.get("url_default") or cover_obj.get("url") or ""
-        if not cover:
-            info_list = cover_obj.get("info_list") or []
-            if info_list:
-                cover = (info_list[-1] or {}).get("url", "")
-        interact = it.get("interact_info") or {}
+
+        # 1. 提取 note_id 与 xsec_token
+        note_card = it.get("noteCard") or it.get("note_card") or {}
+        nid = it.get("note_id") or it.get("id") or note_card.get("noteId") or note_card.get("note_id") or ""
+        xsec_token = it.get("xsec_token") or it.get("xsecToken") or note_card.get("xsecToken") or note_card.get("xsec_token") or ""
+
+        # 2. 提取 title
+        title = (
+            it.get("display_title")
+            or it.get("title")
+            or it.get("displayTitle")
+            or note_card.get("displayTitle")
+            or note_card.get("display_title")
+            or ""
+        )
+
+        # 3. 提取 cover
+        cover_obj = it.get("cover") or note_card.get("cover") or {}
+        if isinstance(cover_obj, str):
+            cover = cover_obj
+        elif isinstance(cover_obj, dict):
+            cover = cover_obj.get("url_default") or cover_obj.get("urlDefault") or cover_obj.get("url") or ""
+            if not cover:
+                info_list = cover_obj.get("info_list") or cover_obj.get("infoList") or []
+                if info_list:
+                    cover = (info_list[-1] or {}).get("url", "")
+        else:
+            cover = ""
+
+        # 4. 提取 interact_info (liked)
+        interact = (
+            it.get("interact_info")
+            or it.get("interactInfo")
+            or note_card.get("interactInfo")
+            or note_card.get("interact_info")
+            or {}
+        )
+        if isinstance(interact, dict):
+            liked_raw = interact.get("liked_count") or interact.get("likedCount") or it.get("liked", "0")
+        else:
+            liked_raw = str(interact) if interact else "0"
+        liked = self.format_count(liked_raw)
+
+        # 5. 提取 type
+        note_type = "video" if (it.get("type") == "video" or note_card.get("type") == "video") else "normal"
+
         return {
-            "note_id": it.get("note_id", ""),
-            "xsec_token": it.get("xsec_token", ""),
-            "title": it.get("display_title", ""),
+            "note_id": nid,
+            "xsec_token": xsec_token,
+            "title": title,
             "cover": cover,
-            "type": "video" if it.get("type") == "video" else "normal",
-            "liked": self.format_count(interact.get("liked_count", "0")),
+            "type": note_type,
+            "liked": liked,
         }
 
     def get_user_posted(self, user_id: str, xsec_token: str = "", cursor: str = "", xsec_source: str = "pc_feed") -> tuple:
@@ -745,6 +1055,14 @@ class XhsClient:
         try:
             tmp_path.parent.mkdir(parents=True, exist_ok=True)
             r = requests.get(url, headers=headers, proxies=proxies, stream=True, timeout=30)
+            if r.status_code != 200:
+                # 尝试不带 Referer/Cookie 的标准请求头重试（部分 CDN 域名对跨域 Referer 拦截）
+                clean_headers = {
+                    "User-Agent": self.USER_AGENT,
+                    "Accept": "*/*",
+                }
+                r = requests.get(url, headers=clean_headers, proxies=proxies, stream=True, timeout=30)
+
             if r.status_code == 200:
                 with open(tmp_path, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=1024 * 1024):
@@ -892,6 +1210,114 @@ class _XhsBrowserSession:
                     page = context.new_page()
                     page.on("response", self._on_response)
                     page.goto(profile_url, wait_until="networkidle", timeout=30000)
+
+                    # 提取首屏（第 1 页）SSR 及 DOM 笔记
+                    try:
+                        initial_notes = page.evaluate("""() => {
+                            const list = [];
+                            const seen = new Set();
+
+                            const unwrap = (obj) => {
+                                if (!obj) return [];
+                                if (Array.isArray(obj)) return obj;
+                                if (obj._value && Array.isArray(obj._value)) return obj._value;
+                                if (obj._rawValue && Array.isArray(obj._rawValue)) return obj._rawValue;
+                                if (obj.value && Array.isArray(obj.value)) return obj.value;
+                                return [];
+                            };
+
+                            // 1. 从 __INITIAL_STATE__ / __INITIAL_DATA__ 中解析（包含 Vue3 ref 响应式对象解包）
+                            try {
+                                const state = window.__INITIAL_STATE__ || window.__INITIAL_DATA__;
+                                if (state && state.user) {
+                                    const rawNotes = unwrap(state.user.notes);
+                                    const flat = [];
+                                    for (const item of rawNotes) {
+                                        const unwrappedItem = unwrap(item);
+                                        if (unwrappedItem.length > 0) {
+                                            flat.push(...unwrappedItem);
+                                        } else if (item && typeof item === 'object') {
+                                            flat.push(item);
+                                        }
+                                    }
+                                    for (const item of flat) {
+                                        if (!item || typeof item !== 'object') continue;
+                                        const card = item.noteCard || item.note_card || {};
+                                        const coverObj = card.cover || item.cover || {};
+                                        const cover = (coverObj.urlDefault || coverObj.url_default || coverObj.url) || 
+                                                      ((coverObj.infoList && coverObj.infoList[0]) ? coverObj.infoList[0].url : '') || '';
+                                        const interact = card.interactInfo || card.interact_info || {};
+                                        const nid = item.id || item.noteId || item.note_id || card.noteId || card.note_id || '';
+                                        const title = card.displayTitle || card.display_title || '';
+                                        const token = item.xsecToken || item.xsec_token || card.xsecToken || card.xsec_token || '';
+                                        if (nid && !seen.has(nid)) {
+                                            list.push({
+                                                note_id: nid,
+                                                xsec_token: token,
+                                                display_title: title,
+                                                cover: cover,
+                                                type: (card.type === 'video' || item.type === 'video') ? 'video' : 'normal',
+                                                interact_info: {
+                                                    liked_count: String(interact.likedCount || interact.liked_count || '0')
+                                                }
+                                            });
+                                            seen.add(nid);
+                                        }
+                                    }
+                                }
+                            } catch(e) {
+                                console.error('SSR extract error:', e);
+                            }
+
+                            // 2. 检查 DOM 补充缺失的 note_id / xsec_token
+                            try {
+                                const items = document.querySelectorAll('section.note-item, .note-item, div[class*="note-item"]');
+                                items.forEach((el, idx) => {
+                                    const link = el.querySelector('a[href*="/explore/"]') || el.querySelector('a');
+                                    const href = link ? (link.getAttribute('href') || '') : '';
+                                    let nid = '';
+                                    let token = '';
+                                    const match = href.match(/\\/explore\\/([a-zA-Z0-9_-]+)/);
+                                    if (match) nid = match[1];
+                                    const tokenMatch = href.match(/xsec_token=([^&]+)/);
+                                    if (tokenMatch) token = decodeURIComponent(tokenMatch[1]);
+
+                                    if (idx < list.length && !list[idx].note_id && nid) {
+                                        list[idx].note_id = nid;
+                                        if (token && !list[idx].xsec_token) list[idx].xsec_token = token;
+                                        seen.add(nid);
+                                    } else if (nid && !seen.has(nid)) {
+                                        const img = el.querySelector('img');
+                                        const cover = img ? (img.src || img.getAttribute('data-src') || '') : '';
+                                        const titleEl = el.querySelector('.title, .footer .title, span.title, [class*="title"]');
+                                        const title = titleEl ? (titleEl.textContent || '').trim() : '';
+                                        const likeEl = el.querySelector('.like-wrapper, .count, [class*="like"], [class*="count"]');
+                                        const liked = likeEl ? (likeEl.textContent || '').trim() : '0';
+                                        const isVideo = !!el.querySelector('.play-icon, [class*="play"], svg[class*="play"]');
+                                        list.push({
+                                            note_id: nid,
+                                            xsec_token: token,
+                                            display_title: title,
+                                            cover: cover,
+                                            type: isVideo ? 'video' : 'normal',
+                                            interact_info: {
+                                                liked_count: liked
+                                            }
+                                        });
+                                        seen.add(nid);
+                                    }
+                                });
+                            } catch(e) {
+                                console.error('DOM extract error:', e);
+                            }
+
+                            return list;
+                        }""")
+                        if initial_notes:
+                            self._captured = initial_notes + self._captured
+                            self._pages_loaded += 1
+                    except Exception as e:
+                        print(f"提取首屏笔记异常: {e}")
 
                     if self._pages_loaded == 0:
                         page.wait_for_timeout(3000)
@@ -1102,17 +1528,32 @@ def _do_xhs_download_thread(task_id: str, urls: list, account_name: str):
             if img_ext == "jpeg":
                 img_ext = "jpg"
 
-            if detail["type"] == "视频":
-                video_url = detail["video"]
-                if video_url:
+            if detail["type"] == "视频" or detail.get("video") or detail.get("video_candidates"):
+                candidates = detail.get("video_candidates") or ([detail["video"]] if detail.get("video") else [])
+                if candidates:
                     save_file = note_dir / f"{clean_title}.mp4"
-                    try:
-                        size = client.download_file(video_url, save_file)
-                        total_size += size
-                        video_file_name = save_file.name
-                    except Exception as e:
+                    last_download_err = None
+                    video_ok = False
+                    for v_url in candidates:
+                        try:
+                            size = client.download_file(v_url, save_file)
+                            if size > 0:
+                                total_size += size
+                                video_file_name = save_file.name
+                                video_ok = True
+                                break
+                        except Exception as e:
+                            last_download_err = e
+                            continue
+                    if video_ok:
+                        # 尝试将视频上传到腾讯云 COS
+                        cos_url = upload_xhs_video_to_cos(save_file, detail["note_id"])
+                        if cos_url:
+                            detail["cos_url"] = cos_url
+                            detail["video_url"] = cos_url
+                    else:
                         success = False
-                        error_msg = f"视频下载失败: {str(e)}"
+                        error_msg = f"视频下载失败: {last_download_err or '所有备选视频源均无法下载'}"
                 else:
                     success = False
                     error_msg = "未找到可用无水印视频链接"
@@ -1144,6 +1585,15 @@ def _do_xhs_download_thread(task_id: str, urls: list, account_name: str):
 
             # 生成可直接打开的 HTML（引用本地已下载媒体）
             total_size += write_note_html(note_dir, detail, video_file_name, image_items)
+
+            # 生成与公众号对齐的 data.json（包含视频 COS 链接与文字描述合并内容）
+            data_json = write_note_data_json(note_dir, detail, cos_url=detail.get("cos_url"), video_file=video_file_name, image_items=image_items)
+
+            # 如果开启了服务器上传，像公众号一样推送到远端服务器
+            uploaded_ok = False
+            upload_err = None
+            if success:
+                uploaded_ok, upload_err = post_xhs_note_to_server(data_json)
                     
             with _download_lock:
                 task = _download_tasks.get(task_id)
@@ -1153,7 +1603,9 @@ def _do_xhs_download_thread(task_id: str, urls: list, account_name: str):
                         task["results"].append({
                             "title": detail["title"] or detail["note_id"],
                             "success": True,
-                            "path": str(note_dir)
+                            "path": str(note_dir),
+                            "cos_url": detail.get("cos_url", ""),
+                            "uploaded": uploaded_ok
                         })
                     else:
                         task["failed"] += 1
@@ -1172,7 +1624,11 @@ def _do_xhs_download_thread(task_id: str, urls: list, account_name: str):
                 "size": total_size,
                 "time": time.time(),
                 "success": success,
-                "error": error_msg
+                "error": error_msg,
+                "cos_url": detail.get("cos_url", ""),
+                "uploaded": uploaded_ok if success else False,
+                "upload_error": upload_err if (success and not uploaded_ok) else None,
+                "upload_time": time.time() if (success and uploaded_ok) else None,
             })
             save_json(XHS_HISTORY_FILE, history)
             
@@ -1482,6 +1938,7 @@ def delete_history_item(index):
 def open_folder():
     import subprocess
     import sys
+    import os
     
     data = request.get_json() or {}
     account = data.get("account", "").strip()
@@ -1492,12 +1949,16 @@ def open_folder():
         
     try:
         path.mkdir(parents=True, exist_ok=True)
+        resolved_path = str(path.resolve())
         if sys.platform == "darwin":
-            subprocess.run(["open", str(path)])
+            subprocess.run(["open", resolved_path])
         elif sys.platform == "win32":
-            subprocess.run(["explorer", str(path)])
+            if hasattr(os, "startfile"):
+                os.startfile(resolved_path)
+            else:
+                subprocess.run(f'explorer "{resolved_path}"', shell=True)
         else:
-            subprocess.run(["xdg-open", str(path)])
+            subprocess.run(["xdg-open", resolved_path])
         return jsonify({"message": "文件夹已打开"})
     except Exception as e:
         return jsonify({"error": f"打开文件夹失败: {str(e)}"}), 500
@@ -1506,6 +1967,7 @@ def open_folder():
 def open_file():
     import subprocess
     import sys
+    import os
     
     data = request.get_json() or {}
     path_str = data.get("path", "")
@@ -1517,12 +1979,16 @@ def open_file():
         if not path.exists():
             return jsonify({"error": "文件或文件夹不存在"}), 404
             
+        resolved_path = str(path.resolve())
         if sys.platform == "darwin":
-            subprocess.run(["open", str(path)])
+            subprocess.run(["open", resolved_path])
         elif sys.platform == "win32":
-            subprocess.run(["explorer", str(path)])
+            if hasattr(os, "startfile"):
+                os.startfile(resolved_path)
+            else:
+                subprocess.run(f'explorer "{resolved_path}"', shell=True)
         else:
-            subprocess.run(["xdg-open", str(path)])
+            subprocess.run(["xdg-open", resolved_path])
         return jsonify({"message": "已打开"})
     except Exception as e:
         return jsonify({"error": f"打开失败: {str(e)}"}), 500
@@ -1531,6 +1997,7 @@ def open_file():
 def open_parent():
     import subprocess
     import sys
+    import os
     
     data = request.get_json() or {}
     path_str = data.get("path", "")
@@ -1542,20 +2009,112 @@ def open_parent():
         if not path.exists():
             return jsonify({"error": "文件或文件夹不存在"}), 404
             
+        resolved_path = str(path.resolve())
         if path.is_file():
             if sys.platform == "darwin":
-                subprocess.run(["open", "-R", str(path)])
+                subprocess.run(["open", "-R", resolved_path])
             elif sys.platform == "win32":
-                subprocess.run(f'explorer /select,"{path.resolve()}"', shell=True)
+                subprocess.run(f'explorer /select,"{resolved_path}"', shell=True)
             else:
-                subprocess.run(["xdg-open", str(path.parent)])
+                subprocess.run(["xdg-open", str(path.parent.resolve())])
         else:
             if sys.platform == "darwin":
-                subprocess.run(["open", str(path)])
+                subprocess.run(["open", resolved_path])
             elif sys.platform == "win32":
-                subprocess.run(f'explorer "{path.resolve()}"', shell=True)
+                if hasattr(os, "startfile"):
+                    os.startfile(resolved_path)
+                else:
+                    subprocess.run(f'explorer "{resolved_path}"', shell=True)
             else:
-                subprocess.run(["xdg-open", str(path)])
+                subprocess.run(["xdg-open", resolved_path])
         return jsonify({"message": "已打开"})
     except Exception as e:
         return jsonify({"error": f"打开失败: {str(e)}"}), 500
+
+
+# ── 自动采集路由 ──────────────────────────────────────────
+@xhs_bp.route("/auto-collect/status", methods=["GET"])
+def auto_collect_status():
+    from backend.xhs_scheduler import xhs_collector
+    return jsonify(xhs_collector.get_status())
+
+
+@xhs_bp.route("/auto-collect/toggle", methods=["POST"])
+def auto_collect_toggle():
+    from backend.xhs_scheduler import xhs_collector
+    data = request.get_json() or {}
+    user_id = data.get("user_id", "").strip()
+    if not user_id:
+        return jsonify({"error": "缺少 user_id"}), 400
+
+    auto_collect = data.get("auto_collect_enabled")
+    interval = data.get("collect_interval_minutes")
+    target = xhs_collector.update_account_config(user_id, auto_collect=auto_collect, interval_minutes=interval)
+    if not target:
+        return jsonify({"error": "未找到指定博主"}), 404
+    return jsonify({"message": "设置已更新", "account": target})
+
+
+@xhs_bp.route("/auto-collect/trigger/<user_id>", methods=["POST"])
+def auto_collect_trigger(user_id):
+    from backend.xhs_scheduler import xhs_collector
+    try:
+        res = xhs_collector.trigger_collect(user_id)
+        return jsonify(res)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@xhs_bp.route("/auto-collect/trigger-all", methods=["POST"])
+def auto_collect_trigger_all():
+    from backend.xhs_scheduler import xhs_collector
+    res = xhs_collector.trigger_all()
+    return jsonify(res)
+
+
+@xhs_bp.route("/auto-collect/stop-all", methods=["POST"])
+def auto_collect_stop_all():
+    from backend.xhs_scheduler import xhs_collector
+    res = xhs_collector.stop_all_collect()
+    return jsonify(res)
+
+
+@xhs_bp.route("/auto-collect/stop/<user_id>", methods=["POST"])
+def auto_collect_stop_account(user_id):
+    from backend.xhs_scheduler import xhs_collector
+    res = xhs_collector.stop_account_collect(user_id)
+    return jsonify(res)
+
+
+@xhs_bp.route("/auto-collect/settings", methods=["POST"])
+def auto_collect_save_settings():
+    from backend.config import get_settings, save_settings
+    data = request.get_json() or {}
+    current = get_settings()
+
+    for key in [
+        "xhs_auto_collect_enabled",
+        "xhs_collect_interval_minutes",
+        "xhs_collect_window_start_hour",
+        "xhs_collect_window_end_hour",
+        "xhs_collect_max_per_account",
+        "xhs_collect_cooldown_minutes",
+        "xhs_upload_enabled",
+        "xhs_upload_url",
+        "xhs_device_id",
+        "xhs_cos_prefix",
+    ]:
+        if key in data:
+            current[key] = data[key]
+
+    save_settings(current)
+    return jsonify({"message": "自动采集设置已保存", "settings": current})
+
+
+@xhs_bp.route("/auto-collect/logs", methods=["GET"])
+def auto_collect_logs():
+    from backend.xhs_scheduler import xhs_collector
+    limit = request.args.get("limit", 50, type=int)
+    logs = xhs_collector.get_collect_logs(limit)
+    return jsonify({"logs": logs, "total": len(logs)})
+

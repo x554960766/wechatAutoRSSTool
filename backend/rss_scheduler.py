@@ -14,7 +14,7 @@ import random
 import requests
 from pathlib import Path
 
-from backend.config import DATA_DIR, load_json, save_json
+from backend.config import DATA_DIR, load_json, save_json, normalize_wechat_url
 
 logger = logging.getLogger(__name__)
 
@@ -62,9 +62,7 @@ class RssScheduler:
         if not fakeid:
             return True
         fid = str(fakeid).strip()
-        if fid.endswith("="):
-            return True
-        if not fid.startswith("MP_WXS_") and len(fid) >= 16 and not fid.isdigit():
+        if fid == "${window.biz}" or "${" in fid:
             return True
         return False
 
@@ -150,9 +148,9 @@ class RssScheduler:
         if not isinstance(value, str) or not value or len(value) % 4 != 0:
             return False
         try:
-            base64.b64decode(value.encode("ascii"), validate=True).decode("utf-8")
+            base64.b64decode(value.encode("utf-8", errors="ignore"), validate=True).decode("utf-8", errors="replace")
             return True
-        except (binascii.Error, UnicodeError, ValueError):
+        except Exception:
             return False
 
     def _normalize_upload_article(self, article: dict, encode_content: bool = True) -> dict | None:
@@ -181,7 +179,10 @@ class RssScheduler:
         return normalized
 
     def _article_upload_key(self, article: dict) -> str:
-        return article.get("url") or article.get("link") or json.dumps(article, ensure_ascii=False, sort_keys=True)
+        url = article.get("url") or article.get("link")
+        if url:
+            return normalize_wechat_url(url)
+        return json.dumps(article, ensure_ascii=False, sort_keys=True)
 
     def _dedupe_upload_articles(self, articles: list, encode_content: bool = True) -> list:
         seen = set()
@@ -266,15 +267,15 @@ class RssScheduler:
                 headers={"Content-Type": "application/json"},
                 proxies=get_proxies_dict(), timeout=30,
             )
-            # 记录网关响应（状态码+正文），用于排查「已标记上传但服务器没有」的静默丢弃
-            self._last_upload_response = f"HTTP {resp.status_code} | {(resp.text or '')[:500]}"
+            resp_text = resp.content.decode("utf-8", errors="replace") if hasattr(resp, "content") and resp.content else (resp.text or "")
+            self._last_upload_response = f"HTTP {resp.status_code} | {resp_text[:500]}"
             logger.info("RSS 上传响应[%d篇]: %s", len(articles), self._last_upload_response[:300])
             resp.raise_for_status()
             try:
-                data = resp.json()
+                data = json.loads(resp_text)
                 if isinstance(data, dict) and data.get("success") is False:
                     return False, (data.get("message") or data.get("error") or "远端接口返回失败")
-            except ValueError:
+            except Exception:
                 pass
             return True, None
         except Exception as e:
@@ -577,11 +578,12 @@ class RssScheduler:
 
         try:
             existing = self.get_articles(nickname)
-            existing_links = {a.get("link") for a in existing}
+            existing_links = {normalize_wechat_url(a.get("link")) for a in existing if a.get("link")}
             
-            # 加载历史记录，用于去重和录入
+            # 加载历史记录，用于归一化链接去重和 (账号, 标题) 双重兜底去重（仅针对已成功下载的记录去重，失败记录允许重新尝试下载）
             history = load_json(DOWNLOAD_HISTORY_FILE, [])
-            history_links = {item.get("link") for item in history if isinstance(item, dict) and item.get("link")}
+            history_links = {normalize_wechat_url(item.get("link")) for item in history if isinstance(item, dict) and item.get("link") and item.get("success")}
+            history_titles = {(item.get("account"), item.get("title")) for item in history if isinstance(item, dict) and item.get("account") and item.get("title") and item.get("success")}
 
             new_articles = []
             begin = 0
@@ -590,19 +592,30 @@ class RssScheduler:
             
             try:
                 for page_idx in range(max_pages):
-                    page_articles, _total = _fetch_articles_page(fakeid, begin=begin, count=count)
+                    res = _fetch_articles_page(fakeid, begin=begin, count=count, account_name=nickname)
+                    page_articles, _total = res[0], res[1]
                     if not page_articles:
                         break
                     
                     has_old_article = False
                     for art in page_articles:
-                        link = art.get("link")
-                        if link:
-                            # 如果已经在 RSS 缓存或下载历史中，说明后面的文章都是已下载过的老文章了
-                            if link in existing_links or link in history_links:
-                                has_old_article = True
-                            else:
-                                new_articles.append(art)
+                        link = art.get("link", "")
+                        title = art.get("title", "")
+                        norm_link = normalize_wechat_url(link)
+                        
+                        # 查重：若规范化 URL 在 RSS/历史记录中，或者 (公众号, 标题) 已存在，均判定为老文章
+                        is_duplicate = (
+                            (norm_link and (norm_link in existing_links or norm_link in history_links))
+                            or ((nickname, title) in history_titles)
+                        )
+                        if is_duplicate:
+                            has_old_article = True
+                        else:
+                            new_articles.append(art)
+                            if norm_link:
+                                existing_links.add(norm_link)
+                            if title:
+                                history_titles.add((nickname, title))
                     
                     # 如果当前页中包含了已有的老文章，或者新文章总数已经满足，或者返回的文章长度小于请求数，或者已抓完总数
                     if has_old_article or len(page_articles) < count or (begin + len(page_articles) >= _total):
@@ -628,6 +641,8 @@ class RssScheduler:
                         if not link:
                             continue
 
+                        norm_link = normalize_wechat_url(link)
+
                         # 尝试下载
                         success = False
                         downloaded_path = None
@@ -646,12 +661,14 @@ class RssScheduler:
                                 error_msg = str(e)
                             time.sleep(1)
 
-                        # 寻找历史记录中是否已存在该链接
+                        # 寻找历史记录中是否已存在该链接或标题
                         existing_history_item = None
                         for item in history:
-                            if isinstance(item, dict) and item.get("link") == link:
-                                existing_history_item = item
-                                break
+                            if isinstance(item, dict):
+                                item_link = normalize_wechat_url(item.get("link", ""))
+                                if (norm_link and item_link == norm_link) or (item.get("account") == nickname and item.get("title") == title):
+                                    existing_history_item = item
+                                    break
 
                         is_permanent = result.get("is_permanent", False) if isinstance(result, dict) else False
 
@@ -682,7 +699,10 @@ class RssScheduler:
                                 "publish_time": result.get("publish_time") or art.get("update_time", int(time.time())),
                             }
                             history.append(existing_history_item)
-                            history_links.add(link)
+                            if norm_link:
+                                history_links.add(norm_link)
+                            if title:
+                                history_titles.add((nickname, title))
 
                         # 仅在下载成功，或该失败是永久性失败（如作者已删除/内容被屏蔽）时，才加入到订阅缓存列表中（防止重复重试）
                         if success or is_permanent:
@@ -791,8 +811,8 @@ class RssScheduler:
                     self._global_upload_sweep()
             except Exception as e:
                 logger.error("RSS 调度器异常: %s", e)
-            # 每 30 秒检查一次是否有订阅需要执行
-            self._stop_event.wait(30)
+            # 每 5 秒检查一次是否有订阅需要执行
+            self._stop_event.wait(5)
         logger.info("RSS 调度器已停止")
 
     @staticmethod
@@ -811,13 +831,16 @@ class RssScheduler:
 
     @classmethod
     def _normalize_interval_minutes(cls, value) -> int:
-        return max(15, cls._safe_int(value, 60))
+        return max(1, cls._safe_int(value, 60))
 
     @classmethod
     def _get_interval_range_minutes(cls, interval_minutes: int) -> tuple[int, int]:
         interval = cls._normalize_interval_minutes(interval_minutes)
-        jitter = max(5, round(interval * 0.25))
-        return max(5, interval - jitter), interval + jitter
+        if interval == 60 or interval <= 1:
+            # 默认：1小时 到 1.5小时（60 到 90 分钟）随机
+            return 60, 90
+        jitter = max(1, round(interval * 0.25))
+        return max(1, interval - jitter), interval + jitter
 
     def _schedule_next_fetch(self, sub: dict, start_time: float | None = None) -> float:
         min_minutes, max_minutes = self._get_interval_range_minutes(sub.get("interval_minutes", 60))

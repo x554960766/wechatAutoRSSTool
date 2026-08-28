@@ -22,7 +22,7 @@
   // ---- 可调参数（测风控时单变量扫描这几个）----
   var RATE_LIMIT_PER_MIN = 20; // 令牌桶：60s 窗口内最多 finder 调用次数
   var MAX_ITEMS_PER_AUTHOR = 30; // 单作者最多采集条数（≈2 页），0 或负数 = 不限
-  var SESSION_AUTHOR_CAP = 12; // 单次最多处理作者数，超出下次轮替继续
+  var SESSION_AUTHOR_CAP = 0; // 单次最多处理作者数，0 或负数 = 不限（采集全部关注）
   var CIRCUIT_FAIL_THRESHOLD = 3; // 连续最终失败达到此数 → 熔断
   var PAGE_JITTER_MS = 1500; // 翻页间基准延迟
   var AUTHOR_JITTER_MS = 6000; // 作者间基准延迟
@@ -144,7 +144,7 @@
     return authors;
   }
 
-  // 拉取并同步单个作者的作品（增量：命中已知 id 即停）。knownSet 为该作者已同步 id 的 {id:1} 映射。
+  // 拉取并同步单个作者的作品（增量：跳过已知已同步 id，若整页皆为旧作品则停止翻页）。knownSet 为该作者已同步 id 的 {id:1} 映射。
   async function harvestAuthor(author, knownSet, isCancelled, onPage) {
     var marker = "";
     var total = 0;
@@ -152,11 +152,12 @@
     var pages = 0;
     var label = author.nickname || author.username;
     var cap = MAX_ITEMS_PER_AUTHOR > 0 ? MAX_ITEMS_PER_AUTHOR : Infinity;
+    var curMyUser = my_username || (typeof __wx_username !== "undefined" ? __wx_username : "");
     while (!isCancelled() && !circuitOpen) {
       var r = await callWithRetry("finderUserPage", function () {
         return WXU.API.finderUserPage({
           username: author.username,
-          finderUsername: my_username || author.username,
+          finderUsername: curMyUser || author.username,
           lastBuffer: marker,
           needFansCount: 0,
           objectId: "0",
@@ -168,21 +169,23 @@
       }
       pages++;
       var raw = (r.data && r.data.object) || [];
-      // 视频号返回按时间倒序：逐条收集新作品，遇到第一个已知 id 即停（后面都是旧的）
       var fresh = [];
-      var hitKnown = false;
+      var pageVideoCount = 0;
+      var pageNewCount = 0;
       for (var i = 0; i < raw.length; i++) {
         var o = raw[i];
         if (!(o.objectDesc && o.objectDesc.mediaType === 4)) continue;
+        pageVideoCount++;
         if (knownSet && knownSet[o.id]) {
-          hitKnown = true;
-          break;
+          // 已同步过的旧作品（包含置顶老视频），跳过不采，不阻断后续其他新作品
+          continue;
         }
         if (total + fresh.length >= cap) {
           capped = true; // 达单作者上限，停止（可能还有更新作品未采，需明示）
           break;
         }
         fresh.push(o);
+        pageNewCount++;
       }
       if (fresh.length) {
         await WXU.request({
@@ -193,7 +196,10 @@
         total += fresh.length;
         if (onPage) onPage(total);
       }
-      if (hitKnown || capped) break; // 增量命中 或 达上限，停止翻页
+      // 翻页终止判定：
+      // 1. 达到单作者上限 (capped)
+      // 2. 本页包含视频但全为已知旧作品 (pageVideoCount > 0 && pageNewCount === 0)，说明已到达历史同步断点
+      if (capped || (pageVideoCount > 0 && pageNewCount === 0)) break;
       marker = (r.data && r.data.lastBuffer) || "";
       if (!marker || raw.length === 0) break; // 没有更多（以 lastBuffer 为主要翻页依据）
       await jitterSleep(PAGE_JITTER_MS);
@@ -247,11 +253,12 @@
         }
       } catch (_) {}
 
-      // 单作者采集上限：从后端配置读取（设置页可调，0=不限），覆盖默认值
+      // 单作者采集上限与单批作者数上限：从后端配置读取（设置页可调，0=不限），覆盖默认值
       try {
         var cfgRet = await WXU.request({ method: "GET", url: "/__wx_channels_api/harvest-config" });
         var hc = cfgRet && cfgRet[1];
         if (hc && typeof hc.max_per_author === "number") MAX_ITEMS_PER_AUTHOR = hc.max_per_author;
+        if (hc && typeof hc.session_cap === "number") SESSION_AUTHOR_CAP = hc.session_cap;
       } catch (_) {}
 
       setPanel("running", "正在获取关注列表…");
@@ -263,13 +270,13 @@
         return;
       }
 
-      // 会话预算：本次只处理 SESSION_AUTHOR_CAP 个，用 localStorage 偏移轮替，避免尾部作者被饿死
+      // 会话预算：若配置了 SESSION_AUTHOR_CAP > 0，本次只处理前 N 个，用 localStorage 偏移轮替
       var startIdx = 0;
       try {
         startIdx = parseInt(localStorage.getItem("wx_harvest_offset") || "0", 10) || 0;
       } catch (_) {}
       if (startIdx >= authors.length) startIdx = 0;
-      var cap = Math.min(SESSION_AUTHOR_CAP, authors.length);
+      var cap = (SESSION_AUTHOR_CAP > 0 && SESSION_AUTHOR_CAP < authors.length) ? SESSION_AUTHOR_CAP : authors.length;
 
       var done = 0, totalVideos = 0, failed = 0, cappedAuthors = 0;
       for (var i = 0; i < cap; i++) {

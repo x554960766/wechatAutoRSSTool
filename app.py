@@ -18,14 +18,15 @@ def ensure_virtualenv():
     if getattr(sys, 'frozen', False):
         return
     project_root = os.path.dirname(os.path.abspath(__file__))
-    if sys.platform == 'win32':
-        venv_python = os.path.join(project_root, 'venv312', 'Scripts', 'python.exe')
-    else:
-        venv_python = os.path.join(project_root, 'venv312', 'bin', 'python')
-    if os.path.exists(venv_python):
-        current_exe = os.path.abspath(sys.executable)
-        target_exe = os.path.abspath(venv_python)
-        if current_exe != target_exe:
+    venv_dir = os.path.join(project_root, 'venv312')
+    if os.path.exists(venv_dir):
+        if os.path.abspath(sys.prefix) == os.path.abspath(venv_dir) or os.environ.get("VIRTUAL_ENV") == venv_dir:
+            return
+        if sys.platform == 'win32':
+            venv_python = os.path.join(venv_dir, 'Scripts', 'python.exe')
+        else:
+            venv_python = os.path.join(venv_dir, 'bin', 'python')
+        if os.path.exists(venv_python):
             print(f"[Env Auto-Switch] 检测到虚拟环境，正在自动切换至: {venv_python}", flush=True)
             args = [venv_python] + sys.argv
             os.execv(venv_python, args)
@@ -98,9 +99,36 @@ app.register_blueprint(updater_bp)
 from backend.account_pool import migrate_legacy_config
 migrate_legacy_config()
 
+# 自动启动本地 MITM 抓包截获代理服务（开启端口 8080 与系统代理）
+try:
+    from backend.mitm_proxy import ProxyManager
+    ProxyManager.get_instance().start()
+    print("🚀 [App Init] 本地 MITM 截获代理服务与系统代理已自动开启！", flush=True)
+except Exception as p_err:
+    print(f"⚠️ [App Init] 代理服务启动提示: {p_err}", flush=True)
+
 # 启动 RSS 自动抓取调度器
 from backend.rss_scheduler import rss_scheduler
 rss_scheduler.start()
+
+# 启动小红书自动采集调度器
+try:
+    from backend.xhs_scheduler import xhs_collector
+    xhs_collector.start()
+    print("🚀 [App Init] 小红书自动采集调度器已启动", flush=True)
+except Exception as xhs_err:
+    print(f"⚠️ [App Init] 小红书自动采集调度器启动提示: {xhs_err}", flush=True)
+
+# 启动凭证保活守护线程（默认禁用主动自动化操作，显式设置 ENABLE_REFRESH_DAEMON=1 或 --enable-refresh-daemon 时才启动）
+if os.environ.get("ENABLE_REFRESH_DAEMON", "0") in ("1", "true", "True") or "--enable-refresh-daemon" in sys.argv:
+    try:
+        from scripts.auto_refresh_pc_wechat import start_background_refresh_daemon
+        start_background_refresh_daemon()
+    except Exception as daemon_err:
+        print(f"⚠️ [App Init] 凭证保活守护线程启动提示: {daemon_err}", flush=True)
+else:
+    print("ℹ️ [App Init] 微信客户端凭证主动自动化保活已默认关闭（未启动）。", flush=True)
+
 
 
 
@@ -187,6 +215,7 @@ def main():
     parser.add_argument("--port", type=int, default=5200, help="服务端口 (默认 5200)")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="监听地址")
     parser.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    parser.add_argument("--no-refresh-daemon", action="store_true", help="不启动微信凭证保活守护线程")
     parser.add_argument("--debug", action="store_true", help="调试模式")
     args = parser.parse_args()
 

@@ -9,6 +9,8 @@ pysocks>=1.7
 pywebview>=5.0
 pythonnet>=3.0; sys_platform == "win32"
 clr_loader>=0.2; sys_platform == "win32"
+# Windows UI 自动化（windows/win_flow.py 策略B元素定位与旧版 SendKeys 兜底，未安装时自动降级）
+uiautomation>=2.0.28; sys_platform == "win32"
 pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
 pyobjc-framework-WebKit>=10.0; sys_platform == "darwin"
 xhshow>=0.2.0

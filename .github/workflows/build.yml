@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - master
+      - develop
     tags:
       - '*'
   workflow_dispatch: # 支持在 GitHub 页面上点击按钮手动触发打包
@@ -110,7 +111,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: "WeChat MP Tools v${{ github.ref_name }}"
+          name: "WeChat MP Tools ${{ github.ref_name }}"
           draft: false
           prerelease: false
           files: |

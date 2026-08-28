@@ -137,6 +137,11 @@ const SettingsPage = {
                                 <input type="number" class="form-input" id="setting-channels-harvest-max" min="0" step="1" placeholder="30" />
                                 <div class="form-hint">每个作者单次最多采集并上传多少条；0 = 不限。上传数据与采集一致。</div>
                             </div>
+                            <div class="form-group" style="flex: 1;">
+                                <label class="form-label" for="setting-channels-harvest-session-cap">单次采集作者数上限</label>
+                                <input type="number" class="form-input" id="setting-channels-harvest-session-cap" min="0" step="1" placeholder="0" />
+                                <div class="form-hint">单次任务最多处理多少个关注作者；0 = 采集全部关注作者。</div>
+                            </div>
                         </div>
                         <div style="display: flex; gap: 16px;">
                             <div class="form-group" style="flex: 1;">
@@ -294,6 +299,39 @@ const SettingsPage = {
                     </div>
                 </div>
 
+                <!-- 小红书上传与 COS 配置 -->
+                <div class="card">
+                    <div class="card-header">
+                        <h3 class="card-title">📕 小红书新作品上传到服务器</h3>
+                    </div>
+                    <div class="card-body" style="padding: 0 var(--spacing-md) var(--spacing-md);">
+                        <div class="form-group" style="margin-top: var(--spacing-md);">
+                            <label class="form-checkbox-label" style="display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;">
+                                <input type="checkbox" id="setting-xhs-upload-enabled" onchange="SettingsPage.toggleXhsUpload()" style="width: 18px; height: 18px; accent-color: var(--primary);" />
+                                <span>小红书新作品上传到服务器 (含视频腾讯云 COS 链接)</span>
+                            </label>
+                            <div class="form-hint">开启后，下载视频将自动传腾讯云 COS，并将视频链接与文字描述合并写入 data.json，按公众号相同接口推送到服务器</div>
+                        </div>
+                        <div id="setting-xhs-upload-panel" style="display: none;">
+                            <div class="form-group" style="margin-top: var(--spacing-md);">
+                                <label class="form-label" for="setting-xhs-device-id">设备 ID (deviceId)</label>
+                                <input type="text" class="form-input" id="setting-xhs-device-id" placeholder="小红书_caiji100" />
+                                <div class="form-hint">小红书上传接口 payload 中的 deviceId 配置</div>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label" for="setting-xhs-upload-url">小红书上传接口地址</label>
+                                <input type="url" class="form-input" id="setting-xhs-upload-url" placeholder="https://example.com/api/data/gzhAdd (为空默认复用公众号上传接口)" />
+                                <div class="form-hint">留空时自动使用上方配置的公众号上传接口地址</div>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label" for="setting-xhs-cos-prefix">COS 视频存储前缀</label>
+                                <input type="text" class="form-input" id="setting-xhs-cos-prefix" placeholder="xhs/" />
+                                <div class="form-hint">腾讯云 COS 上传前缀路径，凭证复用视频号区域的 COS 配置</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
             <!-- 缓存与备份管理 -->
             <div class="card" style="margin-top: var(--spacing-lg);">
                 <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
@@ -410,11 +448,13 @@ const SettingsPage = {
         const chHarvestStart = document.getElementById('setting-channels-harvest-start');
         const chHarvestEnd = document.getElementById('setting-channels-harvest-end');
         const chHarvestMax = document.getElementById('setting-channels-harvest-max');
+        const chHarvestSessionCap = document.getElementById('setting-channels-harvest-session-cap');
         if (chAutoHarvest) chAutoHarvest.checked = !!data.channels_auto_harvest_enabled;
         if (chHarvestInterval) chHarvestInterval.value = data.channels_harvest_interval_hours !== undefined ? data.channels_harvest_interval_hours : 6;
         if (chHarvestStart) chHarvestStart.value = data.channels_harvest_window_start_hour !== undefined ? data.channels_harvest_window_start_hour : 8;
         if (chHarvestEnd) chHarvestEnd.value = data.channels_harvest_window_end_hour !== undefined ? data.channels_harvest_window_end_hour : 24;
         if (chHarvestMax) chHarvestMax.value = data.channels_harvest_max_per_author !== undefined ? data.channels_harvest_max_per_author : 30;
+        if (chHarvestSessionCap) chHarvestSessionCap.value = data.channels_harvest_session_cap !== undefined ? data.channels_harvest_session_cap : 0;
 
         const chUploadEnabled = document.getElementById('setting-channels-upload-enabled');
         const chUploadUrl = document.getElementById('setting-channels-upload-url');
@@ -437,7 +477,17 @@ const SettingsPage = {
         if (cosCdsDomain) cosCdsDomain.value = data.cos_cds_domain || '';
         if (chDeviceId) chDeviceId.value = data.channels_device_id || '视频号_caiji2';
 
+        const xhsUploadEnabled = document.getElementById('setting-xhs-upload-enabled');
+        const xhsUploadUrl = document.getElementById('setting-xhs-upload-url');
+        const xhsDeviceId = document.getElementById('setting-xhs-device-id');
+        const xhsCosPrefix = document.getElementById('setting-xhs-cos-prefix');
+        if (xhsUploadEnabled) xhsUploadEnabled.checked = !!data.xhs_upload_enabled;
+        if (xhsUploadUrl) xhsUploadUrl.value = data.xhs_upload_url || '';
+        if (xhsDeviceId) xhsDeviceId.value = data.xhs_device_id || '小红书_caiji100';
+        if (xhsCosPrefix) xhsCosPrefix.value = data.xhs_cos_prefix !== undefined ? data.xhs_cos_prefix : 'xhs/';
+
         this.toggleRssUpload();
+        this.toggleXhsUpload();
         this.syncRssEndMinute();
     },
 
@@ -447,6 +497,13 @@ const SettingsPage = {
         const panel = document.getElementById('setting-rss-upload-panel');
         if (!panel) return;
         panel.style.display = rssUploadEnabled && rssUploadEnabled.checked ? 'block' : 'none';
+    },
+
+    toggleXhsUpload() {
+        const xhsUploadEnabled = document.getElementById('setting-xhs-upload-enabled');
+        const panel = document.getElementById('setting-xhs-upload-panel');
+        if (!panel) return;
+        panel.style.display = xhsUploadEnabled && xhsUploadEnabled.checked ? 'block' : 'none';
     },
 
 
@@ -519,6 +576,7 @@ const SettingsPage = {
             channels_harvest_window_start_hour: (() => { const el = document.getElementById('setting-channels-harvest-start'); return el ? parseInt(el.value) : 8; })(),
             channels_harvest_window_end_hour: (() => { const el = document.getElementById('setting-channels-harvest-end'); return el ? parseInt(el.value) : 24; })(),
             channels_harvest_max_per_author: (() => { const el = document.getElementById('setting-channels-harvest-max'); const v = el ? parseInt(el.value) : 30; return (isNaN(v) || v < 0) ? 30 : v; })(),
+            channels_harvest_session_cap: (() => { const el = document.getElementById('setting-channels-harvest-session-cap'); const v = el ? parseInt(el.value) : 0; return (isNaN(v) || v < 0) ? 0 : v; })(),
             channels_upload_enabled: (() => { const el = document.getElementById('setting-channels-upload-enabled'); return el ? el.checked : false; })(),
             channels_upload_url: (() => { const el = document.getElementById('setting-channels-upload-url'); return el ? el.value.trim() : ''; })(),
             cos_token_api_url: (() => { const el = document.getElementById('setting-cos-token-api-url'); return el ? el.value.trim() : ''; })(),
@@ -529,6 +587,10 @@ const SettingsPage = {
             cos_prefix: (() => { const el = document.getElementById('setting-cos-prefix'); return el ? el.value.trim() : 'channels/'; })(),
             cos_cds_domain: (() => { const el = document.getElementById('setting-cos-cds-domain'); return el ? el.value.trim() : ''; })(),
             channels_device_id: (() => { const el = document.getElementById('setting-channels-device-id'); return el ? (el.value.trim() || '视频号_caiji2') : '视频号_caiji2'; })(),
+            xhs_upload_enabled: (() => { const el = document.getElementById('setting-xhs-upload-enabled'); return el ? el.checked : false; })(),
+            xhs_upload_url: (() => { const el = document.getElementById('setting-xhs-upload-url'); return el ? el.value.trim() : ''; })(),
+            xhs_device_id: (() => { const el = document.getElementById('setting-xhs-device-id'); return el ? (el.value.trim() || '小红书_caiji100') : '小红书_caiji100'; })(),
+            xhs_cos_prefix: (() => { const el = document.getElementById('setting-xhs-cos-prefix'); return el ? el.value.trim() : 'xhs/'; })(),
         };
 
         try {
@@ -673,6 +735,7 @@ const SettingsPage = {
                 channels_harvest_window_start_hour: 8,
                 channels_harvest_window_end_hour: 24,
                 channels_harvest_max_per_author: 30,
+                channels_harvest_session_cap: 0,
                 channels_upload_enabled: false,
                 channels_upload_url: '',
                 cos_token_api_url: '',

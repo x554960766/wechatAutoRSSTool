@@ -71,10 +71,13 @@ const API = {
 
     // ── Account Pool API ─────────────────────────────
     accountPool: {
-        list()         { return API.get('/api/account-pool'); },
-        summary()      { return API.get('/api/account-pool/summary', { showError: false }); },
-        remove(id)     { return API.delete(`/api/account-pool/${id}`); },
-        events()       { return API.get('/api/account-pool/events', { showError: false }); },
+        list()                     { return API.get('/api/account-pool'); },
+        summary()                  { return API.get('/api/account-pool/summary', { showError: false }); },
+        remove(id)                 { return API.delete(`/api/account-pool/${id}`); },
+        events()                   { return API.get('/api/account-pool/events', { showError: false }); },
+        getAutoRefreshConfig()     { return API.get('/api/account-pool/auto-refresh-config', { showError: false }); },
+        toggleAutoRefresh(enabled) { return API.post('/api/account-pool/auto-refresh-toggle', { enabled }); },
+        syncManual()               { return API.post('/api/account-pool/sync-manual'); },
     },
 
     // ── Accounts API ─────────────────────────────────
@@ -283,6 +286,15 @@ const API = {
         openFolder(account = '')    { return API.post('/api/xhs/open-folder', { account }); },
         openFile(path)              { return API.post('/api/xhs/open-file', { path }); },
         openParent(path)            { return API.post('/api/xhs/open-parent', { path }); },
+        // 自动采集 API
+        getAutoCollectStatus()      { return API.get('/api/xhs/auto-collect/status'); },
+        toggleAutoCollect(data)     { return API.post('/api/xhs/auto-collect/toggle', data); },
+        triggerAutoCollect(userId)  { return API.post(`/api/xhs/auto-collect/trigger/${userId}`); },
+        triggerAllAutoCollect()     { return API.post('/api/xhs/auto-collect/trigger-all'); },
+        stopAutoCollect(userId)     { return API.post(`/api/xhs/auto-collect/stop/${userId}`); },
+        stopAllAutoCollect()        { return API.post('/api/xhs/auto-collect/stop-all'); },
+        saveAutoCollectSettings(d)  { return API.post('/api/xhs/auto-collect/settings', d); },
+        getAutoCollectLogs(limit=50){ return API.get(`/api/xhs/auto-collect/logs?limit=${limit}`); },
     },
 
     // ── Version Update API ──────────────────────────────

@@ -46,6 +46,7 @@ const Router = {
             'xhs_login': typeof XhsLoginPage !== 'undefined' ? XhsLoginPage : null,
             'xhs_accounts': typeof XhsAccountsPage !== 'undefined' ? XhsAccountsPage : null,
             'xhs_notes': typeof XhsNotesPage !== 'undefined' ? XhsNotesPage : null,
+            'xhs_auto_collect': typeof XhsAutoCollectPage !== 'undefined' ? XhsAutoCollectPage : null,
             'xhs_download': typeof XhsDownloadPage !== 'undefined' ? XhsDownloadPage : null,
             'xhs_history': typeof XhsHistoryPage !== 'undefined' ? XhsHistoryPage : null,
 
