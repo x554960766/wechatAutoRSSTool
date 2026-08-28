@@ -9,7 +9,8 @@ from flask import Blueprint, jsonify, request
 
 from backend.config import (
     ACCOUNTS_FILE, CONFIG_FILE, BASE_URL, DEFAULT_HEADERS,
-    load_json, save_json, get_proxies_dict, report_proxy_status
+    load_json, save_json, get_proxies_dict, report_proxy_status,
+    get_default_wechat_ua
 )
 from backend.account_pool import borrow_session, account_pool
 
@@ -90,7 +91,7 @@ def search_accounts():
             pass
 
         headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.5304.110 Safari/537.36 NetType/WIFI MicroMessenger/6.8.0(0x16080000) MacWechat/store ClientCanvas/1.0.0"
+            "User-Agent": get_default_wechat_ua()
         }
         if cookie_str:
             headers["Cookie"] = cookie_str
@@ -357,3 +358,28 @@ def rss_force_upload(fakeid):
         rss_scheduler._save_subscriptions(subs)
 
     return jsonify(result)
+
+
+@accounts_bp.route("/sync-pc-wechat", methods=["POST"])
+def sync_pc_wechat():
+    """按需触发 PC 微信针对特定公众号的自动化同步（如搜索并点击该公众号文章）。"""
+    data = request.get_json(silent=True) or {}
+    keyword = (data.get("keyword") or "").strip() or "新京报"
+    try:
+        from scripts.auto_refresh_pc_wechat import trigger_pc_wechat_refresh
+        # force=True：用户手动点击是明确意图，绕过冷却/合并（仍受全局 UI 互斥保护）
+        success = trigger_pc_wechat_refresh(keyword=keyword, force=True)
+        return jsonify({"success": success, "keyword": keyword})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@accounts_bp.route("/sync-batch-pc-wechat", methods=["POST"])
+def sync_batch_pc_wechat():
+    """全自动触发 UI 自动化一键为全部公众号建立主页授权会话"""
+    try:
+        from scripts.auto_refresh_pc_wechat import run_batch_portal_flow_macos
+        success = run_batch_portal_flow_macos()
+        return jsonify({"success": success})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500

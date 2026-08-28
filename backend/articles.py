@@ -16,7 +16,7 @@ from backend.config import (
     CONFIG_FILE, BASE_URL, DEFAULT_HEADERS, OUTPUT_DIR,
     DOWNLOAD_HISTORY_FILE,
     load_json, save_json, get_settings, get_proxies_dict, report_proxy_status,
-    normalize_wechat_url
+    normalize_wechat_url, get_default_wechat_ua
 )
 from backend.account_pool import borrow_session, account_pool
 
@@ -55,13 +55,14 @@ def fetch_article_detail_content(url: str) -> str:
             del img["data-src"]
 
 def _fetch_articles_via_appmsg_fallback(fakeid: str, begin: int, count: int, keyword: str, token: str, cookie_str: str):
-    """当 PC 微信 key 失效或缺失时，使用 Playwright/Web 获取到的 Web Token 自动走 /cgi-bin/appmsg 备用通道获取文章列表"""
-    if not token:
+    """当拥有可用 Web 管理端 Token 时，尝试通过 /cgi-bin/appmsg 备用通道获取文章列表"""
+    if not token or not str(token).isdigit():
         return None
     headers = {**DEFAULT_HEADERS, "Cookie": cookie_str}
-    proxies = get_proxies_dict()
     try:
-        resp = req.get(
+        s = req.Session()
+        s.trust_env = False
+        resp = s.get(
             f"{BASE_URL}/cgi-bin/appmsg",
             params={
                 "action": "list_ex",
@@ -76,8 +77,8 @@ def _fetch_articles_via_appmsg_fallback(fakeid: str, begin: int, count: int, key
                 "count": str(count),
             },
             headers=headers,
-            proxies=proxies,
-            timeout=20,
+            timeout=3,
+            verify=False,
         )
         if resp.status_code == 200:
             try:
@@ -104,63 +105,100 @@ def _fetch_articles_via_appmsg_fallback(fakeid: str, begin: int, count: int, key
                 can_continue = 1 if (begin + len(articles)) < total_cnt else 0
                 return articles, total_cnt, can_continue
     except Exception as e:
-        print(f"appmsg fallback 尝试失败: {e}")
+        print(f"appmsg fallback 尝试跳过: {e}", flush=True)
     return None
 
 
-def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "") -> tuple:
+def _enqueue_biz_refresh(fakeid: str, name: str, reason: str) -> None:
+    """把凭证过期的公众号加入刷新队列（自动跳过 + 及时补凭证，下轮采集补齐数据）。"""
+    try:
+        from backend.refresh_queue import refresh_queue
+        refresh_queue.enqueue(biz=fakeid, name=name, reason=reason)
+    except Exception as e:
+        print(f"[_fetch_articles_page] 刷新队列入队失败: {e}", flush=True)
+
+
+def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "", account_name: str = "") -> tuple:
     """使用微信客户端历史消息原生接口 (profile_ext?action=getmsg) 获取文章列表 (articles, total_count)
-    支持从账号池提取 appmsg_token, key, pass_ticket, uin 与 Cookie 进行翻页抓取"""
-    max_switch = 3
+    支持从账号池提取 appmsg_token, key, pass_ticket, uin 与 Cookie 进行翻页抓取
+    凭证过期时自动跳过并把该公众号加入刷新队列（及时补凭证，下轮采集补齐数据）"""
+    max_switch = 2
     last_exc = None
 
     for _ in range(max_switch):
-        try:
-            account_id, token, cookie_str = borrow_session()
-        except RuntimeError as e:
-            raise RuntimeError(str(e))
+        # biz 感知选号：优先持有该公众号专属凭证的账号，避免多账号池下选错账号导致 ret=-3
+        account_data = account_pool.acquire_for_biz(fakeid) or account_pool.acquire()
+        if not account_data:
+            if last_exc is not None:
+                break
+            raise RuntimeError("账号池中无可用账号，请先在『账号池』页面添加/登录账号")
 
-        # 尝试从账号中提取三方库需要的客户端参数
-        account_data = {}
-        with account_pool._lock:
-            for acc in account_pool._load():
-                if acc.get("id") == account_id:
-                    account_data = acc
-                    break
+        account_id = account_data["id"]
+        from backend.account_pool import AccountPool
+        biz_cred = AccountPool.get_biz_credential(account_data, fakeid)
 
-        appmsg_token = account_data.get("appmsg_token", token)
-        pass_ticket = account_data.get("pass_ticket", "")
-        key = account_data.get("key", "")
-        uin = account_data.get("uin", "")
+        token = biz_cred.get("token", "")
+        appmsg_token = biz_cred.get("appmsg_token", token)
+        cookie_str = biz_cred.get("cookie_str") or account_data.get("cookie_str", "")
+        uin = biz_cred.get("uin") or account_data.get("uin", "")
+        # 严格 biz 隔离：key / pass_ticket 只用该公众号自己的会话凭证，
+        # 不回退账号级字段（账号级 key 属于最近打开的其他公众号，跨号使用必被拒绝）
+        key = biz_cred.get("key", "")
+        pass_ticket = biz_cred.get("pass_ticket", "")
+        poc_token = biz_cred.get("poc_token", "")
+        poc_sid = biz_cred.get("poc_sid", "")
+        wxtoken = biz_cred.get("wxtoken", "777")
+
+        if not token and not key:
+            # 该公众号尚未建立独立阅读会话：不发起注定失败的请求。
+            # 优先全池查找公众平台 Web Token（纯数字）——客户端通道被封锁时这是唯一 API 恢复路径
+            web_token, web_cookie, _web_id = account_pool.get_web_token_session()
+            if web_token:
+                try:
+                    fallback_res = _fetch_articles_via_appmsg_fallback(fakeid, begin, count, keyword, web_token, web_cookie)
+                    if fallback_res is not None:
+                        articles, total_cnt, can_continue = fallback_res
+                        account_pool.report(account_id, ret=0)
+                        return articles, total_cnt, can_continue
+                except Exception as fb_err:
+                    print(f"Appmsg 备用通道尝试失败: {fb_err}", flush=True)
+            account_pool.report(account_id, ret=-3, error="该公众号尚未建立独立阅读会话（无专属凭证），已加入刷新队列")
+            _enqueue_biz_refresh(fakeid, account_name or keyword, "无会话凭证")
+            last_exc = PermissionError(f"当前公众号【{account_name or fakeid}】尚未建立独立主页会话：已加入自动刷新队列，请在电脑微信中打开该公众号主页建立会话！")
+            continue
 
         import urllib.parse, re
-        appmsg_token = urllib.parse.unquote(appmsg_token) if appmsg_token else ""
-        pass_ticket = urllib.parse.unquote(pass_ticket) if pass_ticket else ""
-        key = urllib.parse.unquote(key) if key else ""
-        uin = urllib.parse.unquote(uin) if uin else ""
+        if appmsg_token:
+            appmsg_token = urllib.parse.unquote(str(appmsg_token))
+        if pass_ticket:
+            pass_ticket = urllib.parse.unquote(str(pass_ticket))
+        if key:
+            key = urllib.parse.unquote(str(key))
+        if poc_token:
+            poc_token = urllib.parse.unquote(str(poc_token))
 
-        cookie_str = urllib.parse.unquote(cookie_str.replace(", ", "; "))
+        # 规范化 Cookie 分隔符，并保证 pass_ticket 中的 + 编码为 %2B 防止被微信服务端解析为空格
+        clean_cookie = cookie_str.replace(", ", "; ")
+        if "pass_ticket=" in clean_cookie:
+            clean_cookie = re.sub(r'pass_ticket=([^;,\s]+)', lambda m: 'pass_ticket=' + m.group(1).replace('+', '%2B'), clean_cookie)
+        if poc_sid and "poc_sid=" not in clean_cookie:
+            clean_cookie = f"{clean_cookie}; poc_sid={poc_sid}" if clean_cookie else f"poc_sid={poc_sid}"
 
-        if not uin:
-            m = re.search(r'wxuin=([^;,\s]+)', cookie_str) or re.search(r'(?:^|;\s*)uin=([^;,\s]+)', cookie_str)
-            if m: uin = m.group(1)
-
-        if not key:
-            m = re.search(r'(?:^|;\s*)key=([^;,\s]+)', cookie_str)
-            if m: key = m.group(1)
-
-        if not pass_ticket:
-            m = re.search(r'pass_ticket=([^;,\s]+)', cookie_str)
-            if m: pass_ticket = m.group(1)
-
-        ua = account_data.get("user_agent") or "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.5304.110 Safari/537.36 NetType/WIFI MicroMessenger/6.8.0(0x16080000) MacWechat/store ClientCanvas/1.0.0"
+        ua = biz_cred.get("user_agent") or account_data.get("user_agent") or get_default_wechat_ua()
         headers = {
             "User-Agent": ua,
-            "Cookie": cookie_str,
+            "Cookie": clean_cookie,
             "Accept": "application/json, text/plain, */*",
         }
         proxies = get_proxies_dict()
         proxy_url = proxies.get("http") if proxies else None
+
+        import base64
+        uin_str = str(uin).strip() if uin else ""
+        if uin_str and uin_str.isdigit():
+            uin_encoded = base64.b64encode(uin_str.encode()).decode()
+        else:
+            uin_encoded = uin_str
 
         params = {
             "action": "getmsg",
@@ -169,38 +207,45 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "")
             "offset": str(begin),
             "count": str(count),
             "is_ok": "1",
-            "scene": "126",
-            "uin": "",
-            "key": "",
-            "pass_ticket": "",
-            "appmsg_token": appmsg_token,
+            "scene": "124",
+            "uin": uin_encoded,
+            "key": str(key) if key else "",
+            "pass_ticket": str(pass_ticket) if pass_ticket else "",
+            "wxtoken": str(wxtoken) if wxtoken else "777",
+            "poc_token": str(poc_token) if poc_token else "",
             "x5": "0",
         }
 
+        from backend.cred_redact import mask_secret
+        print(f"[_fetch_articles_page] Sending HTTP GET to profile_ext for fakeid={fakeid} (uin={mask_secret(uin, 4)} key={'yes' if key else 'no'})...", flush=True)
         try:
             import urllib3
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            s = req.Session()
+            s.trust_env = False
             try:
-                resp = req.get(
+                resp = s.get(
                     f"{BASE_URL}/mp/profile_ext",
                     params=params,
                     headers=headers,
-                    proxies={"http": None, "https": None},
-                    timeout=25,
+                    timeout=8,
                     verify=False,
                 )
-            except Exception:
+                print(f"[_fetch_articles_page] profile_ext responded with HTTP {resp.status_code}", flush=True)
+            except Exception as s_err:
+                print(f"[_fetch_articles_page] s.get failed: {s_err}, trying curl_cffi...", flush=True)
                 from curl_cffi import requests as c_req
                 resp = c_req.get(
                     f"{BASE_URL}/mp/profile_ext",
                     params=params,
                     headers=headers,
-                    proxies={"http": None, "https": None},
-                    timeout=25,
+                    timeout=8,
                     impersonate="chrome",
                     verify=False,
                 )
+                print(f"[_fetch_articles_page] c_req.get responded with HTTP {resp.status_code}", flush=True)
         except Exception as exc:
+            print(f"[_fetch_articles_page] Both requests engines failed: {exc}", flush=True)
             report_proxy_status(proxy_url, success=False)
             account_pool.report(account_id, http_ok=False, error=str(exc))
             last_exc = exc
@@ -213,38 +258,59 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "")
             continue
 
         report_proxy_status(proxy_url, success=True)
+        resp_text = ""
         try:
             resp_text = resp.content.decode("utf-8", errors="replace") if hasattr(resp, "content") and resp.content else (resp.text or "")
             data = json.loads(resp_text)
         except Exception:
-            last_exc = RuntimeError("返回数据非 JSON 格式（可能需要重新在微信电脑版打开历史消息更新 key/token）")
+            # 响应护栏（参考 Access_wechat_article 的 js_content 校验思路）：
+            # 微信在凭证被拒绝时会以 HTTP 200 返回 HTML 验证页/环境异常页，而非接口 JSON。
+            sniff = resp_text[:3000] if resp_text else ""
+            if any(kw in sniff for kw in ("环境异常", "去验证", "操作验证", "weui-msg", "wx_alert", "当前环境异常")):
+                print(f"[_fetch_articles_page] 命中验证页护栏: 返回 HTML 验证页而非 JSON，凭证被服务端拒绝", flush=True)
+                account_pool.report(account_id, ret=200003, error="返回验证页(环境异常)，客户端凭证已被微信拒绝")
+                _enqueue_biz_refresh(fakeid, account_name or keyword, "验证页")
+                last_exc = PermissionError("微信返回验证页（环境异常），当前凭证已被拒绝，已加入刷新队列，将在下轮采集自动重试！")
+            else:
+                # 未知格式的非 JSON 响应也回写账号池计入失败，避免坏账号反复被调度
+                account_pool.report(account_id, http_ok=True, error="返回数据非 JSON 格式")
+                last_exc = RuntimeError("返回数据非 JSON 格式（可能需要重新在微信电脑版打开历史消息更新 key/token）")
             continue
 
         ret = data.get("ret", 0)
-        account_pool.report(account_id, ret=ret)
 
-        if ret != 0:
+        if ret == 0:
+            account_pool.report(account_id, ret=0)
+        else:
             errmsg = data.get("errmsg", f"ret={ret}")
 
-            # 如果客户端接口失败，且拥有可用 Web Token，尝试通过 /cgi-bin/appmsg 备用通道拉取
-            if appmsg_token or token:
+            # 客户端接口失败：优先全池查找公众平台 Web Token（纯数字）走 /cgi-bin/appmsg 备用通道
+            web_token, web_cookie, _web_id = account_pool.get_web_token_session()
+            if not web_token and str(appmsg_token or token).isdigit():
+                web_token, web_cookie = (appmsg_token or token), cookie_str
+            if web_token:
                 try:
-                    fallback_res = _fetch_articles_via_appmsg_fallback(fakeid, begin, count, keyword, appmsg_token or token, cookie_str)
+                    fallback_res = _fetch_articles_via_appmsg_fallback(fakeid, begin, count, keyword, web_token, web_cookie)
                     if fallback_res is not None:
                         articles, total_cnt, can_continue = fallback_res
+                        account_pool.report(account_id, ret=0)
                         return articles, total_cnt, can_continue
                 except Exception as fb_err:
                     print(f"Appmsg 备用通道尝试失败: {fb_err}")
 
+            account_pool.report(account_id, ret=ret)
+
             if ret in (-3, -4, -5, -6, 200003):
-                # 凭证失效，尝试发起探针请求触发 mitm_proxy 静默刷新
-                account_pool.try_refresh_account(account_id)
-                last_exc = PermissionError(f"客户端凭证已失效 ({errmsg})，请在 PC 微信或浏览器中刷新页面更新 key/token！")
-            elif ret == 200013:
-                last_exc = RuntimeError("触发微信频次控制(200013)，正在切换账号重试...")
+                _enqueue_biz_refresh(fakeid, account_name or keyword, f"ret={ret}")
+                hint = ""
+                if not biz_cred.get("getmsg_ready"):
+                    hint = "（当前捕获的是文章页凭证，不支持拉取列表；需打开该公众号『主页』以建立列表会话）"
+                last_exc = PermissionError(f"当前公众号【{account_name or fakeid}】凭证未就绪或已过期 (ret={ret}, {errmsg}){hint}，已加入刷新队列，下轮采集自动重试！")
+            elif ret == 200013 or "操作频繁" in str(errmsg):
+                last_exc = RuntimeError("触发微信频次控制(200013: 操作频繁)，账号已自动进入冷却避让状态，请稍后再试！")
             else:
                 last_exc = RuntimeError(f"微信历史消息接口错误: {errmsg}")
-            continue
+            break
 
         articles = []
         msg_list_str = data.get("general_msg_list", "")
@@ -311,8 +377,12 @@ def get_articles(fakeid):
     count = request.args.get("count", 10, type=int)
     keyword = request.args.get("keyword", "").strip()
 
+    t_start = time.time()
+    print(f"[Articles API] Start fetching articles for fakeid={fakeid} begin={begin} count={count}", flush=True)
+
     try:
-        articles, total_count, can_continue = _fetch_articles_page(fakeid, begin, count, keyword)
+        articles, total_count, can_continue = _fetch_articles_page(fakeid, begin, count, keyword, account_name=keyword)
+        print(f"[Articles API] Fetch finished in {time.time() - t_start:.2f}s, got {len(articles)} articles", flush=True)
 
         return jsonify({
             "articles": articles,
@@ -323,8 +393,10 @@ def get_articles(fakeid):
         })
 
     except PermissionError as e:
+        print(f"[Articles API] PermissionError in {time.time() - t_start:.2f}s: {e}", flush=True)
         return jsonify({"error": str(e)}), 401
     except (RuntimeError, req.RequestException) as e:
+        print(f"[Articles API] Error in {time.time() - t_start:.2f}s: {e}", flush=True)
         return jsonify({"error": f"网络请求失败: {str(e)}"}), 500
 
 
@@ -991,7 +1063,7 @@ def _do_range_download(
                         return
                     task["current"] = f"正在获取第 {begin // page_size + 1} 页"
 
-                res = _fetch_articles_page(fakeid, begin, page_size, keyword)
+                res = _fetch_articles_page(fakeid, begin, page_size, keyword, account_name=keyword)
                 articles, total_count = res[0], res[1]
                 if not articles:
                     stop = True

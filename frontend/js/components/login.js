@@ -28,6 +28,14 @@ const LoginPage = {
         return remaining > 0 ? `${remaining}分钟` : '即将恢复';
     },
 
+    formatBizAge(seconds) {
+        if (seconds === null || seconds === undefined) return '未知';
+        if (seconds < 60) return '刚刚';
+        if (seconds < 3600) return `${Math.floor(seconds / 60)}分钟前`;
+        if (seconds < 86400) return `${Math.floor(seconds / 3600)}小时前`;
+        return `${Math.floor(seconds / 86400)}天前`;
+    },
+
     statusLabel(status) {
         const map = {
             active: '正常',
@@ -55,13 +63,32 @@ const LoginPage = {
                     <h2 class="page-title">账号池</h2>
                     <p class="page-description">管理微信公众号与微信读书采集凭证，自动代理静默注入刷新</p>
                 </div>
-                <button class="btn btn-primary" id="btn-add-account" onclick="LoginPage.startLogin()">
-                    <svg viewBox="0 0 24 24" fill="none" width="18" height="18">
-                        <line x1="12" y1="5" x2="12" y2="19" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-                        <line x1="5" y1="12" x2="19" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-                    </svg>
-                    添加账号
-                </button>
+                <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+                    <!-- 定时同步开关 -->
+                    <div style="display: flex; align-items: center; gap: 8px; background: var(--bg-secondary); padding: 6px 12px; border-radius: var(--radius-md); border: 1px solid var(--border-color);" title="开启后每 5 分钟自动检测并批量续期公众号凭证">
+                        <label class="switch" style="margin: 0;">
+                            <input type="checkbox" id="switch-auto-refresh" checked onchange="LoginPage.toggleAutoRefresh(this.checked)">
+                            <span class="switch-slider"></span>
+                        </label>
+                        <span style="font-size: 0.84rem; color: var(--text-secondary); font-weight: 500;" id="label-auto-refresh">
+                            定时自动同步 (每5分钟)
+                        </span>
+                    </div>
+
+                    <!-- 手动同步按钮 -->
+                    <button class="btn btn-secondary" id="btn-manual-sync" onclick="LoginPage.manualSync()" title="立即通过微信文件传输助手打开聚合页，批量同步全部公众号凭证">
+                        🔄 手动同步凭证
+                    </button>
+
+                    <!-- 添加账号 -->
+                    <button class="btn btn-primary" id="btn-add-account" onclick="LoginPage.startLogin()">
+                        <svg viewBox="0 0 24 24" fill="none" width="18" height="18">
+                            <line x1="12" y1="5" x2="12" y2="19" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                            <line x1="5" y1="12" x2="19" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                        </svg>
+                        添加账号
+                    </button>
+                </div>
             </div>
 
             <div id="pool-summary" style="margin-bottom: 20px;"></div>
@@ -71,7 +98,10 @@ const LoginPage = {
     },
 
     async init() {
-        await this.loadAccounts();
+        await Promise.all([
+            this.loadAccounts(),
+            this.loadAutoRefreshConfig(),
+        ]);
         this._startEventPolling();
     },
 
@@ -96,10 +126,10 @@ const LoginPage = {
                         Toast.warning(`账号【${ev.nickname || '未知'}】${ev.reason}，已被移出账号池`);
                     }
                 }
-                // 无论是否有事件都刷新，确保 mitmproxy 后台静默更新凭证后 UI 能同步
+                // 无论是否有事件都刷新，确保 mitmproxy 后台静默更新凭证后 UI 能同步（5 秒粒度）
                 await this.loadAccounts();
             } catch (e) { /* silent */ }
-        }, 15000);
+        }, 5000);
     },
 
     async loadAccounts() {
@@ -108,8 +138,9 @@ const LoginPage = {
                 API.accountPool.list(),
                 API.accountPool.summary(),
             ]);
+            this._accounts = poolData.accounts || [];
             this.renderSummary(summaryData);
-            this.renderGrid(poolData.accounts || []);
+            this.renderGrid(this._accounts);
         } catch (err) {
             const grid = document.getElementById('pool-accounts-grid');
             if (grid) grid.innerHTML = `<div style="text-align:center; color: var(--text-muted); padding: 40px;">加载账号列表失败</div>`;
@@ -120,6 +151,9 @@ const LoginPage = {
         const el = document.getElementById('pool-summary');
         if (!el) return;
         const { total = 0, active = 0, cooldown = 0, banned = 0, invalid = 0 } = summary || {};
+        // 公众号专属凭证统计（跨账号汇总，独立于微信账号数）
+        const bizAll = (this._accounts || []).flatMap(a => a.biz_credentials || []);
+        const bizFresh = bizAll.filter(b => b.fresh).length;
         el.innerHTML = `
             <div style="display: flex; gap: 12px; flex-wrap: wrap;">
                 <span style="font-size: 0.85rem; padding: 4px 12px; border-radius: 20px; background: rgba(7,193,96,0.1); color: #07c160; font-weight: 600;">
@@ -132,8 +166,11 @@ const LoginPage = {
                     已踢出 ${banned + invalid}
                 </span>` : ''}
                 <span style="font-size: 0.85rem; padding: 4px 12px; border-radius: 20px; background: var(--bg-tertiary); color: var(--text-muted);">
-                    共 ${total} 个账号
+                    共 ${total} 个微信账号
                 </span>
+                ${bizAll.length ? `<span style="font-size: 0.85rem; padding: 4px 12px; border-radius: 20px; background: rgba(7,193,96,0.08); color: var(--text-secondary); font-weight: 600;">
+                    📰 公众号凭证 ${bizAll.length}（新鲜 ${bizFresh}${bizAll.length - bizFresh > 0 ? ` · 待续期 ${bizAll.length - bizFresh}` : ''}）
+                </span>` : ''}
             </div>
         `;
     },
@@ -160,11 +197,145 @@ const LoginPage = {
             return;
         }
 
+        // 公众号专属凭证独立成卡（不合并进微信账号卡片），排在账号卡之前
+        const bizCards = [];
+        for (const acc of accounts) {
+            for (const b of (acc.biz_credentials || [])) {
+                bizCards.push(this._renderBizCard(b, acc));
+            }
+        }
+
         grid.innerHTML = `
             <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px;">
+                ${bizCards.join('')}
                 ${accounts.map(acc => this._renderCard(acc)).join('')}
             </div>
         `;
+    },
+
+    _renderBizCard(b, owner) {
+        const fresh = !!b.fresh;
+        const ready = !!b.getmsg_ready;
+        // 已验证(可拉列表)的凭证按新鲜度绿/黄；未验证(仅文章页会话)灰色提示需开主页
+        const color = ready ? (fresh ? 'var(--success)' : 'var(--warning)') : 'var(--text-muted)';
+        const label = ready ? (fresh ? '会话新鲜' : '待续期') : '仅文章会话·需开主页';
+        const safeName = (b.name || '').replace(/'/g, "\\'");
+        return `
+            <div style="
+                background: var(--bg-card);
+                border: 1px solid ${ready && fresh ? 'var(--border-color)' : 'rgba(255,165,0,0.35)'};
+                border-radius: 12px;
+                padding: 16px 20px;
+                position: relative;
+            ">
+                <div style="position: absolute; top: 14px; right: 16px; display: flex; align-items: center; gap: 6px;">
+                    <span style="width: 8px; height: 8px; border-radius: 50%; background: ${color}; display: inline-block;
+                        ${ready && fresh ? 'box-shadow: 0 0 6px rgba(7,193,96,0.5);' : ''}"></span>
+                    <span style="font-size: 0.75rem; color: ${color}; font-weight: 600;">${label}</span>
+                </div>
+
+                <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px;">
+                    <div style="width: 38px; height: 38px; border-radius: 10px; background: rgba(7,193,96,0.12); color: #07c160; display: flex; align-items: center; justify-content: center; font-size: 1.05rem; flex-shrink: 0;">📰</div>
+                    <div style="flex: 1; min-width: 0;">
+                        <div style="font-weight: 700; color: var(--text-primary); font-size: 0.95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${this._esc(b.name)}">${this._esc(b.name)}</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); font-family: monospace;">${this._esc(b.biz)}</div>
+                    </div>
+                </div>
+
+                <div style="font-size: 0.78rem; color: var(--text-secondary); margin-bottom: 10px;">
+                    更新: <strong>${this.formatBizAge(b.age_seconds)}</strong>${b.has_key ? '' : ' · <span style="color: var(--error);">缺少 key</span>'}
+                    <span style="color: var(--text-muted);"> · 归属: ${this._esc(owner.nickname || '微信账号')}</span>
+                </div>
+
+                <button class="btn btn-primary btn-sm" style="font-size: 0.78rem; width: 100%;" onclick="LoginPage.syncBizCredential('${safeName}')">
+                    🔄 刷新该公众号凭证
+                </button>
+            </div>
+        `;
+    },
+
+    async manualSync() {
+        Toast.info('🚀 正在唤起微信客户端打开聚合页批量同步凭证，请稍候（约 10~15 秒）...');
+        const btn = document.getElementById('btn-manual-sync');
+        if (btn) {
+            btn.disabled = true;
+            btn.innerText = '⏳ 正在同步中...';
+        }
+        try {
+            const data = await API.accountPool.syncManual();
+            if (data.success) {
+                Toast.success('🎉 全部公众号主页凭证已 100% 自动同步就绪！');
+            } else {
+                Toast.warning('批量同步部分完成或超时，可前往微信确认');
+            }
+        } catch (e) {
+            Toast.error('手动同步请求失败: ' + e.message);
+        } finally {
+            if (btn) {
+                btn.disabled = false;
+                btn.innerText = '🔄 手动同步凭证';
+            }
+            await this.loadAccounts();
+        }
+    },
+
+    async toggleAutoRefresh(enabled) {
+        try {
+            const data = await API.accountPool.toggleAutoRefresh(enabled);
+            const intervalMin = data.interval_minutes || 5;
+            const label = document.getElementById('label-auto-refresh');
+            if (data.enabled) {
+                Toast.success(`✅ 已开启定时自动同步（每 ${intervalMin} 分钟巡检一次）`);
+                if (label) label.innerText = `定时自动同步 (每${intervalMin}分钟)`;
+            } else {
+                Toast.info('⏸️ 已关闭定时自动同步');
+                if (label) label.innerText = '定时自动同步 (已关闭)';
+            }
+        } catch (e) {
+            Toast.error('切换定时同步开关失败: ' + e.message);
+        }
+    },
+
+    async loadAutoRefreshConfig() {
+        try {
+            const cfg = await API.accountPool.getAutoRefreshConfig();
+            const sw = document.getElementById('switch-auto-refresh');
+            const label = document.getElementById('label-auto-refresh');
+            if (sw && cfg && typeof cfg.enabled === 'boolean') {
+                sw.checked = cfg.enabled;
+            }
+            if (label && cfg) {
+                const intervalMin = cfg.interval_minutes || 5;
+                label.innerText = cfg.enabled ? `定时自动同步 (每${intervalMin}分钟)` : '定时自动同步 (已关闭)';
+            }
+        } catch (e) { /* silent */ }
+    },
+
+    async syncAllBatch() {
+        return this.manualSync();
+    },
+
+    async syncBizCredential(name) {
+        if (!name) return;
+        Toast.info(`正在为【${name}】在电脑微信中打开文章以刷新凭证，请稍候（约 1 分钟）...`);
+        try {
+            const resp = await fetch('/api/accounts/sync-pc-wechat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ keyword: name })
+            });
+            const data = await resp.json();
+            if (data.success) {
+                Toast.success(`【${name}】新凭证已捕获`);
+            } else {
+                Toast.warning(`【${name}】本轮未捕获新凭证，可稍后重试，或手动在微信中打开该号任意一篇文章`);
+            }
+        } catch (e) {
+            Toast.error('刷新请求失败: ' + e.message);
+        } finally {
+            await this.loadAccounts();
+            setTimeout(() => this.loadAccounts(), 3000);  // 捕获落盘后再补一次刷新
+        }
     },
 
     _renderCard(acc) {
@@ -219,9 +390,11 @@ const LoginPage = {
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; font-size: 0.82rem; color: var(--text-secondary); margin-bottom: 12px;">
                     <div>失败: <strong>${acc.failures}</strong></div>
                     <div>风控: <strong>${acc.risk_hits}</strong></div>
-                    <div style="grid-column: span 2;">
-                        凭证状态: <strong style="color: var(--success);">长期有效</strong>${acc.save_time ? `<span style="color: var(--text-muted); font-size: 0.76rem; margin-left: 6px;">(${this.formatDate(acc.save_time)} 添加)</span>` : ''}
+                    <div>公众号专属凭证: <strong>${acc.biz_count || 0}</strong> 个${acc.biz_count ? '' : '（打开任一公众号文章后自动建立）'}</div>
+                    <div>
+                        凭证状态: <strong style="color: var(--success);">长期有效</strong>
                     </div>
+                    ${acc.save_time ? `<div style="grid-column: span 2; color: var(--text-muted); font-size: 0.76rem;">(${this.formatDate(acc.save_time)} 更新)</div>` : ''}
                 </div>
 
                 ${extraInfo}
@@ -231,7 +404,7 @@ const LoginPage = {
                     ${isKicked ? `
                         <button class="btn btn-primary btn-sm" onclick="LoginPage.startLogin()" style="flex: 1; font-size: 0.8rem;">重新登录</button>
                     ` : ''}
-                    <button class="btn btn-danger btn-sm" onclick="LoginPage.removeAccount('${acc.id}', '${this._esc(acc.nickname)}')" style="font-size: 0.8rem; ${isKicked ? '' : 'margin-left: auto;'}">
+                    <button class="btn btn-danger btn-sm" onclick="LoginPage.removeAccount('${acc.id}')" style="font-size: 0.8rem; ${isKicked ? '' : 'margin-left: auto;'}">
                         删除
                     </button>
                 </div>
@@ -372,12 +545,14 @@ const LoginPage = {
         }
     },
 
-    async removeAccount(id, nickname) {
-        Modal.confirm('删除账号', `确定要从账号池中删除「${nickname}」吗？`, async () => {
+    async removeAccount(id) {
+        const acc = (this._accounts || []).find(a => a.id === id);
+        const name = acc ? (acc.nickname || '该账号') : '该账号';
+        Modal.confirm('删除账号', `确定要从账号池中删除「${name}」吗？`, async () => {
             try {
                 await API.accountPool.remove(id);
                 Toast.success('已删除');
-                this.loadAccounts();
+                await this.loadAccounts();
                 App.checkAuthStatus();
             } catch (err) {
                 Toast.error('删除失败: ' + err.message);

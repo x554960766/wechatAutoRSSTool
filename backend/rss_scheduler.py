@@ -588,7 +588,7 @@ class RssScheduler:
             
             try:
                 for page_idx in range(max_pages):
-                    res = _fetch_articles_page(fakeid, begin=begin, count=count)
+                    res = _fetch_articles_page(fakeid, begin=begin, count=count, account_name=nickname)
                     page_articles, _total = res[0], res[1]
                     if not page_articles:
                         break
@@ -807,8 +807,8 @@ class RssScheduler:
                     self._global_upload_sweep()
             except Exception as e:
                 logger.error("RSS 调度器异常: %s", e)
-            # 每 30 秒检查一次是否有订阅需要执行
-            self._stop_event.wait(30)
+            # 每 5 秒检查一次是否有订阅需要执行
+            self._stop_event.wait(5)
         logger.info("RSS 调度器已停止")
 
     @staticmethod
@@ -827,13 +827,16 @@ class RssScheduler:
 
     @classmethod
     def _normalize_interval_minutes(cls, value) -> int:
-        return max(15, cls._safe_int(value, 60))
+        return max(1, cls._safe_int(value, 60))
 
     @classmethod
     def _get_interval_range_minutes(cls, interval_minutes: int) -> tuple[int, int]:
         interval = cls._normalize_interval_minutes(interval_minutes)
-        jitter = max(5, round(interval * 0.25))
-        return max(5, interval - jitter), interval + jitter
+        if interval == 60 or interval <= 1:
+            # 默认：1小时 到 1.5小时（60 到 90 分钟）随机
+            return 60, 90
+        jitter = max(1, round(interval * 0.25))
+        return max(1, interval - jitter), interval + jitter
 
     def _schedule_next_fetch(self, sub: dict, start_time: float | None = None) -> float:
         min_minutes, max_minutes = self._get_interval_range_minutes(sub.get("interval_minutes", 60))

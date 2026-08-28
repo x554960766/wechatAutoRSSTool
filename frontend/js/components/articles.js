@@ -238,7 +238,42 @@ const ArticlesPage = {
             this.updatePagination();
             this.updateSelectedCount();
         } catch (err) {
-            container.innerHTML = `<div class="empty-state"><p class="empty-state-desc">加载失败: ${err.message}</p></div>`;
+            const isAuthError = err.message && (err.message.includes('失效') || err.message.includes('未找到有效凭证') || err.message.includes('ret=-3') || err.message.includes('401') || err.message.includes('过期') || err.message.includes('会话'));
+            const accountName = this.currentAccount ? (this.currentAccount.nickname || '') : '';
+            container.innerHTML = `
+                <div class="empty-state" style="padding: 40px 20px;">
+                    <div style="font-size: 2.5rem; margin-bottom: 12px;">${isAuthError ? '🔐' : '⚠️'}</div>
+                    <h3 class="empty-state-title" style="margin-bottom: 8px;">${isAuthError ? (accountName ? `【${accountName}】尚未建立阅读会话` : '微信采集凭证已过期') : '加载文章列表失败'}</h3>
+                    <p class="empty-state-desc" style="max-width: 540px; margin: 0 auto 20px; line-height: 1.6; color: var(--text-secondary, #666);">
+                        ${isAuthError ? `微信 PC 客户端要求每个公众号首次抓取前建立独立阅读 Session（需打开公众号『主页』，仅点开文章不够）。<br>👉 <strong>方法 1</strong>：点击下方按钮，由系统自动在电脑微信中打开该号主页；<br>👉 <strong>方法 2</strong>：在电脑微信中进入该公众号任一文章 → 点击文章顶部的<strong>公众号名称/头像</strong>进入主页（出现历史文章列表即成功）。` : (err.message || '网络连接超时')}
+                    </p>
+                    <div style="display: flex; justify-content: center; gap: 10px; flex-wrap: wrap;">
+                        ${accountName ? `<button class="btn btn-primary" onclick="ArticlesPage.syncTargetAccount('${accountName}')">🤖 自动为【${accountName}】同步凭证</button>` : ''}
+                        <button class="btn btn-secondary" onclick="ArticlesPage.loadArticles()">🔄 重新检测并加载</button>
+                    </div>
+                </div>
+            `;
+        }
+    },
+
+    async syncTargetAccount(accountName) {
+        if (!accountName) return;
+        Toast.info(`正在尝试为【${accountName}】自动在微信中打开文章，请稍候...`);
+        try {
+            const resp = await fetch('/api/accounts/sync-pc-wechat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ keyword: accountName })
+            });
+            const data = await resp.json();
+            if (data.success) {
+                Toast.success(`【${accountName}】文章已定位，正在重新拉取列表...`);
+                setTimeout(() => this.loadArticles(), 2500);
+            } else {
+                Toast.warning(`自动化指令已发送，若未成功请手动在微信点开一篇文章后点击重试。`);
+            }
+        } catch (e) {
+            Toast.error(`触发自动同步失败: ${e.message}`);
         }
     },
 

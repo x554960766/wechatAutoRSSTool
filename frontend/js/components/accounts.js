@@ -543,6 +543,9 @@ const AccountsPage = {
 
     getRssIntervalRange(intervalMinutes) {
         const interval = Math.max(15, parseInt(intervalMinutes, 10) || 60);
+        if (interval === 60) {
+            return { min: 60, max: 90 };
+        }
         const jitter = Math.max(5, Math.round(interval * 0.25));
         return {
             min: Math.max(5, interval - jitter),

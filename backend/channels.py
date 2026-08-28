@@ -883,7 +883,8 @@ def get_proxy_status():
     return jsonify({
         "proxy_running": manager.running,
         "cert_installed": check_cert_trusted(),
-        "proxy_port": manager.port
+        "proxy_port": manager.port,
+        "last_error": getattr(manager, "last_error", None),
     })
 
 

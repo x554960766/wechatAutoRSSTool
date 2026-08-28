@@ -19,7 +19,8 @@ def ensure_virtualenv():
             args = [venv_python] + sys.argv
             os.execv(venv_python, args)
 
-ensure_virtualenv()
+
+
 
 import json
 import time
@@ -51,6 +52,7 @@ CONFIG_FILE = DATA_DIR / "wechat_mp_config.json"
 
 def load_credentials():
     """读取凭证：优先读取 account_pool.json 中最新捕获的有效凭证"""
+    from backend.cred_redact import mask_secret
     pool_file = DATA_DIR / "account_pool.json"
     if pool_file.exists():
         try:
@@ -60,7 +62,7 @@ def load_credentials():
                 acc = active[0]
                 token = acc.get("token") or acc.get("appmsg_token", "")
                 cookie_str = acc.get("cookie_str", "")
-                print(f"  📂 已从账号池加载 PC 微信捕获凭证（token={token[:8]}...）")
+                print(f"  📂 已从账号池加载 PC 微信捕获凭证（token={mask_secret(token, 6)}）")
                 return token, cookie_str, acc
         except Exception:
             pass
@@ -70,7 +72,7 @@ def load_credentials():
         token = cfg.get("token", "")
         cookie_str = cfg.get("cookie_str", "") or cfg.get("cookie", "")
         if token:
-            print(f"  📂 已从配置文件加载凭证（token={token[:8]}...）")
+            print(f"  📂 已从配置文件加载凭证（token={mask_secret(token, 6)}）")
             return token, cookie_str, cfg
 
     print("\n⚠️ 账号池及配置文件中未找到有效凭证。")
@@ -115,14 +117,42 @@ def fetch_page_via_appmsgpublish(
     API: GET https://mp.weixin.qq.com/mp/profile_ext
     """
     import urllib.parse, re
+    from backend.config import get_default_wechat_ua
+    ua = get_default_wechat_ua()
     url = "https://mp.weixin.qq.com/mp/profile_ext"
-    ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.5304.110 Safari/537.36 NetType/WIFI MicroMessenger/6.8.0(0x16080000) MacWechat/store ClientCanvas/1.0.0"
-    clean_cookie = urllib.parse.unquote(cookie_str.replace(", ", "; "))
+    clean_cookie = cookie_str.replace(", ", "; ")
+    if "pass_ticket=" in clean_cookie:
+        clean_cookie = re.sub(r'pass_ticket=([^;,\s]+)', lambda m: 'pass_ticket=' + m.group(1).replace('+', '%2B'), clean_cookie)
     raw_token = urllib.parse.unquote(token) if token else ""
     acc = acc or {}
-    pass_ticket = urllib.parse.unquote(acc.get("pass_ticket", "")) if acc.get("pass_ticket") else ""
+    # 严格 biz 隔离：优先使用该公众号的专属会话凭证（key/pass_ticket 属于单号会话，跨号使用会被拒绝）
+    biz_entry = (acc.get("biz_tokens") or {}).get(fakeid)
+    poc_token = ""
+    poc_sid = ""
+    wxtoken = "777"
+    if isinstance(biz_entry, dict):
+        key = biz_entry.get("key") or ""
+        pass_ticket = urllib.parse.unquote(biz_entry["pass_ticket"]) if biz_entry.get("pass_ticket") else ""
+        poc_token = urllib.parse.unquote(biz_entry["poc_token"]) if biz_entry.get("poc_token") else ""
+        poc_sid = biz_entry.get("poc_sid") or ""
+        wxtoken = biz_entry.get("wxtoken") or "777"
+    else:
+        key = acc.get("key", "")
+        pass_ticket = urllib.parse.unquote(acc.get("pass_ticket", "")) if acc.get("pass_ticket") else ""
+        poc_token = urllib.parse.unquote(acc.get("poc_token", "")) if acc.get("poc_token") else ""
+        poc_sid = acc.get("poc_sid") or ""
+        wxtoken = acc.get("wxtoken") or "777"
     uin = acc.get("uin", "")
-    key = acc.get("key", "")
+
+    if poc_sid and "poc_sid=" not in clean_cookie:
+        clean_cookie = f"{clean_cookie}; poc_sid={poc_sid}" if clean_cookie else f"poc_sid={poc_sid}"
+
+    import base64
+    uin_str = str(uin).strip() if uin else ""
+    if uin_str and uin_str.isdigit():
+        uin_encoded = base64.b64encode(uin_str.encode()).decode()
+    else:
+        uin_encoded = uin_str
 
     headers = {
         "User-Agent": ua,
@@ -136,11 +166,12 @@ def fetch_page_via_appmsgpublish(
         "offset": str(begin),
         "count": str(count),
         "is_ok": "1",
-        "scene": "126",
-        "uin": "",
-        "key": "",
-        "pass_ticket": "",
-        "appmsg_token": raw_token,
+        "scene": "124",
+        "uin": uin_encoded,
+        "key": str(key) if key else "",
+        "pass_ticket": str(pass_ticket) if pass_ticket else "",
+        "wxtoken": str(wxtoken) if wxtoken else "777",
+        "poc_token": str(poc_token) if poc_token else "",
         "x5": "0",
     }
 
@@ -397,4 +428,6 @@ def main():
 
 
 if __name__ == "__main__":
+    ensure_virtualenv()
     main()
+

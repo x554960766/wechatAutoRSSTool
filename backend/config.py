@@ -14,7 +14,7 @@ from pathlib import Path
 from backend.runtime import app_dir
 
 # ── 版本号 ────────────────────────────────────────────────
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.8.3"
 
 # ── 路径配置 ──────────────────────────────────────────────
 if getattr(sys, 'frozen', False):
@@ -66,6 +66,7 @@ DEFAULT_SETTINGS = {
     "channels_harvest_window_start_hour": 8,
     "channels_harvest_window_end_hour": 24,
     "channels_harvest_max_per_author": 30,  # 单作者单次采集上限，0 = 不限
+    "channels_harvest_session_cap": 0,  # 单次采集作者数上限，0 = 采集全部关注作者
     # 腾讯云 COS 配置（支持向接口动态获取 STS 临时凭证，或填写静态 COS 凭证）
     "cos_token_api_url": "",
     "cos_secret_id": "",
@@ -75,6 +76,17 @@ DEFAULT_SETTINGS = {
     "cos_prefix": "channels/",
     "cos_cds_domain": "",
     "channels_device_id": "视频号_caiji2",
+    # 小红书自动采集与上传配置
+    "xhs_auto_collect_enabled": False,
+    "xhs_collect_interval_minutes": 120,
+    "xhs_collect_window_start_hour": 8,
+    "xhs_collect_window_end_hour": 24,
+    "xhs_collect_max_per_account": 20,
+    "xhs_collect_cooldown_minutes": 15,
+    "xhs_upload_enabled": False,
+    "xhs_upload_url": "",
+    "xhs_device_id": "小红书_caiji100",
+    "xhs_cos_prefix": "xhs/",
 }
 
 
@@ -435,4 +447,12 @@ def normalize_wechat_url(url: str) -> str:
     except Exception:
         pass
     return url
+
+
+def get_default_wechat_ua() -> str:
+    """根据操作系统自动匹配对应平台的 微信客户端 User-Agent (避免 Windows 用 Mac UA 导致微信判定登录失效)"""
+    if sys.platform == "win32":
+        return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.5304.110 Safari/537.36 NetType/WIFI MicroMessenger/7.0.20.1781(0x6700143B) WindowsWechat ClientCanvas/1.0.0"
+    return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.5304.110 Safari/537.36 NetType/WIFI MicroMessenger/6.8.0(0x16080000) MacWechat/store ClientCanvas/1.0.0"
+
 
