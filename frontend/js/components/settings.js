@@ -325,7 +325,7 @@ const SettingsPage = {
                             </div>
                             <div class="form-group">
                                 <label class="form-label" for="setting-xhs-cos-prefix">COS 视频存储前缀</label>
-                                <input type="text" class="form-input" id="setting-xhs-cos-prefix" placeholder="xhs/" />
+                                <input type="text" class="form-input" id="setting-xhs-cos-prefix" placeholder="channels/" />
                                 <div class="form-hint">腾讯云 COS 上传前缀路径，凭证复用视频号区域的 COS 配置</div>
                             </div>
                         </div>
@@ -484,7 +484,7 @@ const SettingsPage = {
         if (xhsUploadEnabled) xhsUploadEnabled.checked = !!data.xhs_upload_enabled;
         if (xhsUploadUrl) xhsUploadUrl.value = data.xhs_upload_url || '';
         if (xhsDeviceId) xhsDeviceId.value = data.xhs_device_id || '小红书_caiji100';
-        if (xhsCosPrefix) xhsCosPrefix.value = data.xhs_cos_prefix !== undefined ? data.xhs_cos_prefix : 'xhs/';
+        if (xhsCosPrefix) xhsCosPrefix.value = data.xhs_cos_prefix !== undefined ? data.xhs_cos_prefix : 'channels/';
 
         this.toggleRssUpload();
         this.toggleXhsUpload();
@@ -590,7 +590,7 @@ const SettingsPage = {
             xhs_upload_enabled: (() => { const el = document.getElementById('setting-xhs-upload-enabled'); return el ? el.checked : false; })(),
             xhs_upload_url: (() => { const el = document.getElementById('setting-xhs-upload-url'); return el ? el.value.trim() : ''; })(),
             xhs_device_id: (() => { const el = document.getElementById('setting-xhs-device-id'); return el ? (el.value.trim() || '小红书_caiji100') : '小红书_caiji100'; })(),
-            xhs_cos_prefix: (() => { const el = document.getElementById('setting-xhs-cos-prefix'); return el ? el.value.trim() : 'xhs/'; })(),
+            xhs_cos_prefix: (() => { const el = document.getElementById('setting-xhs-cos-prefix'); return el ? el.value.trim() : 'channels/'; })(),
         };
 
         try {

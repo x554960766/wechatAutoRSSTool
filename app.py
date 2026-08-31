@@ -99,13 +99,8 @@ app.register_blueprint(updater_bp)
 from backend.account_pool import migrate_legacy_config
 migrate_legacy_config()
 
-# 自动启动本地 MITM 抓包截获代理服务（开启端口 8080 与系统代理）
-try:
-    from backend.mitm_proxy import ProxyManager
-    ProxyManager.get_instance().start()
-    print("🚀 [App Init] 本地 MITM 截获代理服务与系统代理已自动开启！", flush=True)
-except Exception as p_err:
-    print(f"⚠️ [App Init] 代理服务启动提示: {p_err}", flush=True)
+# 微信/视频号同步助手（MITM抓包代理）默认保持关闭，需用户在页面手动开启
+print("ℹ️ [App Init] 微信与视频号凭证同步助手代理默认关闭（需手动在页面开启）。", flush=True)
 
 # 启动 RSS 自动抓取调度器
 from backend.rss_scheduler import rss_scheduler

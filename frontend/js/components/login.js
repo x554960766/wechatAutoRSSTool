@@ -67,11 +67,11 @@ const LoginPage = {
                     <!-- 定时同步开关 -->
                     <div style="display: flex; align-items: center; gap: 8px; background: var(--bg-secondary); padding: 6px 12px; border-radius: var(--radius-md); border: 1px solid var(--border-color);" title="开启后每 5 分钟自动检测并批量续期公众号凭证">
                         <label class="switch" style="margin: 0;">
-                            <input type="checkbox" id="switch-auto-refresh" checked onchange="LoginPage.toggleAutoRefresh(this.checked)">
+                            <input type="checkbox" id="switch-auto-refresh" onchange="LoginPage.toggleAutoRefresh(this.checked)">
                             <span class="switch-slider"></span>
                         </label>
                         <span style="font-size: 0.84rem; color: var(--text-secondary); font-weight: 500;" id="label-auto-refresh">
-                            定时自动同步 (每5分钟)
+                            定时自动同步 (已关闭)
                         </span>
                     </div>
 

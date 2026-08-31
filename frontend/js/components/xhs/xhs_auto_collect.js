@@ -97,7 +97,7 @@ const XhsAutoCollectPage = {
                         </div>
                         <div>
                             <label style="display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 4px;">COS 视频存储前缀</label>
-                            <input type="text" id="xhs-cos-prefix" class="form-control" placeholder="xhs/" style="padding: 6px 10px; font-size: 0.85rem; border-radius: 6px; border: 1px solid var(--border-color); background: var(--bg-input); color: var(--text-primary); width: 100%;" />
+                            <input type="text" id="xhs-cos-prefix" class="form-control" placeholder="channels/" style="padding: 6px 10px; font-size: 0.85rem; border-radius: 6px; border: 1px solid var(--border-color); background: var(--bg-input); color: var(--text-primary); width: 100%;" />
                         </div>
                     </div>
                     <div class="form-hint" style="font-size: 0.75rem; color: var(--text-muted); margin-top: 6px;">
@@ -427,7 +427,7 @@ const XhsAutoCollectPage = {
             xhs_upload_enabled: !!(uploadToggle && uploadToggle.checked),
             xhs_upload_url: uploadUrlEl ? uploadUrlEl.value.trim() : '',
             xhs_device_id: deviceIdEl ? deviceIdEl.value.trim() : '小红书_caiji100',
-            xhs_cos_prefix: cosPrefixEl ? cosPrefixEl.value.trim() : 'xhs/',
+            xhs_cos_prefix: cosPrefixEl ? cosPrefixEl.value.trim() : 'channels/',
         };
 
         try {

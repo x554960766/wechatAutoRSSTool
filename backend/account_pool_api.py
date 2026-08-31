@@ -46,7 +46,7 @@ def get_auto_refresh_cfg():
         from scripts.auto_refresh_pc_wechat import get_auto_refresh_config
         return jsonify(get_auto_refresh_config())
     except Exception as e:
-        return jsonify({"enabled": True, "interval_minutes": 5, "error": str(e)})
+        return jsonify({"enabled": False, "interval_minutes": 5, "error": str(e)})
 
 
 @account_pool_bp.route("/auto-refresh-toggle", methods=["POST"])

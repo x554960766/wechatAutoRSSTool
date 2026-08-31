@@ -157,75 +157,124 @@ img,video{{width:100%;border-radius:8px;margin:8px 0;display:block;}}
         print(f"写入 HTML 失败: {e}")
         return 0
 
-def upload_xhs_video_to_cos(video_path: Path, note_id: str) -> str | None:
+def upload_xhs_video_to_cos(video_path: Path, note_id: str, max_retries: int = 3, return_error: bool = False) -> str | None | tuple[str | None, str | None]:
     """把本地下载的小红书视频文件上传到腾讯云 COS，返回公网链接。
-    未配置 COS 或上传失败时记录警告并返回 None（不影响本地保存）。"""
+    - 上传路径前缀统一为 channels/ (如 channels/{note_id}.mp4)
+    - 失败自动重试 3 次，若使用 STS 临时凭证接口则在重试时强行刷新 token
+    - 详细打印并输出 COS 失败原因
+    - 若 return_error=True，返回 (cos_url, error_msg)；否则直接返回 cos_url (兼容旧调用)
+    """
     if not video_path or not video_path.exists():
-        return None
+        err = f"视频文件不存在: {video_path}"
+        print(f"[小红书 COS] 错误: {err}", flush=True)
+        return (None, err) if return_error else None
+
+    if video_path.stat().st_size == 0:
+        err = f"视频文件大小为 0 字节: {video_path}"
+        print(f"[小红书 COS] 错误: {err}", flush=True)
+        return (None, err) if return_error else None
 
     settings = get_settings()
     token_api_url = (settings.get("cos_token_api_url") or "").strip()
 
-    cos_cfg = None
-    if token_api_url:
-        try:
-            from backend.channels_upload import _fetch_cos_token
-            cos_cfg = _fetch_cos_token(token_api_url)
-        except Exception as e:
-            print(f"[小红书 COS] 获取 STS 临时凭证失败: {e}")
+    def _get_cos_cfg(force_refresh: bool = False) -> tuple[dict | None, str | None]:
+        if token_api_url:
+            try:
+                from backend.channels_upload import _fetch_cos_token
+                cfg = _fetch_cos_token(token_api_url, force_refresh=force_refresh)
+                if cfg:
+                    return cfg, None
+            except Exception as e:
+                return None, f"获取 STS 临时凭证失败: {e}"
 
-    if not cos_cfg:
-        # 回退使用静态凭证
+        # 回退使用静态凭证（优先使用小红书专属存储桶，未单独指定则回退默认）
         s_id = str(settings.get("cos_secret_id") if settings.get("cos_secret_id") is not None else "").strip()
         s_key = str(settings.get("cos_secret_key") if settings.get("cos_secret_key") is not None else "").strip()
-        region = str(settings.get("cos_region") if settings.get("cos_region") is not None else "").strip()
-        bucket = str(settings.get("cos_bucket") if settings.get("cos_bucket") is not None else "").strip()
+        region = str(settings.get("xhs_cos_region") or settings.get("cos_region") or "ap-guangzhou").strip()
+        bucket = str(settings.get("xhs_cos_bucket") or "chenshipin-hg-1305012248").strip()
+        cds_domain = str(settings.get("xhs_cos_cds_domain") or f"https://{bucket}.cos.{region}.myqcloud.com/").strip()
+        prefix = str(settings.get("xhs_cos_prefix") or "channels/").strip()
         if s_id and s_key and region and bucket:
-            cos_cfg = {
+            return {
                 "secret_id": s_id,
                 "secret_key": s_key,
                 "region": region,
                 "bucket": bucket,
-                "prefix": str(settings.get("xhs_cos_prefix") or "xhs/").strip(),
-                "cds_domain": str(settings.get("cos_cds_domain") or "").strip(),
-            }
+                "prefix": prefix,
+                "cds_domain": cds_domain,
+            }, None
 
-    if not cos_cfg or not all([cos_cfg.get("secret_id"), cos_cfg.get("secret_key"), cos_cfg.get("region"), cos_cfg.get("bucket")]):
-        return None
+        missing = []
+        if not s_id: missing.append("cos_secret_id")
+        if not s_key: missing.append("cos_secret_key")
+        if not region: missing.append("cos_region")
+        if not bucket: missing.append("cos_bucket")
+        return None, f"未配置腾讯云 COS 凭证（缺少 {', '.join(missing)} 且未配置 cos_token_api_url）"
+
+    # 获取初始凭证
+    cos_cfg, cfg_err = _get_cos_cfg(force_refresh=False)
+    if not cos_cfg:
+        print(f"[小红书 COS] 跳过上传: {cfg_err}", flush=True)
+        return (None, cfg_err) if return_error else None
 
     try:
         from qcloud_cos import CosConfig, CosS3Client
+    except ImportError as e:
+        err = f"未安装 qcloud_cos 依赖包: {e}"
+        print(f"[小红书 COS] 错误: {err}", flush=True)
+        return (None, err) if return_error else None
 
-        prefix = cos_cfg.get("prefix") or "xhs/"
-        if not prefix.endswith("/"):
-            prefix += "/"
-        key = f"{prefix}{note_id or int(time.time())}.mp4"
+    prefix = str(settings.get("xhs_cos_prefix") or cos_cfg.get("prefix") or "channels/").strip()
+    if not prefix.endswith("/"):
+        prefix += "/"
+    prefix = prefix.lstrip("/")
+    key = f"{prefix}{note_id or int(time.time())}.mp4"
 
+    try:
         data = video_path.read_bytes()
-
-        cos_config_kwargs = {
-            "Region": cos_cfg["region"],
-            "SecretId": cos_cfg["secret_id"],
-            "SecretKey": cos_cfg["secret_key"],
-        }
-        if cos_cfg.get("token"):
-            cos_config_kwargs["Token"] = cos_cfg["token"]
-
-        config = CosConfig(**cos_config_kwargs)
-        client = CosS3Client(config)
-        client.put_object(Bucket=cos_cfg["bucket"], Body=data, Key=key)
-
-        cds_domain = cos_cfg.get("cds_domain") or settings.get("cos_cds_domain") or ""
-        if cds_domain:
-            cos_url = f"{cds_domain.rstrip('/')}/{key}"
-        else:
-            cos_url = f"https://{cos_cfg['bucket']}.cos.{cos_cfg['region']}.myqcloud.com/{key}"
-
-        print(f"[小红书 COS] 视频上传成功: {cos_url}")
-        return cos_url
     except Exception as e:
-        print(f"[小红书 COS] 上传视频到 COS 失败: {e}")
-        return None
+        err = f"读取视频文件数据失败: {e}"
+        print(f"[小红书 COS] 错误: {err}", flush=True)
+        return (None, err) if return_error else None
+
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            # 重试时若走 STS 接口则强行刷新凭证
+            if attempt > 1 and token_api_url:
+                refreshed_cfg, _ = _get_cos_cfg(force_refresh=True)
+                if refreshed_cfg:
+                    cos_cfg = refreshed_cfg
+
+            cos_config_kwargs = {
+                "Region": cos_cfg["region"],
+                "SecretId": cos_cfg["secret_id"],
+                "SecretKey": cos_cfg["secret_key"],
+            }
+            if cos_cfg.get("token"):
+                cos_config_kwargs["Token"] = cos_cfg["token"]
+
+            config = CosConfig(**cos_config_kwargs)
+            client = CosS3Client(config)
+            client.put_object(Bucket=cos_cfg["bucket"], Body=data, Key=key)
+
+            cds_domain = cos_cfg.get("cds_domain") or settings.get("cos_cds_domain") or ""
+            if cds_domain:
+                cos_url = f"{cds_domain.rstrip('/')}/{key.lstrip('/')}"
+            else:
+                cos_url = f"https://{cos_cfg['bucket']}.cos.{cos_cfg['region']}.myqcloud.com/{key.lstrip('/')}"
+
+            print(f"[小红书 COS] 视频上传成功 (尝试 {attempt}/{max_retries}): {cos_url}", flush=True)
+            return (cos_url, None) if return_error else cos_url
+        except Exception as e:
+            last_err = e
+            print(f"[小红书 COS] 视频上传失败 (第 {attempt}/{max_retries} 次重试, note_id={note_id}): {e}", flush=True)
+            if attempt < max_retries:
+                time.sleep(1.0 * attempt)
+
+    final_err_msg = f"重试 {max_retries} 次均失败: {last_err}"
+    print(f"[小红书 COS] 视频上传最终失败 (note_id={note_id}): {final_err_msg}", flush=True)
+    return (None, final_err_msg) if return_error else None
 
 def generate_note_content(detail: dict, cos_url: str = None) -> str:
     """区分视频和图文生成 content：
@@ -1546,11 +1595,13 @@ def _do_xhs_download_thread(task_id: str, urls: list, account_name: str):
                             last_download_err = e
                             continue
                     if video_ok:
-                        # 尝试将视频上传到腾讯云 COS
-                        cos_url = upload_xhs_video_to_cos(save_file, detail["note_id"])
+                        # 尝试将视频上传到腾讯云 COS (支持失败自动重试3次)
+                        cos_url, cos_err = upload_xhs_video_to_cos(save_file, detail["note_id"], return_error=True)
                         if cos_url:
                             detail["cos_url"] = cos_url
                             detail["video_url"] = cos_url
+                        elif cos_err:
+                            detail["cos_error"] = cos_err
                     else:
                         success = False
                         error_msg = f"视频下载失败: {last_download_err or '所有备选视频源均无法下载'}"
@@ -1626,6 +1677,7 @@ def _do_xhs_download_thread(task_id: str, urls: list, account_name: str):
                 "success": success,
                 "error": error_msg,
                 "cos_url": detail.get("cos_url", ""),
+                "cos_error": detail.get("cos_error", None),
                 "uploaded": uploaded_ok if success else False,
                 "upload_error": upload_err if (success and not uploaded_ok) else None,
                 "upload_time": time.time() if (success and uploaded_ok) else None,
