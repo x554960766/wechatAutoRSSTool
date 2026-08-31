@@ -467,11 +467,13 @@ class XhsAutoCollector:
                             if video_ok:
                                 # 视频下载完成后稍微停顿 1.2~2.5 秒
                                 self._sleep(random.uniform(1.2, 2.5), user_id=user_id)
-                                # 尝试将视频上传到腾讯云 COS
-                                cos_url = upload_xhs_video_to_cos(save_file, detail["note_id"])
+                                # 尝试将视频上传到腾讯云 COS (支持失败自动重试3次)
+                                cos_url, cos_err = upload_xhs_video_to_cos(save_file, detail["note_id"], return_error=True)
                                 if cos_url:
                                     detail["cos_url"] = cos_url
                                     detail["video_url"] = cos_url
+                                elif cos_err:
+                                    detail["cos_error"] = cos_err
                             else:
                                 success = False
                                 error_msg = f"视频下载失败: {last_v_err or '所有备选源均不可用'}"
@@ -521,6 +523,21 @@ class XhsAutoCollector:
                     if success and not (self._stop_event.is_set() or self._abort_all_event.is_set() or user_id in self._cancelled_users):
                         uploaded_ok, upload_err = post_xhs_note_to_server(data_json)
 
+                    # 自动采集且推送到服务器成功后：自动删除本地文件与目录，释放磁盘与空间，只保留采集与上传记录
+                    local_cleaned = False
+                    if success and uploaded_ok and note_dir and note_dir.exists():
+                        try:
+                            import shutil
+                            shutil.rmtree(note_dir, ignore_errors=True)
+                            local_cleaned = True
+                            logger.info("小红书自动采集 [%s] 作品已成功上传服务器，自动清理本地文件: %s", nickname, note_dir.name)
+                            # 若博主根目录已空则一并清理
+                            parent_dir = note_dir.parent
+                            if parent_dir.exists() and not any(parent_dir.iterdir()):
+                                parent_dir.rmdir()
+                        except Exception as rm_e:
+                            logger.warning("清理本地笔记文件失败: %s", rm_e)
+
                     # 记录单篇详情到采集日志列表中
                     detail_records.append({
                         "note_id": detail["note_id"],
@@ -528,10 +545,12 @@ class XhsAutoCollector:
                         "type": detail["type"],
                         "download_success": success,
                         "cos_url": detail.get("cos_url", ""),
+                        "cos_error": detail.get("cos_error", None),
                         "uploaded": uploaded_ok if success else False,
                         "upload_error": upload_err if (success and not uploaded_ok) else None,
                         "error": error_msg,
-                        "path": str(note_dir) if success else "",
+                        "path": str(note_dir) if (success and not local_cleaned) else "",
+                        "local_cleaned": local_cleaned,
                         "time": time.time()
                     })
 
@@ -543,23 +562,25 @@ class XhsAutoCollector:
                             "note_id": detail["note_id"],
                             "type": detail["type"],
                             "author": detail["author"]["nickname"] or nickname,
-                            "path": str(note_dir),
+                            "path": str(note_dir) if not local_cleaned else "",
                             "size": total_size,
                             "time": time.time(),
                             "success": success,
                             "error": error_msg,
                             "trigger": "auto_collect",
                             "cos_url": detail.get("cos_url", ""),
+                            "cos_error": detail.get("cos_error", None),
                             "uploaded": uploaded_ok if success else False,
                             "upload_error": upload_err if (success and not uploaded_ok) else None,
                             "upload_time": time.time() if (success and uploaded_ok) else None,
+                            "local_cleaned": local_cleaned,
                         })
                         save_json(XHS_HISTORY_FILE, history)
 
                     if success:
                         new_downloaded += 1
                         if uploaded_ok:
-                            logger.info("小红书自动采集 [%s] 成功下载并推送服务器: %s (COS: %s)", nickname, clean_title, detail.get("cos_url") or "无")
+                            logger.info("小红书自动采集 [%s] 成功下载并推送服务器 (本地文件已释放): %s (COS: %s)", nickname, clean_title, detail.get("cos_url") or "无")
                         elif upload_err:
                             logger.warning("小红书自动采集 [%s] 下载成功但推送服务器失败: %s - %s", nickname, clean_title, upload_err)
                         else:
@@ -765,7 +786,7 @@ class XhsAutoCollector:
             "upload_enabled": bool(settings.get("xhs_upload_enabled", False)),
             "upload_url": settings.get("xhs_upload_url", "") or settings.get("rss_upload_url", ""),
             "device_id": settings.get("xhs_device_id", "小红书_caiji100"),
-            "cos_prefix": settings.get("xhs_cos_prefix", "xhs/"),
+            "cos_prefix": settings.get("xhs_cos_prefix", "channels/"),
             "has_cos_config": bool(settings.get("cos_token_api_url") or (settings.get("cos_secret_id") and settings.get("cos_bucket"))),
             "in_cooldown": in_cd,
             "cooldown_remaining": cd_remaining,

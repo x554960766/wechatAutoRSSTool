@@ -41,7 +41,7 @@ _daemon_lock = threading.Lock()
 _ui_flow_lock = threading.Lock()        # 全局 UI 互斥：同一时刻只允许一个 UI 自动化流程操作微信客户端
 _proactive_last_attempt = {}            # biz -> 上次主动续期尝试时间（退避用，防止失败目标霸占名额）
 
-ENABLE_BACKGROUND_ACTIVE_REFRESH = True   # 开启后台主动刷新，默认开启
+ENABLE_BACKGROUND_ACTIVE_REFRESH = False  # 微信凭证后台主动刷新，默认关闭，需手动开启
 
 
 def get_auto_refresh_config() -> dict:

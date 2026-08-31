@@ -14,7 +14,7 @@ from pathlib import Path
 from backend.runtime import app_dir
 
 # ── 版本号 ────────────────────────────────────────────────
-APP_VERSION = "1.8.3"
+APP_VERSION = "1.8.4"
 
 # ── 路径配置 ──────────────────────────────────────────────
 if getattr(sys, 'frozen', False):
@@ -86,7 +86,9 @@ DEFAULT_SETTINGS = {
     "xhs_upload_enabled": False,
     "xhs_upload_url": "",
     "xhs_device_id": "小红书_caiji100",
-    "xhs_cos_prefix": "xhs/",
+    "xhs_cos_bucket": "chenshipin-hg-1305012248",
+    "xhs_cos_cds_domain": "https://chenshipin-hg-1305012248.cos.ap-guangzhou.myqcloud.com/",
+    "xhs_cos_prefix": "channels/",
 }
 
 

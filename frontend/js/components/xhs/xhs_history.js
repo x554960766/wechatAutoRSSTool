@@ -131,6 +131,13 @@ const XhsHistoryPage = {
                             ${statusPrefix}${title}
                         </div>
                         ${item.error ? `<div style="font-size: 0.75rem; color: var(--error); margin-top: 2px;">错误: ${this._esc(item.error)}</div>` : ''}
+                        ${item.cos_url ? `
+                            <div style="margin-top: 4px;">
+                                <a href="${this._esc(item.cos_url)}" target="_blank" style="display: inline-flex; align-items: center; gap: 4px; font-size: 0.74rem; color: var(--primary, #3b82f6); background: rgba(59, 130, 246, 0.08); padding: 2px 8px; border-radius: 4px; text-decoration: none; border: 1px solid rgba(59, 130, 246, 0.2); transition: all 0.2s;" title="${this._esc(item.cos_url)}" onmouseover="this.style.background='rgba(59,130,246,0.15)'" onmouseout="this.style.background='rgba(59,130,246,0.08)'">
+                                    <span>☁️</span><span>COS直链</span>
+                                </a>
+                            </div>` : ''}
+                        ${!item.cos_url && item.cos_error ? `<div style="font-size: 0.72rem; color: var(--warning, #d97706); margin-top: 3px;" title="${this._esc(item.cos_error)}">⚠️ COS失败: ${this._esc(item.cos_error)}</div>` : ''}
                     </td>
                     <td style="padding: 12px 16px;">
                         <span style="background: ${badgeBg}; color: ${badgeColor}; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; font-weight: 600;">
@@ -143,11 +150,13 @@ const XhsHistoryPage = {
                     <td style="padding: 12px 16px;">${sizeStr}</td>
                     <td style="padding: 12px 16px; color: var(--text-muted); font-size: 0.8rem;">${timeStr}</td>
                     <td style="padding: 12px 16px; text-align: center;">
-                        <div style="display: flex; gap: 6px; justify-content: center;">
+                        <div style="display: flex; gap: 6px; justify-content: center; align-items: center;">
                             ${item.success && item.path ? `
                                 <button class="btn btn-secondary btn-sm" onclick="XhsHistoryPage.openFile('${this._esc(item.path).replace(/\\/g, '\\\\')}')" style="padding: 3px 8px; font-size: 0.75rem;">📂 打开</button>
                                 <button class="btn btn-secondary btn-sm" onclick="XhsHistoryPage.openParent('${this._esc(item.path).replace(/\\/g, '\\\\')}')" style="padding: 3px 8px; font-size: 0.75rem;">🔍 定位</button>
-                            ` : ''}
+                            ` : (item.success && (item.local_cleaned || item.uploaded) ? `
+                                <span style="font-size: 0.72rem; color: var(--text-muted); padding: 3px 8px; border-radius: 4px; background: var(--bg-tertiary); border: 1px solid var(--border-color);" title="自动采集作品已推送到服务器，本地文件已释放以节约存储空间">☁️ 已释放文件</span>
+                            ` : '')}
                             <button class="btn btn-danger btn-sm" onclick="XhsHistoryPage.deleteItem(${item._index}, '${title}')" style="padding: 3px 8px; font-size: 0.75rem;">删除</button>
                         </div>
                     </td>
