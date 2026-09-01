@@ -160,6 +160,7 @@ img,video{{width:100%;border-radius:8px;margin:8px 0;display:block;}}
 def upload_xhs_video_to_cos(video_path: Path, note_id: str, max_retries: int = 3, return_error: bool = False) -> str | None | tuple[str | None, str | None]:
     """把本地下载的小红书视频文件上传到腾讯云 COS，返回公网链接。
     - 上传路径前缀统一为 channels/ (如 channels/{note_id}.mp4)
+    - 强制使用小红书专属存储桶 chenshipin-hg-1305012248 与对应域名，完全隔离公众号/视频号
     - 失败自动重试 3 次，若使用 STS 临时凭证接口则在重试时强行刷新 token
     - 详细打印并输出 COS 失败原因
     - 若 return_error=True，返回 (cos_url, error_msg)；否则直接返回 cos_url (兼容旧调用)
@@ -177,6 +178,15 @@ def upload_xhs_video_to_cos(video_path: Path, note_id: str, max_retries: int = 3
     settings = get_settings()
     token_api_url = (settings.get("cos_token_api_url") or "").strip()
 
+    # 小红书专属存储桶配置（彻底与公众号/视频号隔离，不受全局 cos_bucket 覆盖影响）
+    target_bucket = str(settings.get("xhs_cos_bucket") or "chenshipin-hg-1305012248").strip()
+    target_region = str(settings.get("xhs_cos_region") or settings.get("cos_region") or "ap-guangzhou").strip()
+    target_domain = str(settings.get("xhs_cos_cds_domain") or f"https://{target_bucket}.cos.{target_region}.myqcloud.com/").strip()
+    target_prefix = str(settings.get("xhs_cos_prefix") or "channels/").strip()
+    if not target_prefix.endswith("/"):
+        target_prefix += "/"
+    target_prefix = target_prefix.lstrip("/")
+
     def _get_cos_cfg(force_refresh: bool = False) -> tuple[dict | None, str | None]:
         if token_api_url:
             try:
@@ -187,29 +197,20 @@ def upload_xhs_video_to_cos(video_path: Path, note_id: str, max_retries: int = 3
             except Exception as e:
                 return None, f"获取 STS 临时凭证失败: {e}"
 
-        # 回退使用静态凭证（优先使用小红书专属存储桶，未单独指定则回退默认）
         s_id = str(settings.get("cos_secret_id") if settings.get("cos_secret_id") is not None else "").strip()
         s_key = str(settings.get("cos_secret_key") if settings.get("cos_secret_key") is not None else "").strip()
-        region = str(settings.get("xhs_cos_region") or settings.get("cos_region") or "ap-guangzhou").strip()
-        bucket = str(settings.get("xhs_cos_bucket") or "chenshipin-hg-1305012248").strip()
-        cds_domain = str(settings.get("xhs_cos_cds_domain") or f"https://{bucket}.cos.{region}.myqcloud.com/").strip()
-        prefix = str(settings.get("xhs_cos_prefix") or "channels/").strip()
-        if s_id and s_key and region and bucket:
+        if s_id and s_key:
             return {
                 "secret_id": s_id,
                 "secret_key": s_key,
-                "region": region,
-                "bucket": bucket,
-                "prefix": prefix,
-                "cds_domain": cds_domain,
+                "region": target_region,
+                "bucket": target_bucket,
             }, None
 
         missing = []
         if not s_id: missing.append("cos_secret_id")
         if not s_key: missing.append("cos_secret_key")
-        if not region: missing.append("cos_region")
-        if not bucket: missing.append("cos_bucket")
-        return None, f"未配置腾讯云 COS 凭证（缺少 {', '.join(missing)} 且未配置 cos_token_api_url）"
+        return None, f"未配置腾讯云 COS 凭证密钥（缺少 {', '.join(missing)} 且未配置 cos_token_api_url）"
 
     # 获取初始凭证
     cos_cfg, cfg_err = _get_cos_cfg(force_refresh=False)
@@ -224,11 +225,7 @@ def upload_xhs_video_to_cos(video_path: Path, note_id: str, max_retries: int = 3
         print(f"[小红书 COS] 错误: {err}", flush=True)
         return (None, err) if return_error else None
 
-    prefix = str(settings.get("xhs_cos_prefix") or cos_cfg.get("prefix") or "channels/").strip()
-    if not prefix.endswith("/"):
-        prefix += "/"
-    prefix = prefix.lstrip("/")
-    key = f"{prefix}{note_id or int(time.time())}.mp4"
+    key = f"{target_prefix}{note_id or int(time.time())}.mp4"
 
     try:
         data = video_path.read_bytes()
@@ -247,7 +244,7 @@ def upload_xhs_video_to_cos(video_path: Path, note_id: str, max_retries: int = 3
                     cos_cfg = refreshed_cfg
 
             cos_config_kwargs = {
-                "Region": cos_cfg["region"],
+                "Region": target_region,
                 "SecretId": cos_cfg["secret_id"],
                 "SecretKey": cos_cfg["secret_key"],
             }
@@ -256,14 +253,9 @@ def upload_xhs_video_to_cos(video_path: Path, note_id: str, max_retries: int = 3
 
             config = CosConfig(**cos_config_kwargs)
             client = CosS3Client(config)
-            client.put_object(Bucket=cos_cfg["bucket"], Body=data, Key=key)
+            client.put_object(Bucket=target_bucket, Body=data, Key=key)
 
-            cds_domain = cos_cfg.get("cds_domain") or settings.get("cos_cds_domain") or ""
-            if cds_domain:
-                cos_url = f"{cds_domain.rstrip('/')}/{key.lstrip('/')}"
-            else:
-                cos_url = f"https://{cos_cfg['bucket']}.cos.{cos_cfg['region']}.myqcloud.com/{key.lstrip('/')}"
-
+            cos_url = f"{target_domain.rstrip('/')}/{key.lstrip('/')}"
             print(f"[小红书 COS] 视频上传成功 (尝试 {attempt}/{max_retries}): {cos_url}", flush=True)
             return (cos_url, None) if return_error else cos_url
         except Exception as e:
