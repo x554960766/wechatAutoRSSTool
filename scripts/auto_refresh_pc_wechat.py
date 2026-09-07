@@ -268,13 +268,16 @@ def _wait_batch_portal_completion(sync_start_time: float, timeout_seconds: float
         time.sleep(1.5)
         pool_acc = account_pool.acquire() or {}
         ready_cnt = 0
+        now_check = time.time()
         for acc in accounts_sub:
             fakeid = acc.get("fakeid")
             cred = AccountPool.get_biz_credential(pool_acc, fakeid) if pool_acc else {}
-            # 严格校验：1) 具备 key 2) getmsg_ready 3) 本次同步新捕获 (updated_at >= sync_start_time - 2.0)
-            if cred.get("getmsg_ready") and cred.get("key") and cred.get("updated_at", 0) >= (sync_start_time - 2.0):
-                ready_cnt += 1
-        logger.info("当前批量授权同步进度: [%d/%d] (本次新捕获凭证)", ready_cnt, target_count)
+            # 校验：1) 具备 key 2) getmsg_ready 3) 本次同步新捕获或处于 30 分钟内的新鲜窗口
+            if cred.get("getmsg_ready") and cred.get("key"):
+                updated_at = cred.get("updated_at", 0)
+                if updated_at >= (sync_start_time - 2.0) or (now_check - updated_at < 1800):
+                    ready_cnt += 1
+        logger.info("当前批量授权同步进度: [%d/%d] (有效就绪凭证)", ready_cnt, target_count)
         if target_count > 0 and ready_cnt >= target_count:
             all_ready = True
             break
@@ -320,6 +323,15 @@ def run_batch_portal_flow_macos(timeout_seconds: float = 45.0) -> bool:
         from mac.mac_ocr import ocr
         from mac.scale import CoordSpace
         from mac.mac_input import move_and_click, type_text_via_clipboard, human_sleep, press
+        # 确保凭证同步代理助手已在运行，否则无法拦截与流转凭据
+        try:
+            from backend.mitm_proxy import ProxyManager
+            mgr = ProxyManager.get_instance()
+            if not mgr.running:
+                logger.info("⚡️ 自动启动凭证同步代理助手...")
+                mgr.start()
+        except Exception as ex_proxy:
+            logger.warning("启动凭证同步代理助手异常: %s", ex_proxy)
 
         # ──【层级 1】：优先检查当前屏幕上是否已有打开的聚合页 Web 窗口 ──
         existing_web_wins = find_web_windows()

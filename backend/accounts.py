@@ -376,10 +376,10 @@ def sync_pc_wechat():
 
 @accounts_bp.route("/sync-batch-pc-wechat", methods=["POST"])
 def sync_batch_pc_wechat():
-    """全自动触发 UI 自动化一键为全部公众号建立主页授权会话"""
+    """全自动触发 UI 自动化一键为全部公众号建立主页授权会话（跨平台支持）"""
     try:
-        from scripts.auto_refresh_pc_wechat import run_batch_portal_flow_macos
-        success = run_batch_portal_flow_macos()
+        from scripts.auto_refresh_pc_wechat import trigger_pc_wechat_refresh
+        success = trigger_pc_wechat_refresh(force=True)
         return jsonify({"success": success})
     except Exception as e:
         return jsonify({"error": str(e)}), 500

@@ -375,13 +375,10 @@ def set_windows_proxy(enabled, host="127.0.0.1", port=5202):
         if enabled:
             winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
             winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, f"{host}:{port}")
-            # Clear ProxyOverride set by dev-sidecar or other tools that might
-            # bypass our proxy for target domains. We need channels.weixin.qq.com
-            # to go through our MITM proxy, so any override rules must be removed.
-            try:
-                winreg.DeleteValue(key, "ProxyOverride")
-            except FileNotFoundError:
-                pass  # No ProxyOverride set, that's fine
+            # Ensure local and intranet addresses bypass the proxy to prevent local loops
+            # with Flask (127.0.0.1:5200) and WebView2 / internal services.
+            override_val = "<local>;localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*"
+            winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ, override_val)
         else:
             winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
         winreg.CloseKey(key)
@@ -580,6 +577,18 @@ class ChannelsAddon:
                 )
                 return
 
+            if path == "/__wx_official_api/mp-batch-next":
+                self._forward_to_flask(
+                    flow, "http://127.0.0.1:5200/api/auth/mp-batch-next"
+                )
+                return
+
+            if path == "/__wx_official_api/mp-batch-status":
+                self._forward_to_flask(
+                    flow, "http://127.0.0.1:5200/api/auth/mp-batch-status"
+                )
+                return
+
             if path == "/__wx_official_api/log":
                 try:
                     payload = json.loads(flow.request.get_text())
@@ -685,7 +694,7 @@ class ChannelsAddon:
                     global _last_captured_cred_hash
                     if cred_hash != _last_captured_cred_hash:
                         _last_captured_cred_hash = cred_hash
-                        saved_acc = account_pool.add_or_update({
+                        cred_payload = {
                             "token": token,
                             "appmsg_token": token,
                             "key": key,
@@ -700,10 +709,16 @@ class ChannelsAddon:
                             "user_agent": user_agent,
                             "nickname": "动态微信凭证",
                             "save_time": time.time(),
-                        })
-                        if saved_acc:
-                            from backend.cred_redact import mask_secret
-                            print(f"[MITM Captured Credential] src={biz_source} uin={mask_secret(norm_uin, 4)} biz={biz[:10] if biz else ''} token={mask_secret(token, 6)} keylen={len(key or '')} ptlen={len(pass_ticket or '')}", flush=True)
+                        }
+                        def _bg_save_cred(payload):
+                            try:
+                                saved_acc = account_pool.add_or_update(payload)
+                                if saved_acc:
+                                    from backend.cred_redact import mask_secret
+                                    print(f"[MITM Captured Credential] src={payload['biz_source']} uin={mask_secret(payload['uin'], 4)} biz={(payload['biz'] or '')[:10]} token={mask_secret(payload['token'], 6)} keylen={len(payload['key'] or '')} ptlen={len(payload['pass_ticket'] or '')}", flush=True)
+                            except Exception as ex:
+                                print(f"[AccountPool Async Save Error] {ex}", flush=True)
+                        threading.Thread(target=_bg_save_cred, args=(cred_payload,), daemon=True).start()
             except Exception as cap_err:
                 print(f"[MITM Capture Error] {cap_err}")
 
@@ -782,7 +797,11 @@ class ChannelsAddon:
 
         # 3. Check for channels.weixin.qq.com / mp.weixin.qq.com HTML
         if host == "mp.weixin.qq.com" and "/mp/profile_ext" in flow.request.path:
-            if "text/html" not in content_type:
+            # 仅在显式批量流转模式 (URL 明确带 batch_mode=1) 且非真实异步 XHR 时才封装为流转 HUD 网页
+            # 避免被 f=json 参数误判为 XHR，确保顶级页面导航能够正常呈现流转 HUD 动画并执行注入脚本
+            is_explicit_batch = "batch_mode=1" in flow.request.url
+            is_xhr_header = flow.request.headers.get("x-requested-with", "").lower() == "xmlhttprequest"
+            if is_explicit_batch and not is_xhr_header and "text/html" not in content_type:
                 # 将 API 响应动态封装为包含可视 HUD 动画和自动流转脚本的完整流转网页
                 raw_text = flow.response.get_text(strict=False) or "{}"
                 flow.response.headers["content-type"] = "text/html; charset=utf-8"
@@ -942,6 +961,28 @@ class ChannelsAddon:
         elif host == "mp.weixin.qq.com":
             inject_script = f"<script>{get_injected_official_js()}</script>"
             print(f"[Proxy Injected Official JS] path={flow.request.path}", flush=True)
+
+            # 参考 wechatDownload：从文章 HTML (/s) 页面嗅探 biz、appmsg_token 与 nickname
+            try:
+                if "/s" in flow.request.path:
+                    m_biz = re.search(r'(?:var\s+biz\s*=\s*|window\.biz\s*=\s*|__biz=)"?([^"&\'\s]+)"?', html)
+                    m_token = re.search(r'(?:var\s+appmsg_token\s*=\s*|window\.appmsg_token\s*=\s*|appmsg_token=)"?([^"&\'\s]+)"?', html)
+                    m_nick = re.search(r'(?:var\s+nickname\s*=\s*|window\.nickname\s*=\s*)"([^"\r\n]+)"', html)
+                    sniffed_biz = m_biz.group(1) if m_biz else ""
+                    sniffed_token = m_token.group(1) if m_token else ""
+                    sniffed_nick = m_nick.group(1) if m_nick else ""
+                    if sniffed_biz:
+                        from backend.account_pool import account_pool
+                        account_pool.add_or_update({
+                            "biz": sniffed_biz,
+                            "appmsg_token": sniffed_token,
+                            "nickname": sniffed_nick or "动态微信凭证",
+                            "biz_name": sniffed_nick,
+                            "biz_source": "article",
+                            "save_time": time.time(),
+                        })
+            except Exception as ex_sniff:
+                print(f"[Proxy HTML Sniff Error] {ex_sniff}", flush=True)
         else:
             return
 
@@ -967,10 +1008,9 @@ class ChannelsAddon:
         flow.response.headers["cache-control"] = "no-store, no-cache, must-revalidate, max-age=0"
         flow.response.headers["pragma"] = "no-cache"
 
-        if host == "mp.weixin.qq.com":
-            for h in ("content-security-policy", "x-content-security-policy", "x-webkit-csp", "x-frame-options", "frame-options"):
-                if h in flow.response.headers:
-                    del flow.response.headers[h]
+        for h in ("content-security-policy", "x-content-security-policy", "x-webkit-csp", "x-frame-options", "frame-options"):
+            if h in flow.response.headers:
+                del flow.response.headers[h]
 
 
 # ── Synced Data Saving (同步数据持久化) ──────────────────────────
@@ -1607,7 +1647,7 @@ def get_injected_official_js():
             // 0. 批量授权管道流转 (支持 URL query batch_mode=1 或 profile_ext 页面自动流转)
             try {
                 const urlParams = new URLSearchParams(window.location.search);
-                const isBatchMode = urlParams.get('batch_mode') === '1' || sessionStorage.getItem('mp_batch_mode') === 'true' || window.location.pathname.includes('/mp/profile_ext');
+                const isBatchMode = urlParams.get('batch_mode') === '1' || sessionStorage.getItem('mp_batch_mode') === 'true';
                 let currentBiz = urlParams.get('__biz') || window.biz || '';
                 if (!currentBiz && document.documentElement) {
                     const m = document.documentElement.outerHTML.match(/(?:var\s+biz\s*=\s*|__biz=)"?([^"&'\s]+)"?/);
@@ -1615,15 +1655,29 @@ def get_injected_official_js():
                 }
 
                 if (isBatchMode && currentBiz && !window.location.pathname.includes('/s')) {
-                    fetch('http://127.0.0.1:5200/api/auth/mp-batch-next?current_biz=' + encodeURIComponent(currentBiz))
+                    // 若页面中无 HUD 元素（如原生公众号主页），动态注入顶部悬浮指示条
+                    let desc = document.getElementById('stream-desc');
+                    let title = document.getElementById('stream-title');
+                    if (!desc) {
+                        const hud = document.createElement('div');
+                        hud.id = 'stream-hud-floating';
+                        hud.style.cssText = 'position:fixed;top:16px;left:50%;transform:translateX(-50%);background:rgba(20,20,20,0.88);color:#fff;padding:10px 20px;border-radius:24px;z-index:999999;font-size:13px;box-shadow:0 8px 24px rgba(0,0,0,0.2);display:flex;align-items:center;gap:10px;font-family:-apple-system,sans-serif;backdrop-filter:blur(10px);pointer-events:none;';
+                        hud.innerHTML = '<span style="font-size:16px;display:inline-block;animation:stream-spin 2s linear infinite;">🔄</span><span id="stream-desc">正在自动同步凭证...</span><style>@keyframes stream-spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}</style>';
+                        if (document.body) {
+                            document.body.appendChild(hud);
+                        } else {
+                            document.addEventListener('DOMContentLoaded', () => document.body.appendChild(hud));
+                        }
+                        desc = document.getElementById('stream-desc');
+                    }
+
+                    fetch('/__wx_official_api/mp-batch-next?current_biz=' + encodeURIComponent(currentBiz))
                         .then(r => r.json())
                         .then(data => {
-                            const title = document.getElementById('stream-title');
-                            const desc = document.getElementById('stream-desc');
                             if (data && data.next_url) {
                                 remoteLog('✅ 凭证已捕获，即将流转至第 [' + (data.step + 1) + '/' + data.total + '] 个公众号【' + (data.next_name || '') + '】...');
                                 if (title) title.innerText = '✅ 凭证捕获成功';
-                                if (desc) desc.innerText = '正在流转至第 [' + (data.step + 1) + '/' + data.total + '] 个【' + (data.next_name || '') + '】...';
+                                if (desc) desc.innerText = '✅ 凭证已捕获，即将流转至第 [' + (data.step + 1) + '/' + data.total + '] 个【' + (data.next_name || '') + '】...';
                                 setTimeout(() => {
                                     window.location.href = data.next_url;
                                 }, 1800);
@@ -1631,13 +1685,12 @@ def get_injected_official_js():
                                 try { sessionStorage.removeItem('mp_batch_mode'); } catch(e) {}
                                 remoteLog('🎉 全部公众号凭证已完成捕获，正在返回聚合控制台');
                                 if (title) title.innerText = '🎉 全部授权完成！';
-                                if (desc) desc.innerText = '全部 ' + data.total + ' 个公众号主页凭据已全部就绪，正在返回控制台...';
+                                if (desc) desc.innerText = '🎉 全部 ' + data.total + ' 个公众号会话凭据已全部就绪，正在返回控制台...';
                                 setTimeout(() => {
                                     window.location.href = 'http://127.0.0.1:5200/api/auth/mp-batch-portal';
                                 }, 1200);
                             }
                         }).catch(err => {
-                            const desc = document.getElementById('stream-desc');
                             if (desc) desc.innerText = '流转请求异常: ' + err.message;
                         });
                 }

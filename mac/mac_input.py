@@ -4,6 +4,7 @@ from __future__ import annotations
 import random
 import time
 
+import Quartz
 import pyautogui
 import pyperclip
 
@@ -14,6 +15,19 @@ pyautogui.PAUSE = 0.05
 def human_sleep(a: float = 0.4, b: float = 0.8) -> None:
     """产生拟人随机微延迟。"""
     time.sleep(random.uniform(a, b))
+
+
+def quartz_click(x: int, y: int, button: str = "left") -> None:
+    """使用 macOS Quartz 原生 HID 事件模拟点击屏幕坐标点（单位：点）。"""
+    pt = Quartz.CGPoint(x, y)
+    btn_down = Quartz.kCGEventLeftMouseDown if button == "left" else Quartz.kCGEventRightMouseDown
+    btn_up = Quartz.kCGEventLeftMouseUp if button == "left" else Quartz.kCGEventRightMouseUp
+    mouse_btn = Quartz.kCGMouseButtonLeft if button == "left" else Quartz.kCGMouseButtonRight
+    down = Quartz.CGEventCreateMouseEvent(None, btn_down, pt, mouse_btn)
+    up = Quartz.CGEventCreateMouseEvent(None, btn_up, pt, mouse_btn)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+    time.sleep(0.08)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
 
 
 def move_and_click(
@@ -29,9 +43,11 @@ def move_and_click(
     pyautogui.moveTo(tx, ty, duration=random.uniform(0.12, 0.25), tween=pyautogui.easeOutQuad)
     time.sleep(random.uniform(0.05, 0.12))
     if double:
-        pyautogui.doubleClick(button=button)
+        quartz_click(tx, ty, button=button)
+        time.sleep(0.08)
+        quartz_click(tx, ty, button=button)
     else:
-        pyautogui.click(button=button)
+        quartz_click(tx, ty, button=button)
 
 
 def type_text_via_clipboard(text: str, clear_first: bool = True) -> None:
