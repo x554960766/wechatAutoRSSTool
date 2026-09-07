@@ -106,7 +106,7 @@ if sys.platform == 'darwin':
         'WebKit',
     ])
 
-# Windows WebView2 (winforms) 支持
+# Windows WebView2 (winforms) 支持与自动化模块
 if sys.platform == 'win32':
     hiddenimports.extend([
         'pythonnet',
@@ -114,6 +114,12 @@ if sys.platform == 'win32':
         'clr_loader',
         'webview.platforms.winforms',
         'webview.platforms.edgechromium',
+        'windows',
+        'windows.win_flow',
+        'windows.win_input',
+        'windows.win_window',
+        'scripts',
+        'scripts.auto_refresh_pc_wechat',
     ])
 
     # ── 关键修复：收集 pythonnet / clr_loader 的原生 .NET DLL ──
@@ -244,7 +250,7 @@ elif sys.platform == 'win32':
         a.zipfiles,
         a.datas,
         strip=False,
-        upx=True,
+        upx=False,
         upx_exclude=[],
         name='WeChat MP Tools',
     )

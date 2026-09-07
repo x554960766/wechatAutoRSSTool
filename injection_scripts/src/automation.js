@@ -22,7 +22,7 @@
   // ---- 可调参数（测风控时单变量扫描这几个）----
   var RATE_LIMIT_PER_MIN = 20; // 令牌桶：60s 窗口内最多 finder 调用次数
   var MAX_ITEMS_PER_AUTHOR = 30; // 单作者最多采集条数（≈2 页），0 或负数 = 不限
-  var SESSION_AUTHOR_CAP = 0; // 单次最多处理作者数，0 或负数 = 不限（采集全部关注）
+  var SESSION_AUTHOR_CAP = 12; // 单次最多处理作者数，超出下次轮替继续 (默认安全阈值 12，防止高频风控)
   var CIRCUIT_FAIL_THRESHOLD = 3; // 连续最终失败达到此数 → 熔断
   var PAGE_JITTER_MS = 1500; // 翻页间基准延迟
   var AUTHOR_JITTER_MS = 6000; // 作者间基准延迟

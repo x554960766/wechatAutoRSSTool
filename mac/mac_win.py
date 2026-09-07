@@ -57,6 +57,30 @@ def list_wechat_windows(min_size: int = 100) -> list[MacWindow]:
             w=int(width),
             h=int(height),
         ))
+    if not out:
+        # 降级查询所有有效微信窗口（避免多屏幕/Spaces 空间切换时因焦点不在前台而过滤掉有效窗口）
+        infos_all = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionAll,
+            Quartz.kCGNullWindowID,
+        )
+        for w in infos_all:
+            if w.get("kCGWindowOwnerName") not in WECHAT_OWNER_NAMES:
+                continue
+            b = w.get("kCGWindowBounds", {})
+            width = b.get("Width", 0)
+            height = b.get("Height", 0)
+            if width < min_size or height < min_size:
+                continue
+            if int(b.get("X", 0)) < -500 or int(b.get("Y", 0)) < -500:
+                continue
+            out.append(MacWindow(
+                window_id=w["kCGWindowNumber"],
+                title=w.get("kCGWindowName", "") or "",
+                x=int(b.get("X", 0)),
+                y=int(b.get("Y", 0)),
+                w=int(width),
+                h=int(height),
+            ))
     return out
 
 
@@ -102,14 +126,53 @@ def wait_new_web_window(before_ids: set[int], timeout: float = 12.0) -> MacWindo
     return None
 
 
+def find_portal_window() -> MacWindow | None:
+    """查找屏幕上已打开的公众号批量授权聚合页窗口 (Title='微信 (窗口)' 或含'聚合'/'授权' 或典型尺寸 806x638)。"""
+    wins = list_wechat_windows()
+    for w in wins:
+        title = w.title or ""
+        if any(k in title for k in ("(窗口)", "聚合", "授权", "batch-portal", "5200")):
+            return w
+    for w in wins:
+        if 750 <= w.w <= 850 and 550 <= w.h <= 700 and w.title not in ("微信", "WeChat"):
+            return w
+    return None
+
+
+
 # ---------------------------------------------------------------- 激活
 
+def raise_window(win: MacWindow) -> bool:
+    """利用 macOS Accessibility (AXUIElement) 将指定窗口置顶激活。"""
+    try:
+        from ApplicationServices import AXUIElementCreateApplication, AXUIElementCopyAttributeValue, AXUIElementPerformAction
+        ws = NSWorkspace.sharedWorkspace()
+        for app in ws.runningApplications():
+            if app.bundleIdentifier() == WECHAT_BUNDLE_ID:
+                app.activateWithOptions_(1 << 1)
+                pid = app.processIdentifier()
+                app_ref = AXUIElementCreateApplication(pid)
+                err, wins = AXUIElementCopyAttributeValue(app_ref, "AXWindows", None)
+                if not err and wins:
+                    for w in wins:
+                        err_title, title_val = AXUIElementCopyAttributeValue(w, "AXTitle", None)
+                        if title_val == win.title or ("(窗口)" in (title_val or "") and "(窗口)" in win.title):
+                            AXUIElementPerformAction(w, "AXRaise")
+                            return True
+                break
+    except Exception:
+        pass
+    return False
+
+
 def activate_wechat() -> None:
-    """把微信 App 置前；若未运行则拉起。"""
+    """把微信 App 置前；若未运行或窗口已关闭则唤起主界面。"""
     ws = NSWorkspace.sharedWorkspace()
     for app in ws.runningApplications():
         if app.bundleIdentifier() == WECHAT_BUNDLE_ID:
             app.activateWithOptions_(1 << 1)  # NSApplicationActivateIgnoringOtherApps
+            # 若所有窗口均已关闭，open -a WeChat 会恢复主窗口
+            subprocess.run(["open", "-a", "WeChat"], check=False)
             return
     subprocess.run(["open", "-a", "WeChat"], check=False)
 

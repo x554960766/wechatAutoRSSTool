@@ -881,7 +881,7 @@ class XhsClient:
         else:
             cover = ""
 
-        # 4. 提取 interact_info (liked)
+        # 4. 提取 interact_info (liked) 与 sticky (置顶标记)
         interact = (
             it.get("interact_info")
             or it.get("interactInfo")
@@ -891,12 +891,28 @@ class XhsClient:
         )
         if isinstance(interact, dict):
             liked_raw = interact.get("liked_count") or interact.get("likedCount") or it.get("liked", "0")
+            sticky = bool(interact.get("sticky") or interact.get("is_sticky") or interact.get("isSticky"))
         else:
             liked_raw = str(interact) if interact else "0"
+            sticky = bool(it.get("sticky") or note_card.get("sticky"))
+        if not sticky:
+            sticky = bool(it.get("sticky") or note_card.get("sticky"))
         liked = self.format_count(liked_raw)
 
         # 5. 提取 type
         note_type = "video" if (it.get("type") == "video" or note_card.get("type") == "video") else "normal"
+
+        # 6. 提取 timestamp 与 publish_time
+        t_raw = it.get("time") or note_card.get("time")
+        timestamp = 0
+        publish_time = ""
+        if t_raw:
+            try:
+                t_sec = float(t_raw) / 1000.0 if float(t_raw) > 1e11 else float(t_raw)
+                timestamp = int(t_sec)
+                publish_time = datetime.fromtimestamp(t_sec).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                pass
 
         return {
             "note_id": nid,
@@ -905,6 +921,9 @@ class XhsClient:
             "cover": cover,
             "type": note_type,
             "liked": liked,
+            "sticky": sticky,
+            "timestamp": timestamp,
+            "publish_time": publish_time,
         }
 
     def get_user_posted(self, user_id: str, xsec_token: str = "", cursor: str = "", xsec_source: str = "pc_feed") -> tuple:
@@ -1014,6 +1033,17 @@ class XhsClient:
                 pass
             interact = note_card.get("interactInfo", {})
             liked = self.format_count(interact.get("likedCount", "0")) if isinstance(interact, dict) else "0"
+            sticky = bool(interact.get("sticky")) if isinstance(interact, dict) else False
+            t_raw = item.get("time") or note_card.get("time")
+            timestamp = 0
+            publish_time = ""
+            if t_raw:
+                try:
+                    t_sec = float(t_raw) / 1000.0 if float(t_raw) > 1e11 else float(t_raw)
+                    timestamp = int(t_sec)
+                    publish_time = datetime.fromtimestamp(t_sec).strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    pass
             notes_list.append({
                 "note_id": item.get("id", "") or note_card.get("noteId", ""),
                 "xsec_token": item.get("xsecToken", ""),
@@ -1021,6 +1051,9 @@ class XhsClient:
                 "cover": cover,
                 "type": "video" if note_card.get("type") == "video" else "normal",
                 "liked": liked,
+                "sticky": sticky,
+                "timestamp": timestamp,
+                "publish_time": publish_time,
             })
         return notes_list
 
@@ -1291,16 +1324,21 @@ class _XhsBrowserSession:
                                         const nid = item.id || item.noteId || item.note_id || card.noteId || card.note_id || '';
                                         const title = card.displayTitle || card.display_title || '';
                                         const token = item.xsecToken || item.xsec_token || card.xsecToken || card.xsec_token || '';
+                                        const isSticky = !!(interact.sticky || interact.is_sticky || card.sticky || item.sticky);
+                                        const rawTime = card.time || item.time || 0;
                                         if (nid && !seen.has(nid)) {
                                             list.push({
                                                 note_id: nid,
                                                 xsec_token: token,
                                                 display_title: title,
                                                 cover: cover,
+                                                time: rawTime,
                                                 type: (card.type === 'video' || item.type === 'video') ? 'video' : 'normal',
                                                 interact_info: {
-                                                    liked_count: String(interact.likedCount || interact.liked_count || '0')
-                                                }
+                                                    liked_count: String(interact.likedCount || interact.liked_count || '0'),
+                                                    sticky: isSticky
+                                                },
+                                                sticky: isSticky
                                             });
                                             seen.add(nid);
                                         }
@@ -1335,6 +1373,7 @@ class _XhsBrowserSession:
                                         const likeEl = el.querySelector('.like-wrapper, .count, [class*="like"], [class*="count"]');
                                         const liked = likeEl ? (likeEl.textContent || '').trim() : '0';
                                         const isVideo = !!el.querySelector('.play-icon, [class*="play"], svg[class*="play"]');
+                                        const isSticky = !!el.querySelector('[class*="sticky"], [class*="top"], .note-item-top');
                                         list.push({
                                             note_id: nid,
                                             xsec_token: token,
@@ -1342,8 +1381,10 @@ class _XhsBrowserSession:
                                             cover: cover,
                                             type: isVideo ? 'video' : 'normal',
                                             interact_info: {
-                                                liked_count: liked
-                                            }
+                                                liked_count: liked,
+                                                sticky: isSticky
+                                            },
+                                            sticky: isSticky
                                         });
                                         seen.add(nid);
                                     }

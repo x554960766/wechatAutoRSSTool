@@ -3,6 +3,7 @@
 管理微信读书平台扫码登录、凭证验证和状态查询
 """
 
+import sys
 import json
 import time
 import threading
@@ -145,6 +146,80 @@ def check_credentials():
     return jsonify({"valid": True, "message": f"账号 (ID: {acc_id}) 凭证正常可用"})
 
 
+@auth_bp.route("/resolve-article-link", methods=["POST"])
+def resolve_article_link():
+    """参考 wechatDownload 机制：从任意微信公众号文章链接中解析提取公众号 ID (__biz) 与元数据，
+    并生成专属的官方主页授权链接与中转链接。
+    """
+    import urllib.parse
+    import re
+    data = request.get_json(silent=True) or {}
+    url = (data.get("url") or "").strip()
+    if not url:
+        return jsonify({"success": False, "error": "请提供有效的微信文章链接"}), 400
+
+    biz = ""
+    title = ""
+    nickname = ""
+    round_head_img = ""
+
+    parsed = urllib.parse.urlparse(url)
+    qs = urllib.parse.parse_qs(parsed.query)
+    if qs.get("__biz"):
+        biz = qs["__biz"][0]
+
+    # 若 URL query 无 __biz（如 /s/xxxx 短链），发起请求解析 HTML
+    if not biz or not nickname:
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 NetType/WIFI MicroMessenger/7.0.20.1781(0x17001429)",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            }
+            resp = req.get(url, headers=headers, timeout=10, allow_redirects=True)
+            if resp.status_code == 200:
+                html_text = resp.text
+                if not biz:
+                    m_biz = re.search(r'(?:var\s+biz\s*=\s*|window\.biz\s*=\s*|__biz=)"?([^"&\'\s]+)"?', html_text)
+                    if m_biz:
+                        biz = m_biz.group(1)
+
+                m_nick = re.search(r'(?:var\s+nickname\s*=\s*|window\.nickname\s*=\s*)"([^"\r\n]+)"', html_text)
+                if m_nick:
+                    nickname = m_nick.group(1)
+                else:
+                    m_dom_nick = re.search(r'<strong class="profile_nickname"[^>]*>([^<]+)</strong>', html_text)
+                    if m_dom_nick:
+                        nickname = m_dom_nick.group(1).strip()
+
+                m_title = re.search(r'<meta\s+property="og:title"\s+content="([^"]*)"', html_text)
+                if m_title:
+                    title = m_title.group(1).strip()
+
+                m_head = re.search(r'(?:var\s+round_head_img\s*=\s*|window\.round_head_img\s*=\s*)"([^"\r\n]+)"', html_text)
+                if m_head:
+                    round_head_img = m_head.group(1)
+        except Exception as ex:
+            print(f"[resolve_article_link] 网络请求解析文章异常: {ex}", flush=True)
+
+    if not biz:
+        return jsonify({"success": False, "error": "未能从该文章链接中提取到公众号 ID (__biz)"}), 400
+
+    host = request.host
+    profile_url = f"https://mp.weixin.qq.com/mp/profile_ext?action=home&__biz={urllib.parse.quote(biz)}#wechat_redirect"
+    relay_url = f"http://{host}/api/auth/mp-relay?biz={urllib.parse.quote(biz)}"
+
+    return jsonify({
+        "success": True,
+        "biz": biz,
+        "nickname": nickname or "未知公众号",
+        "title": title,
+        "round_head_img": round_head_img,
+        "profile_url": profile_url,
+        "relay_url": relay_url,
+        "message": f"成功提取公众号【{nickname or biz}】ID"
+    })
+
+
 @auth_bp.route("/mp-relay-url", methods=["GET"])
 def get_mp_relay_url():
     """获取 PC 微信免证书凭证中转链接（支持指定 biz）"""
@@ -281,19 +356,24 @@ def get_mp_batch_status():
     pool_acc = account_pool.acquire() or {}
     
     results = []
+    now = time.time()
     for acc in accounts_sub:
         fakeid = acc.get("fakeid", "")
         nickname = acc.get("nickname", "未命名公众号")
         cred = AccountPool.get_biz_credential(pool_acc, fakeid) if pool_acc else {}
         has_key = bool(cred.get("key"))
-        ready = bool(cred.get("getmsg_ready") and has_key)
+        updated_at = cred.get("updated_at", 0)
+        # 会话 key 有效期通常为 2 小时 (7200s)，超时视为需刷新
+        is_fresh = has_key and (now - updated_at < 7200)
+        ready = bool(is_fresh)
         results.append({
             "fakeid": fakeid,
             "nickname": nickname,
             "round_head_img": acc.get("round_head_img", ""),
             "has_key": has_key,
             "ready": ready,
-            "updated_at": cred.get("updated_at", 0),
+            "fresh": is_fresh,
+            "updated_at": updated_at,
         })
     return jsonify({"accounts": results})
 
@@ -325,8 +405,8 @@ def handle_mp_batch_next():
     if 0 <= next_idx < len(accounts_sub):
         next_acc = accounts_sub[next_idx]
         fakeid = next_acc.get("fakeid", "")
-        # 使用 action=getmsg 而非 action=home，彻底杜绝微信 Native 原生窗口拦截与关闭，留在 Webview 内部连续流转！
-        next_url = f"https://mp.weixin.qq.com/mp/profile_ext?action=getmsg&__biz={urllib.parse.quote(fakeid)}&f=json&offset=0&count=1&scene=126&batch_mode=1&_t={int(time.time()*1000)}"
+        # 使用 action=home 与 #wechat_redirect 触发微信原生附带 key/pass_ticket 并返回真实公众号主页 HTML
+        next_url = f"https://mp.weixin.qq.com/mp/profile_ext?action=home&__biz={urllib.parse.quote(fakeid)}&scene=124&batch_mode=1#wechat_redirect"
         return jsonify({
             "completed": False,
             "next_url": next_url,
@@ -341,6 +421,132 @@ def handle_mp_batch_next():
         })
 
 
+# ── Mac 后台全自动流水线同步调度 ──────────────────────────
+_batch_sync_lock = threading.Lock()
+_batch_sync_state = {
+    "running": False,
+    "current_step": 0,
+    "total": 0,
+    "current_name": "",
+    "success_count": 0,
+    "failed_count": 0,
+    "message": "",
+    "last_error": None,
+    "start_time": 0,
+    "completed": False,
+}
+
+@auth_bp.route("/start-mac-batch-sync", methods=["POST"])
+def start_mac_batch_sync():
+    """启动 Mac 后台全自动流水线（Fast-Path 优先，自动调度微信补齐未就绪凭据）"""
+    global _batch_sync_state
+    if _batch_sync_state.get("running"):
+        return jsonify({
+            "success": True,
+            "running": True,
+            "message": "后台全自动流水线正在执行中...",
+            "state": _batch_sync_state,
+        })
+
+    from backend.config import ACCOUNTS_FILE, load_json
+    from backend.mitm_proxy import ProxyManager
+    accounts_sub = load_json(ACCOUNTS_FILE, [])
+    if not accounts_sub:
+        return jsonify({"success": False, "error": "订阅列表中暂无公众号"}), 400
+
+    # 1. 启动前确保代理助手已处于运行状态
+    try:
+        mgr = ProxyManager.get_instance()
+        if not mgr.running:
+            mgr.start()
+    except Exception as ex_proxy:
+        print(f"[start_mac_batch_sync] 启动代理助手出现异常: {ex_proxy}", flush=True)
+
+    def _bg_worker():
+        global _batch_sync_state
+        with _batch_sync_lock:
+            _batch_sync_state.update({
+                "running": True,
+                "current_step": 0,
+                "total": len(accounts_sub),
+                "current_name": accounts_sub[0].get("nickname", "") if accounts_sub else "",
+                "success_count": 0,
+                "failed_count": 0,
+                "message": "正在初始化流水线...",
+                "last_error": None,
+                "start_time": time.time(),
+                "completed": False,
+            })
+            try:
+                if sys.platform == "darwin":
+                    from mac.batch_runner import WeChatBatchRunner
+                    runner = WeChatBatchRunner(articles_per_account=10, auto_cleanup=True)
+                    def _on_progress(idx, total, name, success, err):
+                        _batch_sync_state["current_step"] = idx
+                        _batch_sync_state["total"] = total
+                        _batch_sync_state["current_name"] = name
+                        if success:
+                            _batch_sync_state["success_count"] += 1
+                            _batch_sync_state["message"] = f"【{name}】同步就绪 ({idx}/{total})"
+                        else:
+                            _batch_sync_state["failed_count"] += 1
+                            _batch_sync_state["message"] = f"【{name}】等待手动补采: {err} ({idx}/{total})"
+                    
+                    runner.run_queue(accounts_sub, progress_callback=_on_progress)
+                else:
+                    # Windows / 非 macOS 平台：
+                    # 若账号池尚未捕获有效凭证或已超期，先尝试通过 Windows 原生自动化唤起微信刷新凭证
+                    from backend.account_pool import account_pool
+                    pool_acc = account_pool.acquire()
+                    now_ts = time.time()
+                    if not pool_acc or not pool_acc.get("key") or (now_ts - pool_acc.get("save_time", 0) > 7200):
+                        _batch_sync_state["message"] = "正在通过 Windows 微信自动化唤起凭证更新..."
+                        try:
+                            from scripts.auto_refresh_pc_wechat import trigger_pc_wechat_refresh
+                            trigger_pc_wechat_refresh(force=True)
+                        except Exception as refresh_err:
+                            print(f"[start_mac_batch_sync] Windows 自动刷新凭证提示: {refresh_err}", flush=True)
+
+                    from backend.articles import _fetch_articles_page
+                    total_cnt = len(accounts_sub)
+                    for idx, a in enumerate(accounts_sub, start=1):
+                        name = a.get("nickname", "")
+                        fid = a.get("fakeid", "")
+                        _batch_sync_state["current_step"] = idx
+                        _batch_sync_state["current_name"] = name
+                        try:
+                            _fetch_articles_page(fakeid=fid, begin=0, count=5, account_name=name)
+                            _batch_sync_state["success_count"] += 1
+                            _batch_sync_state["message"] = f"【{name}】同步就绪 ({idx}/{total_cnt})"
+                        except Exception as ex:
+                            _batch_sync_state["failed_count"] += 1
+                            _batch_sync_state["message"] = f"【{name}】等待手动补采: {ex} ({idx}/{total_cnt})"
+                
+                _batch_sync_state["message"] = f"🎉 全部 {len(accounts_sub)} 个公众号处理完毕！"
+                _batch_sync_state["completed"] = True
+            except Exception as e:
+                _batch_sync_state["last_error"] = str(e)
+                _batch_sync_state["message"] = f"流水线异常: {e}"
+            finally:
+                _batch_sync_state["running"] = False
+
+    t = threading.Thread(target=_bg_worker, daemon=True)
+    t.start()
+    return jsonify({
+        "success": True,
+        "running": True,
+        "message": "已成功拉起后台全自动静默流水线！",
+        "total": len(accounts_sub)
+    })
+
+
+@auth_bp.route("/mac-batch-sync-status", methods=["GET"])
+def get_mac_batch_sync_status():
+    """获取 Mac 后台全自动流水线的实时执行进度"""
+    global _batch_sync_state
+    return jsonify(_batch_sync_state)
+
+
 @auth_bp.route("/mp-batch-portal", methods=["GET"])
 def handle_mp_batch_portal():
     """公众号主页批量授权中转聚合中心 (参考 wechatDownload 官方主页授权体系)
@@ -351,10 +557,12 @@ def handle_mp_batch_portal():
     """
     from backend.config import ACCOUNTS_FILE, load_json
     from backend.account_pool import AccountPool
+    from backend.mitm_proxy import ProxyManager
     import json, urllib.parse
     accounts_sub = load_json(ACCOUNTS_FILE, [])
     pool_acc = account_pool.acquire() or {}
     total = len(accounts_sub)
+    proxy_running = bool(ProxyManager.get_instance().running)
 
     accounts_data = []
     ready_count = 0
@@ -365,9 +573,9 @@ def handle_mp_batch_portal():
         cred = AccountPool.get_biz_credential(pool_acc, fakeid) if pool_acc else {}
         has_key = bool(cred.get("key"))
         updated_at = cred.get("updated_at", 0)
-        # 凭证新鲜度判断（5分钟内为新鲜，超过仍有效但提示）
-        is_fresh = has_key and (now - updated_at < 3600)
-        is_ready = has_key
+        # 凭证新鲜度判断（2小时内为新鲜有效，超时视为需刷新）
+        is_fresh = has_key and (now - updated_at < 7200)
+        is_ready = is_fresh
         if is_ready:
             ready_count += 1
 
@@ -594,6 +802,26 @@ def handle_mp_batch_portal():
         }}
         .tag-ready {{ background: rgba(7, 193, 96, 0.15); color: var(--primary); }}
         .tag-pending {{ background: rgba(255, 152, 0, 0.15); color: #e65100; }}
+        .proxy-bar {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 9px 13px;
+            border-radius: 12px;
+            margin-bottom: 14px;
+            font-size: 0.8rem;
+            font-weight: 500;
+        }}
+        .proxy-bar-active {{
+            background: rgba(7, 193, 96, 0.08);
+            border: 1px solid rgba(7, 193, 96, 0.3);
+            color: #07c160;
+        }}
+        .proxy-bar-inactive {{
+            background: rgba(255, 152, 0, 0.08);
+            border: 1px solid rgba(255, 152, 0, 0.3);
+            color: #e65100;
+        }}
         .toast {{
             position: fixed;
             bottom: 24px;
@@ -619,6 +847,15 @@ def handle_mp_batch_portal():
                 <p>{'所有公众号主页凭证均已就绪，已可开始导出文章！' if ready_count == total and total > 0 else '在微信内置浏览器中逐个打开主页建立安全会话，支持低风控流转'}</p>
             </div>
 
+            <!-- 凭证同步代理助手状态条 -->
+            <div class="proxy-bar {'proxy-bar-active' if proxy_running else 'proxy-bar-inactive'}" id="proxy-status-bar">
+                <div style="display:flex;align-items:center;gap:6px;">
+                    <span>{'🟢' if proxy_running else '🟠'}</span>
+                    <span id="proxy-status-text">{'同步代理助手：运行中（端口 5202，截获就绪）' if proxy_running else '同步代理助手：未运行（流转前需启动）'}</span>
+                </div>
+                {'<button class="btn btn-outline" style="padding:4px 10px;font-size:0.75rem;" onclick="toggleProxyService()">⚡️ 启动助手</button>' if not proxy_running else ''}
+            </div>
+
             <!-- 风控与安全流转说明 -->
             <div class="risk-banner">
                 🛡️ <strong>低风控安全建议：</strong><br>
@@ -635,7 +872,7 @@ def handle_mp_batch_portal():
                 <span id="progress-stat-pct">{progress_pct}%</span>
             </div>
 
-            <button class="btn" style="width: 100%; margin-bottom: 10px; background: var(--primary); font-size: 0.92rem; padding: 12px;" onclick="startAutoBatch()">🚀 一键开始全自动流转授权</button>
+            <button id="btn-auto-batch" class="btn" style="width: 100%; margin-bottom: 10px; background: var(--primary); font-size: 0.92rem; padding: 12px;" onclick="startAutoBatch()">🚀 一键开始全自动流转授权</button>
 
             <div class="btn-grid">
                 <button class="btn btn-warning" onclick="copyPendingLinks()">🎯 仅复制待授权链接 ({total - ready_count}个)</button>
@@ -658,7 +895,7 @@ def handle_mp_batch_portal():
 
             <div class="account-list" id="account-list-container">
                 {''.join([
-                    f'''<a class="account-item {'ready' if acc['ready'] else 'pending'}" href="{acc['profile_url']}" target="_self" data-fakeid="{acc['fakeid']}" data-ready="{'1' if acc['ready'] else '0'}">
+                    f'''<a class="account-item {'ready' if acc['ready'] else 'pending'}" href="{acc['profile_url']}" target="_blank" data-fakeid="{acc['fakeid']}" data-ready="{'1' if acc['ready'] else '0'}">
                         <img class="avatar" src="{acc['round_head_img'] or 'data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📰</text></svg>'}" />
                         <div class="account-info">
                             <div class="account-name">{acc['nickname']}</div>
@@ -687,19 +924,110 @@ def handle_mp_batch_portal():
             setTimeout(() => {{ t.style.display = 'none'; }}, 2200);
         }}
 
-        function startAutoBatch() {{
-            if (!accounts || accounts.length === 0) {{
-                showToast('暂无公众号可授权！');
+        async function toggleProxyService() {{
+            showToast('正在启动同步代理助手...');
+            try {{
+                const resp = await fetch('/api/channels/proxy/start', {{ method: 'POST' }});
+                const res = await resp.json();
+                if (resp.ok) {{
+                    showToast('同步助手已启动！');
+                    setTimeout(() => {{ window.location.reload(); }}, 600);
+                }} else {{
+                    showToast('启动失败: ' + (res.error || '端口被占用'));
+                }}
+            }} catch(e) {{
+                showToast('请求异常: ' + e.message);
+            }}
+        }}
+
+        let autoFlowRunning = false;
+        let autoFlowIndex = 0;
+        let autoFlowPending = [];
+
+        async function startAutoBatch() {{
+            if (autoFlowRunning) {{
+                showToast('自动流转已在进行中...');
                 return;
             }}
-            const pendingAcc = accounts.find(a => !a.ready) || accounts[0];
-            try {{ sessionStorage.setItem('mp_batch_mode', 'true'); }} catch(e) {{}}
-            showToast('正在启动自动连续流转授权...');
-            setTimeout(() => {{
-                // 使用 action=getmsg 保证留在 Webview 窗口内连续流转，绝不触发微信 Native 原生窗口拦截与关闭
-                const startUrl = 'https://mp.weixin.qq.com/mp/profile_ext?action=getmsg&__biz=' + encodeURIComponent(pendingAcc.fakeid) + '&f=json&offset=0&count=1&scene=126&batch_mode=1&_t=' + Date.now();
-                window.location.href = startUrl;
-            }}, 400);
+
+            const btn = document.getElementById('btn-auto-batch');
+            btn.style.background = '#ff9800';
+            btn.innerText = '🚀 正在启动全自动流转流水线...';
+            btn.disabled = true;
+
+            showToast('🚀 正在拉起全自动 OCR 授权流水线...');
+            autoFlowRunning = true;
+
+            try {{
+                const resp = await fetch('/api/auth/start-mac-batch-sync', {{ method: 'POST' }});
+                const res = await resp.json();
+                if (!res.success) {{
+                    showToast('启动流水线失败: ' + (res.error || '未知错误'));
+                    btn.disabled = false;
+                    btn.style.background = 'var(--primary)';
+                    btn.innerText = '🚀 一键开始全自动流转授权';
+                    autoFlowRunning = false;
+                    return;
+                }}
+            }} catch(e) {{
+                showToast('请求异常: ' + e.message);
+            }}
+
+            // 轮询监控后台 OCR 进度并实时同步卡片高亮状态
+            const pollTimer = setInterval(async () => {{
+                try {{
+                    const r = await fetch('/api/auth/mac-batch-sync-status');
+                    const st = await r.json();
+                    await refreshStatus(false);
+
+                    if (st.running) {{
+                        const cur = st.current_step || 1;
+                        const tot = st.total || accounts.length;
+                        btn.innerText = '⏳ [' + cur + '/' + tot + '] 正在同步: 【' + (st.current_name || '...') + '】';
+                    }} else if (st.completed) {{
+                        clearInterval(pollTimer);
+                        autoFlowRunning = false;
+                        btn.style.background = 'var(--primary)';
+                        btn.disabled = false;
+                        btn.innerText = '🎉 全部公众号流转就绪！(点击可重新执行)';
+                        btn.onclick = startAutoBatch;
+                        await refreshStatus(true);
+                        showToast('🎉 全部公众号授权流转完毕！');
+                    }} else if (st.last_error) {{
+                        clearInterval(pollTimer);
+                        autoFlowRunning = false;
+                        btn.style.background = 'var(--primary)';
+                        btn.disabled = false;
+                        btn.innerText = '🚀 一键开始全自动流转授权';
+                        btn.onclick = startAutoBatch;
+                        showToast('流水线提示: ' + st.last_error);
+                    }}
+                }} catch(err) {{}}
+            }}, 1200);
+        }}
+
+        function advanceToNext() {{
+            if (!autoFlowRunning) return;
+            const acc = autoFlowPending[autoFlowIndex];
+            if (acc) {{
+                openAccountInNewTab(acc.fakeid, acc.profile_url);
+            }}
+            autoFlowIndex++;
+            triggerNextInFlow();
+        }}
+
+        function openAccountInNewTab(fakeid, profileUrl) {{
+            // 确保使用 target="_blank" 绝不破坏/关闭当前聚合页！
+            const el = document.querySelector('[data-fakeid="' + fakeid + '"]');
+            if (el) {{
+                try {{
+                    el.click();
+                    return;
+                }} catch(e) {{}}
+            }}
+            try {{
+                window.open(profileUrl, '_blank');
+            }} catch(e) {{}}
         }}
 
         function filterList(type) {{
@@ -755,7 +1083,7 @@ def handle_mp_batch_portal():
             showToast(successMsg);
         }}
 
-        async function refreshStatus() {{
+        async function refreshStatus(showToastMsg = true) {{
             try {{
                 const resp = await fetch('/api/auth/mp-batch-status');
                 const data = await resp.json();
@@ -764,7 +1092,7 @@ def handle_mp_batch_portal():
                     const total = data.accounts.length;
                     data.accounts.forEach(acc => {{
                         const el = document.querySelector('[data-fakeid="' + acc.fakeid + '"]');
-                        const isReady = !!(acc.ready || acc.has_key);
+                        const isReady = !!(acc.ready !== undefined ? acc.ready : acc.fresh);
                         if (isReady) readyCnt++;
                         if (el) {{
                             el.setAttribute('data-ready', isReady ? '1' : '0');
@@ -791,10 +1119,14 @@ def handle_mp_batch_portal():
                     document.getElementById('f-ready').innerText = '已就绪 (' + readyCnt + ')';
 
                     filterList(curFilter);
-                    showToast('状态已同步: ' + readyCnt + '/' + total + ' 已就绪');
+                    if (showToastMsg) {{
+                        showToast('状态已同步: ' + readyCnt + '/' + total + ' 已就绪');
+                    }}
                 }}
             }} catch(e) {{
-                showToast('刷新状态失败: ' + e.message);
+                if (showToastMsg) {{
+                    showToast('刷新状态失败: ' + e.message);
+                }}
             }}
         }}
 

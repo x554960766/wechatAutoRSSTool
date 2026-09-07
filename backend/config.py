@@ -14,7 +14,7 @@ from pathlib import Path
 from backend.runtime import app_dir
 
 # ── 版本号 ────────────────────────────────────────────────
-APP_VERSION = "1.8.5"
+APP_VERSION = "1.8.6"
 
 # ── 路径配置 ──────────────────────────────────────────────
 if getattr(sys, 'frozen', False):
@@ -66,7 +66,7 @@ DEFAULT_SETTINGS = {
     "channels_harvest_window_start_hour": 8,
     "channels_harvest_window_end_hour": 24,
     "channels_harvest_max_per_author": 30,  # 单作者单次采集上限，0 = 不限
-    "channels_harvest_session_cap": 0,  # 单次采集作者数上限，0 = 采集全部关注作者
+    "channels_harvest_session_cap": 12,  # 单次采集作者数上限，默认 12（分批轮替防风控），0 = 不限
     # 腾讯云 COS 配置（支持向接口动态获取 STS 临时凭证，或填写静态 COS 凭证）
     "cos_token_api_url": "",
     "cos_secret_id": "",

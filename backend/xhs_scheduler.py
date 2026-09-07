@@ -376,19 +376,47 @@ class XhsAutoCollector:
                     raise ValueError(f"无法获取有效笔记列表（{warning}）")
                 logger.info("小红书博主 [%s] 暂无笔记", nickname)
 
-            # 2. 读取下载历史与本地磁盘，获取全量已采集作品 ID（绝对不重复采集已下载过的作品）
+            # 2. 读取下载历史与本地磁盘，获取全量已采集作品 ID
             downloaded_ids = self._get_collected_note_ids()
+            last_note_time = self._safe_float(account.get("last_note_time"), 0)
 
-            # 筛选仅未采集的新作品
+            # 3. 智能增量筛选与时间线容错截断机制：
+            # 解决单点假命中导致的漏采截断问题（例如中间某篇笔记此前被单条下载过或漏采，导致后面的新笔记被一刀切截断）。
+            # 策略：
+            # 1) 置顶笔记 (is_sticky)：已下载则跳过，不计入连续已采计数器；
+            # 2) 连续命中阈值 (CONSECUTIVE_BREAK_COUNT = 3)：
+            #    当在时间线中【连续遇到 3 篇】非置顶的已下载作品时，确认真正接轨历史老数据基线，才执行 break 终止扫描。
+            #    若中间有单篇由于之前漏采/失败的笔记，可被继续检索并加回 pending_notes，不遗漏数据；
+            # 3) 若作品自带有效 timestamp 且比上次采集到的最新作品还新 (note_ts > last_note_time)，确认为新增作品，安全收录。
             pending_notes = []
+            consecutive_seen = 0
+            max_new_ts = last_note_time
+            CONSECUTIVE_BREAK_COUNT = 3
+
             for note in notes_list:
                 nid = str(note.get("note_id", "")).strip()
                 if not nid:
                     continue
+
+                is_sticky = bool(note.get("sticky"))
+                note_ts = self._safe_float(note.get("timestamp"), 0)
+
                 if nid in downloaded_ids:
                     skipped_count += 1
+                    if not is_sticky:
+                        consecutive_seen += 1
+                        # 连续命中 3 篇已采集的非置顶作品，确认已深达稳定历史区间，安全终止
+                        if consecutive_seen >= CONSECUTIVE_BREAK_COUNT:
+                            logger.info(
+                                "小红书博主 [%s] 连续遇到 %d 篇已采集作品，确认接轨历史时间线，安全截断",
+                                nickname, consecutive_seen
+                            )
+                            break
                 else:
+                    consecutive_seen = 0
                     pending_notes.append(note)
+                    if not is_sticky and note_ts > max_new_ts:
+                        max_new_ts = note_ts
 
             # 限制单次采集数量，避免突发大批量触发风控
             if max_per_account > 0:
@@ -641,6 +669,8 @@ class XhsAutoCollector:
                     acc["last_collect_time"] = now
                     acc["last_collect_count"] = new_downloaded
                     acc["last_collect_error"] = last_error
+                    if max_new_ts > self._safe_float(acc.get("last_note_time"), 0):
+                        acc["last_note_time"] = max_new_ts
                     self._schedule_next_fetch(acc, now)
                     break
             save_json(XHS_ACCOUNTS_FILE, accounts)
