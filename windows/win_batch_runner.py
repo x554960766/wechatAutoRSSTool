@@ -247,12 +247,21 @@ class WinBatchRunner:
                         wi.post_click(main.hwnd, cx, cy)
                         wi.human_sleep(0.8, 1.2)
                     else:
-                        # 降级方案：按下方向键选择搜索浮层首项功能，并回车
-                        logger.info("👉 未直接定位到 UIA 控件，使用方向键选择搜索浮层首项并确认...")
-                        wi.post_down(main.hwnd)
+                        # 降级多重保障：真实系统级方向下键 + 回车确认，同时辅以几何物理坐标点击
+                        logger.info("👉 UIA 未直接捕获独立浮层条目，使用系统级按键选择搜索首项功能...")
+                        wi.send_single_key(wi.VK_DOWN)
                         wi.human_sleep(0.2, 0.3)
-                        wi.post_return(main.hwnd)
-                        wi.human_sleep(0.8, 1.2)
+                        wi.send_single_key(wi.VK_RETURN)
+                        wi.human_sleep(0.6, 0.8)
+
+                        # 若仍未进入，直接点击搜索框正下方第一项功能条目物理区域 (通常在 left+120, top+75)
+                        if not _is_in_filehelper(main.hwnd):
+                            l, t, r, b = main.rect
+                            fallback_cand_x = l + 120
+                            fallback_cand_y = t + 75
+                            logger.info("👉 尝试直接点击搜索下拉浮层首项坐标 (%d, %d)...", fallback_cand_x, fallback_cand_y)
+                            wi.post_click(main.hwnd, fallback_cand_x, fallback_cand_y)
+                            wi.human_sleep(0.8, 1.2)
 
                 # 4. 验证是否成功显示「文件传输助手」聊天页面
                 if _is_in_filehelper(main.hwnd):
@@ -260,9 +269,9 @@ class WinBatchRunner:
                     return True
                 else:
                     logger.warning("⚠️ 安全校验未通过：当前窗口非「文件传输助手」，按 Escape 退出以防误操作...")
-                    wi.post_escape(main.hwnd)
-                    time.sleep(0.1)
-                    wi.post_escape(main.hwnd)
+                    wi.send_single_key(wi.VK_ESCAPE)
+                    time.sleep(0.15)
+                    wi.send_single_key(wi.VK_ESCAPE)
                     wi.human_sleep(0.4, 0.6)
 
             return _is_in_filehelper(main.hwnd)

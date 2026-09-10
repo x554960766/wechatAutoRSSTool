@@ -24,23 +24,24 @@ def main():
     parser.add_argument("--proxy-worker", action="store_true", help="Flag for frozen executable")
     parser.add_argument("--port", type=int, default=5202, help="Proxy port")
     parser.add_argument("--confdir", type=str, default="", help="Mitmproxy confdir")
+    parser.add_argument("--upstream", type=str, default="", help="Upstream VPN proxy (e.g. http://127.0.0.1:7897)")
     args, _ = parser.parse_known_args()
 
     confdir = args.confdir or str(prepare_mitm_confdir())
 
     async def _serve():
-        opts = options.Options(
-            listen_host="127.0.0.1",
-            listen_port=args.port,
-            confdir=confdir,
-            ssl_insecure=True,
-            allow_hosts=[
-                r"channels\.weixin\.qq\.com",
-                r"mp\.weixin\.qq\.com",
-                r"res\.wx\.qq\.com",
-                r"open\.weixin\.qq\.com",
-            ],
-        )
+        opts_kwargs = {
+            "listen_host": "127.0.0.1",
+            "listen_port": args.port,
+            "confdir": confdir,
+            "ssl_insecure": True,
+        }
+        if args.upstream:
+            opts_kwargs["mode"] = [f"upstream:{args.upstream}"]
+        else:
+            opts_kwargs["mode"] = [f"regular@{args.port}"]
+
+        opts = options.Options(**opts_kwargs)
         master = DumpMaster(opts, with_termlog=False, with_dumper=False)
         for a in list(master.addons.chain):
             if type(a).__name__ == "ErrorCheck":
