@@ -22,28 +22,19 @@ def close_native_account_windows() -> int:
     try:
         script = '''
 tell application "System Events"
-    set pName to ""
-    if exists (process "微信") then
-        set pName to "微信"
-    else if exists (process "WeChat") then
-        set pName to "WeChat"
-    end if
-    if pName is not "" then
-        tell process pName
-            set wList to (every window whose name is "公众号")
-            set c to count of wList
-            repeat with w in wList
-                try
-                    tell w to click (first button whose subrole is "AXCloseButton")
-                on error
-                    tell w to perform action "AXRaise"
-                    keystroke "w" using command down
-                end try
-            end repeat
-            return c
-        end tell
-    end if
-    return 0
+    tell process "WeChat"
+        set wList to every window whose name is "公众号"
+        set c to count of wList
+        repeat with w in wList
+            try
+                tell w to click (first button whose subrole is "AXCloseButton")
+            on error
+                tell w to perform action "AXRaise"
+                keystroke "w" using command down
+            end try
+        end repeat
+        return c
+    end tell
 end tell
 '''
         r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=5.0)

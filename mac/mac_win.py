@@ -86,17 +86,19 @@ def list_wechat_windows(min_size: int = 100) -> list[MacWindow]:
 
 def find_main_window(timeout: float = 1.0) -> MacWindow | None:
     """
+    定位微信主窗口。
     主窗口判定：
-    1. 标题为「微信」或「WeChat」；
-    2. 微信 4.x 个别场景主窗口标题为空，退化为取「宽度在 700~1800 之间且高度>=500」的最大窗口。
+    1. 标题为「微信」或「WeChat」且尺寸为真实主窗口（宽度 >= 600 且高度 >= 450），
+       必须排除标题同为'微信'但尺寸较小的独立微窗（如 280x380 的登录提示、浮动小卡片等）；
+    2. 微信 4.x 个别场景主窗口标题为空，退化为取「宽度在 600~2000 之间且高度>=450」的最大窗口。
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
         wins = list_wechat_windows()
-        for w in wins:
-            if w.title in ("微信", "WeChat"):
-                return w
-        cands = [w for w in wins if 700 <= w.w <= 1800 and w.h >= 500]
+        titled_cands = [w for w in wins if w.title in ("微信", "WeChat") and w.w >= 600 and w.h >= 450]
+        if titled_cands:
+            return max(titled_cands, key=lambda w: w.w * w.h)
+        cands = [w for w in wins if 600 <= w.w <= 2000 and w.h >= 450]
         if cands:
             return max(cands, key=lambda w: w.w * w.h)
         time.sleep(0.2)
@@ -126,16 +128,67 @@ def wait_new_web_window(before_ids: set[int], timeout: float = 12.0) -> MacWindo
     return None
 
 
-def find_portal_window() -> MacWindow | None:
-    """查找屏幕上已打开的公众号批量授权聚合页窗口 (Title='微信 (窗口)' 或含'聚合'/'授权' 或典型尺寸 806x638)。"""
+def find_portal_window(verify_content: bool = True) -> MacWindow | None:
+    """查找屏幕上已打开的公众号批量授权聚合页窗口（兼容微信 4.x 内嵌分栏与 3.x 独立弹窗）。"""
+    portal_keywords = (
+        "公众号批量授权", "批量授权", "授权聚合中心", "mp-batch-portal",
+        "5200", "5202", "授权清单", "一键开始全自动流转授权",
+        "全部公众号授权就绪", "低风控安全建议", "同步代理助手", "仅复制待授权链接"
+    )
+
+    # 1. 优先检测微信 4.x 主窗口内嵌的第三栏 Webview 分栏（常见于 4.1.x+）
+    main_win = find_main_window(timeout=0.3)
+    if main_win and main_win.w >= 850:
+        try:
+            from mac.mac_ocr import ocr
+            img_main = capture_window(main_win)
+            if img_main is not None:
+                boxes = ocr(img_main)
+                # 检查右侧分栏区域（通常在 x >= main_win.w * 0.5）
+                right_boxes = [b for b in boxes if b.left >= int(main_win.w * 0.5)]
+                if any(any(k in b.text for k in portal_keywords) for b in right_boxes):
+                    return MacWindow(
+                        window_id=main_win.window_id,
+                        title="公众号批量授权聚合中心(内嵌)",
+                        x=main_win.x,
+                        y=main_win.y,
+                        w=main_win.w,
+                        h=main_win.h,
+                    )
+        except Exception:
+            pass
+
+    # 2. 检测独立 Web 窗口（兼容微信 3.x 或用户独立弹窗模式）
     wins = list_wechat_windows()
+    candidates = []
     for w in wins:
         title = w.title or ""
-        if any(k in title for k in ("(窗口)", "聚合", "授权", "batch-portal", "5200")):
+        # 排除明确不是聚合页的窗口
+        if title in ("微信", "WeChat", "公众号"):
+            continue
+        if any(k in title for k in ("聚合", "批量授权", "batch-portal", "5200")):
+            candidates.append(w)
+        elif "(窗口)" in title or (w.w >= 500 and w.h >= 400 and title not in ("微信", "WeChat", "公众号")):
+            candidates.append(w)
+
+    for w in candidates:
+        if not verify_content:
             return w
-    for w in wins:
-        if 750 <= w.w <= 850 and 550 <= w.h <= 700 and w.title not in ("微信", "WeChat"):
-            return w
+        try:
+            img = capture_window(w)
+            from mac.mac_ocr import ocr
+            boxes = ocr(img)
+            # 严格排除视频号相关窗口（避免误把视频号窗口识别为聚合页）
+            if any(any(v in b.text for v in ("视频号", "赞和收藏", "下载", "直播", "动态", "私信")) for b in boxes[:8]):
+                continue
+            # 严格排除公众号名片与普通文章页面
+            if any(any(v in b.text for v in ("全部 贴图 文章", "原创内容", "个朋友关注", "发消息", "关注公众号")) for b in boxes[:8]):
+                continue
+            if any(any(k in b.text for k in portal_keywords) for b in boxes):
+                return w
+        except Exception as e:
+            import logging
+            logging.getLogger("mac_win").warning("find_portal_window verify error: %s", e)
     return None
 
 
@@ -143,7 +196,8 @@ def find_portal_window() -> MacWindow | None:
 # ---------------------------------------------------------------- 激活
 
 def raise_window(win: MacWindow) -> bool:
-    """利用 macOS Accessibility (AXUIElement) 将指定窗口置顶激活。"""
+    """利用 macOS Accessibility (AXUIElement) 将指定窗口置顶激活（支持标题与坐标容差匹配）。"""
+    activate_wechat()
     try:
         from ApplicationServices import AXUIElementCreateApplication, AXUIElementCopyAttributeValue, AXUIElementPerformAction
         ws = NSWorkspace.sharedWorkspace()
@@ -156,7 +210,23 @@ def raise_window(win: MacWindow) -> bool:
                 if not err and wins:
                     for w in wins:
                         err_title, title_val = AXUIElementCopyAttributeValue(w, "AXTitle", None)
-                        if title_val == win.title or ("(窗口)" in (title_val or "") and "(窗口)" in win.title):
+                        err_pos, pos_val = AXUIElementCopyAttributeValue(w, "AXPosition", None)
+                        err_sz, sz_val = AXUIElementCopyAttributeValue(w, "AXSize", None)
+                        match = False
+                        if title_val and win.title and (title_val == win.title or ("(窗口)" in title_val and "(窗口)" in win.title)):
+                            match = True
+                        if "(内嵌)" in win.title and title_val in ("微信", "WeChat"):
+                            match = True
+                        if not match and pos_val and sz_val:
+                            try:
+                                ok1, pt = Quartz.AXValueGetValue(pos_val, Quartz.kAXValueCGPointType, None)
+                                ok2, sz = Quartz.AXValueGetValue(sz_val, Quartz.kAXValueCGSizeType, None)
+                                if ok1 and ok2:
+                                    if abs(pt.x - win.x) <= 8 and abs(pt.y - win.y) <= 8 and abs(sz.width - win.w) <= 15:
+                                        match = True
+                            except Exception:
+                                pass
+                        if match:
                             AXUIElementPerformAction(w, "AXRaise")
                             return True
                 break

@@ -35,6 +35,8 @@ VK_F5 = 0x74
 VK_RETURN = 0x0D
 VK_ESCAPE = 0x1B
 VK_CONTROL = 0x11
+VK_UP = 0x26
+VK_DOWN = 0x28
 VK_KEY_W = 0x57
 VK_KEY_F = 0x46
 VK_KEY_V = 0x56
@@ -148,6 +150,14 @@ def post_refresh(hwnd: int) -> bool:
 
 def post_escape(hwnd: int) -> bool:
     return post_key(hwnd, VK_ESCAPE)
+
+
+def post_down(hwnd: int) -> bool:
+    return post_key(hwnd, VK_DOWN)
+
+
+def post_return(hwnd: int) -> bool:
+    return post_key(hwnd, VK_RETURN)
 
 
 # ── 剪贴板与搜索输入（中文关键词无法用按键消息直接输入，走剪贴板粘贴） ──

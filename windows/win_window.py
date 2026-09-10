@@ -26,13 +26,20 @@ SW_RESTORE = 9
 SW_SHOW = 5
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
-# 微信相关进程名（3.x 为 WeChat.exe + WeChatApp.exe/WeChatAppEx.exe；4.x 为 Weixin.exe）
+# 微信相关进程名（3.x 为 WeChat.exe + WeChatApp.exe/WeChatAppEx.exe；4.x 为 Weixin.exe + WeixinAppEx.exe 等）
 MAIN_PROCESS_NAMES = {"wechat.exe", "weixin.exe"}
-WEBVIEW_PROCESS_NAMES = {"wechatapp.exe", "wechatappex.exe", "wechatappex_he.exe"}
+WEBVIEW_PROCESS_NAMES = {
+    "wechatapp.exe", "wechatappex.exe", "wechatappex_he.exe",
+    "weixinapp.exe", "weixinappex.exe", "weixinappex_he.exe"
+}
 ALL_WECHAT_PROCESS_NAMES = MAIN_PROCESS_NAMES | WEBVIEW_PROCESS_NAMES
 
-# 微信主窗口类名/标题特征（3.x 主窗口类名 WeChatMainWndForPC）
-MAIN_WINDOW_CLASSES = {"WeChatMainWndForPC", "WeChatLoginWndForPC"}
+# 微信主窗口类名/标题特征（3.x 主窗口类名 WeChatMainWndForPC；4.x 为 WeixinMainWndForPC / mmui::MainWindow 等）
+MAIN_WINDOW_CLASSES = {
+    "WeChatMainWndForPC", "WeChatLoginWndForPC",
+    "WeixinMainWndForPC", "WeixinLoginWndForPC",
+    "mmui::MainWindow"
+}
 MAIN_WINDOW_TITLES = {"微信", "WeChat", "Weixin"}
 
 # 文章/公众号 webview 窗口标题关键词（文章窗口标题通常为文章名或公众号名，
@@ -277,3 +284,68 @@ def launch_wechat_windows(wait_seconds: float = 12.0) -> bool:
             return True
         time.sleep(1.0)
     return False
+
+
+def is_portal_window_windows(win: WinWindow) -> bool:
+    """判定一个窗口是否为批量授权聚合页窗口（绝对受保护，不可误关）。"""
+    title = win.title or ""
+    return any(k in title for k in ("公众号批量授权", "批量授权", "聚合", "5200", "batch-portal", "mp-batch"))
+
+
+def find_portal_window_windows(windows: list = None) -> WinWindow | None:
+    """查找屏幕上已打开的公众号批量授权聚合页窗口（兼容 Windows 微信 4.x 内嵌三栏与 3.x 独立弹窗）。"""
+    wins = windows if windows is not None else find_wechat_windows()
+    # 1. 独立窗口模式 (3.x 或独立网页窗口)
+    for w in wins:
+        if is_portal_window_windows(w):
+            return w
+    for w in wins:
+        if w.exe_lower in WEBVIEW_PROCESS_NAMES and is_portal_window_windows(w):
+            return w
+
+    # 2. 检测微信 4.x 主窗口内嵌的第三栏分栏模式 (主窗口宽度 >= 1000)
+    main = find_main_window(wins)
+    if main and main.width >= 1000:
+        try:
+            import uiautomation as auto
+            ctrl = auto.ControlFromHandle(main.hwnd)
+            if ctrl:
+                for c, _ in auto.WalkControl(ctrl, maxDepth=6):
+                    name = c.Name or ""
+                    if any(k in name for k in ("公众号批量授权", "批量授权", "5200", "mp-batch-portal")):
+                        return WinWindow(
+                            hwnd=main.hwnd,
+                            title="公众号批量授权聚合中心(内嵌)",
+                            cls=main.cls,
+                            pid=main.pid,
+                            process_name=main.process_name,
+                            rect=main.rect
+                        )
+        except Exception:
+            pass
+    return None
+
+
+def close_native_account_windows_windows(exclude_hwnds: set[int] | None = None) -> int:
+    """精准关闭 Windows 微信原生公众号主页/名片弹窗，绝不误伤聚合页与主窗口。"""
+    exclude = set(exclude_hwnds or set())
+    main_win = find_main_window()
+    if main_win:
+        exclude.add(main_win.hwnd)
+    portal_win = find_portal_window_windows()
+    if portal_win:
+        exclude.add(portal_win.hwnd)
+
+    closed_count = 0
+    all_wins = find_wechat_windows()
+    for w in all_wins:
+        if w.hwnd in exclude:
+            continue
+        if is_portal_window_windows(w):
+            continue
+        # 原生公众号名片特征：标题为 '公众号' 或属于独立 webview 且非主窗口与聚合页
+        if w.title == "公众号" or (w.exe_lower in WEBVIEW_PROCESS_NAMES and 450 <= w.width <= 750 and 600 <= w.height <= 950):
+            if close_window(w.hwnd):
+                closed_count += 1
+                logger.info("✅ 已安全关闭 Windows 原生公众号名片窗口: %s", w)
+    return closed_count

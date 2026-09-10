@@ -30,6 +30,12 @@ def ensure_virtualenv():
 
 ensure_virtualenv()
 
+# ── 支持 PyInstaller 打包环境下的代理工作子进程拦截 ──
+if len(sys.argv) > 1 and any(arg in sys.argv for arg in ("--proxy-worker", "backend.proxy_worker")):
+    from backend.proxy_worker import main as proxy_worker_main
+    proxy_worker_main()
+    sys.exit(0)
+
 import socket
 import threading
 import time

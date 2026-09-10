@@ -437,8 +437,9 @@ _batch_sync_state = {
 }
 
 @auth_bp.route("/start-mac-batch-sync", methods=["POST"])
+@auth_bp.route("/start-batch-sync", methods=["POST"])
 def start_mac_batch_sync():
-    """启动 Mac 后台全自动流水线（Fast-Path 优先，自动调度微信补齐未就绪凭据）"""
+    """启动全自动流水线（支持 macOS / Windows 平台聚合页自动化调度）"""
     global _batch_sync_state
     if _batch_sync_state.get("running"):
         return jsonify({
@@ -478,37 +479,27 @@ def start_mac_batch_sync():
                 "completed": False,
             })
             try:
+                def _on_progress(idx, total, name, success, err):
+                    _batch_sync_state["current_step"] = idx
+                    _batch_sync_state["total"] = total
+                    _batch_sync_state["current_name"] = name
+                    if success:
+                        _batch_sync_state["success_count"] += 1
+                        _batch_sync_state["message"] = f"【{name}】同步就绪 ({idx}/{total})"
+                    else:
+                        _batch_sync_state["failed_count"] += 1
+                        _batch_sync_state["message"] = f"【{name}】等待手动补采: {err} ({idx}/{total})"
+
                 if sys.platform == "darwin":
                     from mac.batch_runner import WeChatBatchRunner
                     runner = WeChatBatchRunner(articles_per_account=10, auto_cleanup=True)
-                    def _on_progress(idx, total, name, success, err):
-                        _batch_sync_state["current_step"] = idx
-                        _batch_sync_state["total"] = total
-                        _batch_sync_state["current_name"] = name
-                        if success:
-                            _batch_sync_state["success_count"] += 1
-                            _batch_sync_state["message"] = f"【{name}】同步就绪 ({idx}/{total})"
-                        else:
-                            _batch_sync_state["failed_count"] += 1
-                            _batch_sync_state["message"] = f"【{name}】等待手动补采: {err} ({idx}/{total})"
-                    
+                    runner.run_queue(accounts_sub, progress_callback=_on_progress)
+                elif sys.platform == "win32":
+                    from windows.win_batch_runner import WinBatchRunner
+                    runner = WinBatchRunner(articles_per_account=10, auto_cleanup=True)
                     runner.run_queue(accounts_sub, progress_callback=_on_progress)
                 else:
-                    # Windows / 非 macOS 平台：
-                    # 若账号池尚未捕获有效凭证或已超期，先尝试通过 Windows 原生自动化唤起微信刷新凭证
-                    from backend.account_pool import account_pool
-                    pool_acc = account_pool.acquire()
-                    now_ts = time.time()
-                    if not pool_acc or not pool_acc.get("key") or (now_ts - pool_acc.get("save_time", 0) > 7200):
-                        _batch_sync_state["message"] = "正在通过 Windows 微信自动化唤起凭证更新..."
-                        try:
-                            from scripts.auto_refresh_pc_wechat import trigger_pc_wechat_refresh
-                            trigger_pc_wechat_refresh(force=True)
-                        except Exception as refresh_err:
-                            print(f"[start_mac_batch_sync] Windows 自动刷新凭证提示: {refresh_err}", flush=True)
-
                     from backend.articles import _fetch_articles_page
-                    total_cnt = len(accounts_sub)
                     for idx, a in enumerate(accounts_sub, start=1):
                         name = a.get("nickname", "")
                         fid = a.get("fakeid", "")
@@ -517,10 +508,8 @@ def start_mac_batch_sync():
                         try:
                             _fetch_articles_page(fakeid=fid, begin=0, count=5, account_name=name)
                             _batch_sync_state["success_count"] += 1
-                            _batch_sync_state["message"] = f"【{name}】同步就绪 ({idx}/{total_cnt})"
-                        except Exception as ex:
+                        except Exception:
                             _batch_sync_state["failed_count"] += 1
-                            _batch_sync_state["message"] = f"【{name}】等待手动补采: {ex} ({idx}/{total_cnt})"
                 
                 _batch_sync_state["message"] = f"🎉 全部 {len(accounts_sub)} 个公众号处理完毕！"
                 _batch_sync_state["completed"] = True
@@ -541,8 +530,9 @@ def start_mac_batch_sync():
 
 
 @auth_bp.route("/mac-batch-sync-status", methods=["GET"])
+@auth_bp.route("/batch-sync-status", methods=["GET"])
 def get_mac_batch_sync_status():
-    """获取 Mac 后台全自动流水线的实时执行进度"""
+    """获取后台全自动流水线的实时执行进度"""
     global _batch_sync_state
     return jsonify(_batch_sync_state)
 
@@ -955,7 +945,7 @@ def handle_mp_batch_portal():
             btn.innerText = '🚀 正在启动全自动流转流水线...';
             btn.disabled = true;
 
-            showToast('🚀 正在拉起全自动 OCR 授权流水线...');
+            showToast('🚀 正在拉起全自动流转授权流水线...');
             autoFlowRunning = true;
 
             try {{
@@ -973,7 +963,7 @@ def handle_mp_batch_portal():
                 showToast('请求异常: ' + e.message);
             }}
 
-            // 轮询监控后台 OCR 进度并实时同步卡片高亮状态
+            // 轮询监控后台流转进度并实时同步卡片高亮状态
             const pollTimer = setInterval(async () => {{
                 try {{
                     const r = await fetch('/api/auth/mac-batch-sync-status');
