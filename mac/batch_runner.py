@@ -143,82 +143,197 @@ class WeChatBatchRunner:
         activate_wechat()
         human_sleep(0.3, 0.5)
 
-    def _is_portal_content(self, win: MacWindow) -> bool:
-        """OCR 快速校验指定窗口当前是否确实展示批量授权聚合页内容（严格检查正文，过滤顶部标签栏与错误页）"""
-        try:
-            img = capture_window(win)
-            boxes = ocr(img)
-            # 过滤顶部标签栏（top < 60），针对正文内容区
-            body_boxes = [b for b in boxes if b.top > 60]
-            if not body_boxes:
-                return False
-            # 校验是否为断网或错误提示页
-            if any(k in b.text for b in body_boxes for k in ('ERR_', '未连接到互联网', '代理服务器出现问题', '无法访问此网站', 'ERR_PROXY')):
-                return False
-            portal_keywords = ('公众号清单', '会话已就绪', '点击授权', '刷新当前就绪状态', '全部公众号', '全部（', '待授权（')
-            return any(k in b.text for b in body_boxes for k in portal_keywords)
-        except Exception:
-            return False
-
-    def _ensure_portal_window(self) -> MacWindow:
-        """确保屏幕上有且仅有处于前台的可用批量授权聚合页窗口。
-        容错规则：
-        1. 若已存在聚合页窗口且内容正确，直接置顶复用，绝不重复打开；
-        2. 若窗口存在但被其他页面/新标签覆盖，尝试按 Cmd+W 恢复，恢复成功则继续复用；
-        3. 若仍不是聚合页或完全无聚合页窗口，则通过文件传输助手重新拉起聚合页；
-        4. 拉起后轮询直至窗口出现且 OCR 确认聚合页内容就绪。
-        """
-        # 1. 优先检查已存在的候选窗口
         portal = find_portal_window()
         if portal:
             raise_window(portal)
             human_sleep(0.3, 0.5)
-            if self._is_portal_content(portal):
-                logger.info("🎯 检测到聚合页窗口已存在且内容完好，无需重新打开，直接复用 (Window ID: %d)", portal.window_id)
-                return portal
-            else:
-                logger.warning("⚠️ 检测到窗口 (ID: %d) 当前不是聚合页内容或被覆盖，尝试按 Cmd+W 恢复...", portal.window_id)
-                press('command', 'w')
-                human_sleep(0.5, 0.8)
-                if self._is_portal_content(portal):
-                    logger.info("✅ 成功恢复聚合页窗口，继续复用！")
-                    return portal
-
-        # 2. 如果不存在或未恢复，通过微信主界面（文件传输助手）重新打开聚合页
-        logger.info("🚀 当前页面不是聚合页，正在通过文件传输助手重新打开聚合页...")
-        activate_wechat()
-        human_sleep(0.3, 0.5)
+            return portal
 
         main = find_main_window(timeout=3.0)
         if not main:
             raise RuntimeError("未检测到微信客户端窗口，请先打开微信 Mac 版。")
 
-        raise_window(main)
-        human_sleep(0.3, 0.5)
-
         cs = CoordSpace(main.window_id, {'x': main.x, 'y': main.y, 'w': main.w, 'h': main.h})
         img = capture_window(main)
         boxes = ocr(img)
 
-        in_filehelper = any('文件传输助手' in b.text and b.top < 80 for b in boxes)
-        if not in_filehelper:
+        def _find_dropdown_filehelper_box(boxes: list) -> any:
+            """从微信搜索下拉列表或独立浮层窗口中精准定位「功能」分类下的「文件传输助手」。"""
+            if not boxes:
+                return None
+            import re
+
+            # 1. 寻找「聊天记录」分类标题作为绝对下边界
+            chat_top = float("inf")
             for b in boxes:
-                if b.left < 250 and '文件传输助手' in b.text:
-                    sx, sy = cs.img_to_screen(b.center[0], b.center[1])
-                    move_and_click(sx, sy)
-                    human_sleep(0.5, 0.8)
+                txt = b.text.strip().replace(" ", "")
+                if any(k in txt for k in ("聊天记录", "相关的聊天记录", "条聊天记录")) and len(txt) <= 12:
+                    if b.top < chat_top:
+                        chat_top = b.top
+
+            # 2. 寻找「功能」分类标题
+            func_header = None
+            for b in boxes:
+                txt = b.text.strip().replace(" ", "")
+                if (txt == "功能" or (len(txt) <= 4 and "功能" in txt and "助手" not in txt and "搜索" not in txt)) and b.top < chat_top:
+                    func_header = b
                     break
+
+            # 3. 寻找「功能」下方的其他分类标题以确定下边界
+            next_section_top = chat_top
+            if func_header:
+                for b in boxes:
+                    if b.top > func_header.top and b.top < next_section_top:
+                        txt = b.text.strip().replace(" ", "")
+                        if txt in ("联系人", "群聊", "公众号", "收藏", "小程序", "表情", "文章") or (len(txt) <= 4 and any(k in txt for k in ("联系人", "群聊", "收藏"))):
+                            next_section_top = b.top
+
+            # 4. 严格清洗候选块：只保留纯粹的「文件传输助手」，排除任何聊天对话
+            def _is_pure_filehelper_item(b) -> bool:
+                raw = b.text.strip()
+                txt = raw.replace(" ", "")
+                if ":" in raw or "：" in raw:
+                    return False
+                chat_keywords = ("记录", "相关的", "条相关", "昨天", "今天", "撤回", "图片", "视频", "语音", "弱智")
+                if any(k in txt for k in chat_keywords):
+                    return False
+                if re.search(r'\d{1,2}:\d{2}', raw) or re.search(r'\d{4}[-/.]\d{1,2}', raw):
+                    return False
+                clean_txt = re.sub(r'^[^\u4e00-\u9fa5]+', '', txt)
+                if "文件传输助手" not in clean_txt or len(clean_txt) > 8:
+                    return False
+                if b.top >= chat_top:
+                    return False
+                return True
+
+            valid_cands = [b for b in boxes if _is_pure_filehelper_item(b)]
+            if not valid_cands:
+                return None
+
+            valid_cands.sort(key=lambda x: x.top)
+
+            # 优先匹配「功能」标题下方的第一项
+            if func_header:
+                below_func = [b for b in valid_cands if b.top > func_header.top and b.top < next_section_top]
+                if below_func:
+                    logger.info("🎯 成功在「功能」标题 (y=%d) 下方匹配到文件传输助手: %s (y=%d)", func_header.top, below_func[0].text, below_func[0].top)
+                    return below_func[0]
+
+            # 次优先：纯净完全匹配项
+            strict_cands = [b for b in valid_cands if re.sub(r'^[^\u4e00-\u9fa5]+', '', b.text.strip().replace(" ", "")) == "文件传输助手"]
+            if strict_cands:
+                logger.info("🎯 精确定位到纯净「文件传输助手」功能条目: %s (y=%d)", strict_cands[0].text, strict_cands[0].top)
+                return strict_cands[0]
+
+            return valid_cands[0]
+
+        def _is_in_filehelper_window(w) -> bool:
+            img_c = capture_window(w)
+            if img_c is None:
+                return False
+            boxes_c = ocr(img_c)
+            # 严格校验会话窗口顶部标题栏
+            for b in boxes_c:
+                txt = b.text.strip().replace(" ", "")
+                if (txt in ("文件传输助手", "文件传输助手(FileTransfer)") or (txt.startswith("文件传输助手") and len(txt) <= 8)) and b.top < 65 and b.left >= 180:
+                    if ":" not in b.text and "：" not in b.text and "记录" not in txt:
+                        return True
+            return False
+
+        if not _is_in_filehelper_window(main):
+            for attempt in range(1, 3):
+                if attempt > 1:
+                    press("escape", times=2)
+                    human_sleep(0.3, 0.5)
+                # 确保在聊天 tab (侧边栏绿色气泡图标位于 y+145)
+                move_and_click(main.x + 35, main.y + 145)
+                human_sleep(0.3, 0.5)
+                img = capture_window(main)
+                boxes = ocr(img)
+                helper_box = next((b for b in boxes if b.left < 230 and b.top > 45 and ('文件传' in b.text or '传输助手' in b.text) and ':' not in b.text and '：' not in b.text and len(b.text.strip()) <= 8), None)
+                if helper_box:
+                    sx, sy = cs.img_to_screen(helper_box.center[0], helper_box.center[1])
+                    move_and_click(sx, sy)
+                    human_sleep(0.8, 1.2)
+                else:
+                    # 搜索框精准查找文件传输助手
+                    move_and_click(main.x + 100, main.y + 25)
+                    human_sleep(0.2, 0.3)
+                    type_text_via_clipboard('文件传输助手', clear_first=True)
+                    human_sleep(0.6, 0.8)
+
+                    # 捕获搜索下拉浮层：优先检测微信搜索的独立浮层窗口 (Popover Window)
+                    popover_win = None
+                    from mac.mac_win import list_wechat_windows
+                    t_start = time.time()
+                    while time.time() - t_start < 1.5:
+                        for w in list_wechat_windows():
+                            if not w.title and 200 <= w.w <= 550 and w.h >= 180:
+                                if abs(w.x - main.x) <= 350:
+                                    popover_win = w
+                                    break
+                        if popover_win:
+                            break
+                        human_sleep(0.15, 0.25)
+
+                    target_box = None
+                    target_cs = cs
+
+                    if popover_win:
+                        cs_pop = CoordSpace(popover_win.window_id, {"x": popover_win.x, "y": popover_win.y, "w": popover_win.w, "h": popover_win.h})
+                        img_pop = capture_window(popover_win)
+                        boxes_pop = ocr(img_pop) if img_pop is not None else []
+                        target_box = _find_dropdown_filehelper_box(boxes_pop)
+                        if target_box:
+                            target_cs = cs_pop
+                            logger.info("🎯 在独立搜索浮层窗口 (id=%s) 中检测到文件传输助手", popover_win.window_id)
+
+                    # 若未找到浮层窗口，回退截取主窗口
+                    if not target_box:
+                        img_s = capture_window(main)
+                        boxes_s = ocr(img_s)
+                        drop_cands = [b for b in boxes_s if b.left < 350]
+                        target_box = _find_dropdown_filehelper_box(drop_cands)
+
+                    if target_box:
+                        sx, sy = target_cs.img_to_screen(*target_box.center)
+                        logger.info("✅ 精确定位到「功能 -> 文件传输助手」[%s]，点击屏幕坐标 (%d, %d)", target_box.text, sx, sy)
+                        move_and_click(sx, sy)
+                        human_sleep(0.8, 1.2)
+                    else:
+                        logger.warning("⚠️ 未在搜索浮层中定位到「功能」下方的文件传输助手，按 Escape 取消搜索防误触...")
+                        press("escape")
+                        human_sleep(0.3, 0.5)
+
+                if _is_in_filehelper_window(main):
+                    logger.info("🎉 成功准确选中并显示「文件传输助手」聊天页面！")
+                    break
+                else:
+                    logger.warning("⚠️ 安全校验未通过：当前窗口非「文件传输助手」，按 Escape 退出以防误操作...")
+                    press("escape", times=2)
+                    human_sleep(0.4, 0.6)
+
+        def _is_portal_link(text: str) -> bool:
+            t = text.lower()
+            if '5200' in t and any(k in t for k in ('mp-batch', 'batch', 'portal', 'auth', '127.0.0.1')):
+                return True
+            if 'mp-batch-portal' in t or 'batch-portal' in t:
+                return True
+            return False
 
         img2 = capture_window(main)
         boxes2 = ocr(img2)
-        link_box = next((b for b in reversed(boxes2) if b.left > 300 and any(k in b.text for k in ('5200', 'mp-batch', 'portal'))), None)
+        link_box = next((b for b in reversed(boxes2) if b.left >= 200 and _is_portal_link(b.text)), None)
         if link_box:
+            logger.info("✅ 找到已有聚合页链接气泡 [%s]，直接点击打开...", link_box.text)
             sx, sy = cs.img_to_screen(link_box.center[0], link_box.center[1])
             move_and_click(sx, sy)
         else:
+            # 严格遵循用户指示：未找到聚合页链接时直接在输入框发送链接，绝对不乱点其它链接！
             portal_url = "http://127.0.0.1:5200/api/auth/mp-batch-portal"
-            input_x = main.x + int(main.w * 0.6)
-            input_y = main.y + main.h - 80
+            logger.info("👉 未在聊天记录中检测到有效的聚合页链接，正在输入框发送聚合页入口链接...")
+            input_x = main.x + int(main.w * 0.5)
+            input_y = main.y + main.h - 60
             move_and_click(input_x, input_y)
             human_sleep(0.2, 0.3)
             type_text_via_clipboard(portal_url, clear_first=False)
@@ -227,36 +342,124 @@ class WeChatBatchRunner:
             human_sleep(0.8, 1.2)
             img3 = capture_window(main)
             boxes3 = ocr(img3)
-            link_box = next((b for b in reversed(boxes3) if b.left > 300 and any(k in b.text for k in ('5200', 'mp-batch', 'portal'))), None)
+            link_box = next((b for b in reversed(boxes3) if b.left > 280 and _is_portal_link(b.text)), None)
             if link_box:
+                logger.info("✅ 成功识别刚发送的聚合页链接 [%s]，点击打开...", link_box.text)
                 sx, sy = cs.img_to_screen(link_box.center[0], link_box.center[1])
                 move_and_click(sx, sy)
+            else:
+                logger.info("👉 点击刚发送的最新消息气泡...")
+                move_and_click(main.x + int(main.w * 0.55), main.y + main.h - 130)
 
-        # 3. 轮询等待聚合页窗口出现并确认内容
         deadline = time.time() + 8.0
+        portal = None
         while time.time() < deadline:
             time.sleep(0.5)
             portal = find_portal_window()
             if portal:
-                raise_window(portal)
-                if self._is_portal_content(portal):
-                    logger.info("🎉 聚合页窗口已成功重新打开并校验就绪 (Window ID: %d)！", portal.window_id)
-                    return portal
+                break
 
         if not portal:
             raise RuntimeError("未能唤起批量授权聚合页窗口，请手动在微信文件传输助手中点击聚合页链接！")
+        raise_window(portal)
+        # 确保聚合页滚动到公众号卡片清单区域（严密判定新版内嵌模式与旧版独立弹窗模式）
+        main_win_chk = find_main_window(timeout=0.2)
+        is_embedded = ("(内嵌)" in (portal.title or "")) or bool(main_win_chk and portal.window_id == main_win_chk.window_id and portal.w >= 850)
+        try:
+            img = capture_window(portal)
+            boxes = ocr(img)
+            min_check_x = int(portal.w * 0.55) if is_embedded else 0
+            scroll_x = portal.x + (int(portal.w * 0.78) if is_embedded else portal.w // 2)
+            scroll_y = portal.y + (int(portal.h * 0.6) if is_embedded else portal.h // 2)
+            if not any(k in b.text for b in boxes if b.left >= min_check_x for k in ('新京报', '主力', '浙商', '数据', '潇湘', '行星', '清单')):
+                move_and_click(scroll_x, scroll_y)
+                human_sleep(0.2, 0.3)
+                scroll(-10)
+                human_sleep(0.5, 0.8)
+        except Exception:
+            pass
         return portal
 
-    def _sync_via_portal_ocr(self, portal_win: MacWindow, account_name: str, target_fakeid: str) -> bool:
-        """纯 OCR 驱动：在聚合页中识别指定公众号卡片并点击触发抓包，关闭原生名片弹窗，保留聚合页。"""
-        # 0. 前置容错：先关闭任何上次可能残留的原生公众号名片窗口
-        close_native_account_windows()
+    def _close_embedded_profile_tab(self, portal_win: MacWindow, account_name: str = "") -> bool:
+        """
+        在微信 4.1.x 三栏内嵌分栏中，精准定位并点击 Tab 标题右侧的圆形关闭叉号 (ⓧ)，
+        关闭当前公众号主页/文章页 Tab，优雅回到聚合页。
+        """
+        import cv2
+        main = find_main_window(timeout=1.0)
+        if not main or main.w < 850:
+            return False
 
-        # 1. 确保聚合页置顶在最前，并校验当前内容
+        cs = CoordSpace(main.window_id, {'x': main.x, 'y': main.y, 'w': main.w, 'h': main.h})
+        img = capture_window(main)
+        if img is None:
+            return False
+
+        pane_x0 = int(main.w * 0.5)
+        header_crop = img[0:65, pane_x0:main.w]
+        if header_crop.size == 0:
+            return False
+
+        click_target = None
+
+        # 1. 优先模板匹配名字右侧的圆圈叉号图标 (ⓧ)
+        icon_path = os.path.join(os.path.dirname(__file__), 'assets', 'close_tab_icon.png')
+        if os.path.exists(icon_path):
+            icon = cv2.imread(icon_path)
+            if icon is not None and header_crop.shape[0] >= icon.shape[0] and header_crop.shape[1] >= icon.shape[1]:
+                res = cv2.matchTemplate(header_crop, icon, cv2.TM_CCOEFF_NORMED)
+                min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+                if max_val >= 0.70:
+                    cx = pane_x0 + max_loc[0] + icon.shape[1] // 2
+                    cy = max_loc[1] + icon.shape[0] // 2
+                    click_target = (cx, cy)
+                    logger.info("🎯 [Close Tab] 模板匹配定位到标签页关闭图标: (%d, %d), 置信度: %.2f", cx, cy, max_val)
+
+        # 2. OCR 查找名字右侧的关闭按钮
+        if not click_target:
+            boxes = ocr(header_crop)
+            for b in boxes:
+                if account_name and account_name in b.text:
+                    cx = pane_x0 + b.right + 20
+                    cy = (b.top + b.bottom) // 2
+                    click_target = (cx, cy)
+                    logger.info("🎯 [Close Tab] OCR 根据公众号【%s】名称定位到关闭按钮: (%d, %d)", account_name, cx, cy)
+                    break
+                for char in ('⑧', 'ⓧ', '×', 'x', 'X'):
+                    if char in b.text:
+                        cx = pane_x0 + (b.left + b.right) // 2
+                        cy = (b.top + b.bottom) // 2
+                        click_target = (cx, cy)
+                        logger.info("🎯 [Close Tab] OCR 识别到关闭字符【%s】定位: (%d, %d)", char, cx, cy)
+                        break
+                if click_target:
+                    break
+
+        # 3. 如果找到了关闭按钮，执行系统级拟人点击
+        if click_target:
+            sx, sy = cs.img_to_screen(*click_target)
+            logger.info("👉 点击公众号主页 Tab 右侧圆形关闭按钮: 屏幕坐标 (%d, %d)...", sx, sy)
+            move_and_click(sx, sy)
+            human_sleep(0.5, 0.8)
+            return True
+
+        return False
+
+    def _sync_via_portal_ocr(self, portal_win: MacWindow, account_name: str, target_fakeid: str) -> bool:
+        """纯 OCR 驱动：在聚合页中识别指定公众号卡片并点击触发抓包，关闭公众号主页返回聚合页。"""
+        # 1. 确保聚合页置顶在最前并注入焦点
         raise_window(portal_win)
         human_sleep(0.3, 0.5)
-        if not self._is_portal_content(portal_win):
-            portal_win = self._ensure_portal_window()
+
+        main_win_chk = find_main_window(timeout=0.2)
+        is_embedded = ("(内嵌)" in (portal_win.title or "")) or bool(main_win_chk and portal_win.window_id == main_win_chk.window_id and portal_win.w >= 850)
+        pane_min_x = int(portal_win.w * 0.55) if is_embedded else 0
+        scroll_cx = portal_win.x + (int(portal_win.w * 0.78) if is_embedded else portal_win.w // 2)
+        scroll_cy = portal_win.y + (int(portal_win.h * 0.55) if is_embedded else portal_win.h // 2)
+
+        # 激活分栏内部焦点，防止 macOS click-through 吞掉首次点击手势
+        move_and_click(scroll_cx, portal_win.y + 45)
+        human_sleep(0.2, 0.3)
 
         cs = CoordSpace(portal_win.window_id, {'x': portal_win.x, 'y': portal_win.y, 'w': portal_win.w, 'h': portal_win.h})
 
@@ -264,6 +467,9 @@ class WeChatBatchRunner:
         tokens = [t for t in account_name.split() if len(t) >= 2]
 
         def matches_acc(txt_clean: str) -> bool:
+            # 严格排除顶部控制按钮与状态横幅（防止将顶部「⏳ 正在同步：【公众号名】」误判为卡片！）
+            if any(bad in txt_clean for bad in ("正在同步", "正在启动", "流水线", "一键开始", "流转授权", "授权聚合中心", "建议", "清单", "就绪状态", "仅复制", "复制全部", "会话已就绪", "点击授权")):
+                return False
             if name_clean in txt_clean or txt_clean in name_clean:
                 return True
             if any(t in txt_clean for t in tokens):
@@ -272,14 +478,15 @@ class WeChatBatchRunner:
                 return True
             return False
 
-        # 2. 多轮 OCR 扫描寻找该公众号卡片（支持列表滚动容错）
+        # 2. 多轮 OCR 扫描寻找该公众号卡片（支持列表滚动）
         target_box = None
-        for attempt in range(4):
+        for attempt in range(5):
             img = capture_window(portal_win)
             boxes = ocr(img)
 
             for b in boxes:
-                if b.top > 150:
+                # 排除顶部导航栏与控制区（前 80px），且必须在右侧分栏区域（若内嵌）
+                if b.left >= pane_min_x and b.top > 80:
                     txt = b.text.replace(" ", "")
                     if matches_acc(txt):
                         target_box = b
@@ -288,23 +495,22 @@ class WeChatBatchRunner:
             if target_box:
                 break
 
-            # 若未在当前可视区域发现，在列表区域向下滑动
-            if attempt < 3:
-                move_and_click(portal_win.x + portal_win.w // 2, portal_win.y + portal_win.h // 2)
+            # 若未在当前可视区域发现，在列表区域向下滑动使下方卡片可见
+            if attempt < 4:
+                move_and_click(scroll_cx, scroll_cy)
                 human_sleep(0.2, 0.3)
-                scroll(-6)
-                human_sleep(0.5, 0.8)
+                scroll(-10)
+                human_sleep(0.6, 0.9)
 
         if not target_box:
             # 若向下滑动未找到，尝试滚回顶部再扫描一次（防止前面处理项滚到底部）
-            move_and_click(portal_win.x + portal_win.w // 2, portal_win.y + portal_win.h // 2)
-            press('command', 'up')
+            move_and_click(scroll_cx, scroll_cy)
             scroll(30)
-            human_sleep(0.5, 0.8)
+            human_sleep(0.6, 0.9)
             img = capture_window(portal_win)
             boxes = ocr(img)
             for b in boxes:
-                if b.top > 120:
+                if b.left >= pane_min_x and b.top > 80:
                     txt = b.text.replace(" ", "")
                     if matches_acc(txt):
                         target_box = b
@@ -328,53 +534,61 @@ class WeChatBatchRunner:
 
         move_and_click(sx, sy)
 
-        # 4. 轮询等待 MITM 抓包截获与原生公众号名片窗口出现并关闭（支持一次点击重试容错）
+        # 4. 轮询等待 MITM 抓包截获凭据（若 2.5s 未捕获，自动补充点击一次确保激活）
         deadline = time.time() + 6.0
         captured = False
-        native_closed = False
-        retried_click = False
-
+        reclicked = False
         while time.time() < deadline:
             time.sleep(0.3)
-            # 检查凭据库是否已更新
+            # 检查凭据库是否已更新或已持有近期（15分钟内）新鲜有效凭证
             if target_fakeid:
                 acc = account_pool.acquire()
                 cred = AccountPool.get_biz_credential(acc, target_fakeid) if acc else {}
-                if cred.get('key') and cred.get('updated_at', 0) > old_updated_at:
-                    if not captured:
-                        captured = True
-                        logger.info("🎉 成功捕获到公众号【%s】全新凭证!", account_name)
-
-            # 若检测到原生公众号窗口打开，立即安全关闭
-            if close_native_account_windows() > 0:
-                native_closed = True
-
-            if captured and native_closed:
-                break
-
-            # 容错重试：若等待 3 秒后依然没有任何响应，再次点击一次
-            if not captured and not native_closed and not retried_click and (deadline - time.time() < 3.0):
-                retried_click = True
-                logger.info("🔄 [容错重试] 距初次点击无响应，重新置顶聚合页并重试点击卡片 (%d, %d)...", sx, sy)
-                raise_window(portal_win)
-                move_and_click(sx, sy)
-
-        # 5. 坚决关闭可能延迟弹出的原生名片窗口（最多等 2.5 秒直至关闭）
-        if not native_closed:
-            t_close_deadline = time.time() + 2.5
-            while time.time() < t_close_deadline:
-                time.sleep(0.25)
-                if close_native_account_windows() > 0:
+                up_time = cred.get('updated_at', 0)
+                if cred.get('key') and (up_time > old_updated_at or (time.time() - up_time < 900)):
+                    captured = True
+                    logger.info("🎉 成功确认公众号【%s】有效凭证就绪 (更新于 %d 秒前)!", account_name, int(time.time() - up_time))
                     break
+            if not reclicked and time.time() > (deadline - 3.5):
+                logger.info("补充点击以确保手势触发: (%d, %d)...", sx, sy)
+                move_and_click(sx, sy)
+                reclicked = True
 
-        # 6. 如果在聚合页窗口内弹出了新标签页，关闭新标签页返回聚合页
-        try:
-            if not self._is_portal_content(portal_win):
-                logger.info("检测到聚合页被新标签覆盖，正在关闭标签返回聚合页...")
-                press('command', 'w')
-                human_sleep(0.3, 0.5)
-        except Exception:
-            pass
+        # 5. 打开公众号主页后，点击名字右侧的圆圈叉号 (ⓧ) 关闭当前主页，无缝回到聚合页
+        human_sleep(0.5, 0.8)
+        if is_embedded:
+            closed = self._close_embedded_profile_tab(portal_win, account_name=account_name)
+            if not closed:
+                logger.warning("未能自动匹配到标签页关闭按钮，尝试安全兜底...")
+                cs_main = CoordSpace(portal_win.window_id, {'x': portal_win.x, 'y': portal_win.y, 'w': portal_win.w, 'h': portal_win.h})
+                fallback_x, fallback_y = cs_main.img_to_screen(min(portal_win.w - 120, 820), 28)
+                move_and_click(fallback_x, fallback_y)
+                human_sleep(0.5, 0.8)
+
+            # 验证聚合页是否仍在屏幕上；若分栏被收起，通过聊天中气泡秒级重新唤起聚合页
+            img_chk = capture_window(portal_win)
+            boxes_chk = ocr(img_chk) if img_chk is not None else []
+            portal_keys = ('公众号批量授', '批量授', '授权', '清单', 'mp-batch', '5200', '已就绪')
+            has_portal_still = any(any(k in b.text for k in portal_keys) for b in boxes_chk if b.left >= pane_min_x)
+            if not has_portal_still:
+                # 寻找并点击聊天区域中的聚合页链接气泡
+                link_box = next((b for b in reversed(boxes_chk) if b.left > 280 and any(k in b.text for k in ('5200', 'mp-batch', 'portal'))), None)
+                if link_box:
+                    lx, ly = cs.img_to_screen(*link_box.center)
+                    move_and_click(lx, ly)
+                    human_sleep(1.2, 1.8)
+        else:
+            # 独立弹窗模式：关闭弹出的原生公众号名片窗口 (Cmd+W 或 AXCloseButton)
+            close_native_account_windows()
+            # 若聚合页被新标签覆盖，按 Cmd+W 返回
+            try:
+                img_check = capture_window(portal_win)
+                boxes_check = ocr(img_check)
+                if not any('公众号批量授权' in b.text for b in boxes_check[:5]):
+                    press('command', 'w')
+                    human_sleep(0.3, 0.5)
+            except Exception:
+                pass
 
         return captured
 
@@ -408,10 +622,7 @@ class WeChatBatchRunner:
             raise RuntimeError(f"未能获取到公众号【{account_name}】的 fakeid (__biz)")
 
         if not ocr_ok:
-            acc = account_pool.acquire()
-            cred = AccountPool.get_biz_credential(acc, target_fakeid) if acc else {}
-            if not cred.get("key"):
-                raise RuntimeError(f"未能通过聚合页 OCR 激活公众号【{account_name}】并捕获有效凭证")
+            raise RuntimeError(f"未能通过聚合页 OCR 激活公众号【{account_name}】并捕获有效凭证")
 
         # 立即调用 API 拉取历史文章
         articles, total_count, can_continue = _fetch_articles_page(

@@ -12,6 +12,10 @@ datas = [
     (os.path.join(project_root, 'injection_scripts'), 'injection_scripts'),
 ]
 
+mac_assets_dir = os.path.join(project_root, 'mac', 'assets')
+if os.path.isdir(mac_assets_dir):
+    datas.append((mac_assets_dir, os.path.join('mac', 'assets')))
+
 playwright_browsers = os.path.join(project_root, 'ms-playwright')
 bundle_browser = os.environ.get('WECHAT_MP_TOOLS_BUNDLE_BROWSER', '1') != '0'
 if bundle_browser and os.path.isdir(playwright_browsers):
@@ -79,6 +83,7 @@ hiddenimports = [
     'backend.xiaohongshu_login',
     'backend.updater',
     'backend.mitm_proxy',
+    'backend.proxy_worker',
     'qcloud_cos',
     'qcloud_cos.cos_client',
     'qcloud_cos.cos_config',
@@ -96,7 +101,7 @@ hiddenimports = [
     'webview.platforms',
 ]
 
-# macOS Cocoa 支持
+# macOS Cocoa 与自动化支持
 if sys.platform == 'darwin':
     hiddenimports.extend([
         'webview.platforms.cocoa',
@@ -104,6 +109,13 @@ if sys.platform == 'darwin':
         'Cocoa',
         'Foundation',
         'WebKit',
+        'mac',
+        'mac.batch_runner',
+        'mac.mac_win',
+        'mac.mac_input',
+        'mac.steps.step4_cleanup',
+        'scripts',
+        'scripts.auto_refresh_pc_wechat',
     ])
 
 # Windows WebView2 (winforms) 支持与自动化模块
@@ -118,6 +130,7 @@ if sys.platform == 'win32':
         'windows.win_flow',
         'windows.win_input',
         'windows.win_window',
+        'windows.win_batch_runner',
         'scripts',
         'scripts.auto_refresh_pc_wechat',
     ])

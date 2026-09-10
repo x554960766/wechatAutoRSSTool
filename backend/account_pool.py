@@ -7,6 +7,7 @@
 import time
 import threading
 import logging
+import urllib.parse
 
 from backend.config import (
     ACCOUNT_POOL_FILE, CONFIG_FILE,
@@ -59,7 +60,22 @@ class AccountPool:
     # ── 存储 ──────────────────────────────────────────
 
     def _load(self) -> list:
-        return load_json(ACCOUNT_POOL_FILE, [])
+        accounts = load_json(ACCOUNT_POOL_FILE, [])
+        cleaned = False
+        for acc in accounts:
+            biz_tokens = acc.get("biz_tokens")
+            if isinstance(biz_tokens, dict) and biz_tokens:
+                new_biz_tokens = {}
+                for biz, entry in biz_tokens.items():
+                    name = (entry.get("name") if isinstance(entry, dict) else "") or self._resolve_biz_name(biz)
+                    if name and name not in ("未命名公众号", "公众号未命名", "未命名") and self._is_favorite_biz(biz):
+                        new_biz_tokens[biz] = entry
+                    else:
+                        cleaned = True
+                acc["biz_tokens"] = new_biz_tokens
+        if cleaned:
+            save_json(ACCOUNT_POOL_FILE, accounts)
+        return accounts
 
     def _save(self, accounts: list):
         save_json(ACCOUNT_POOL_FILE, accounts)
@@ -257,16 +273,46 @@ class AccountPool:
     # ── 增删改查 ──────────────────────────────────────
 
     @staticmethod
+    def _is_favorite_biz(biz: str) -> bool:
+        """判断 biz 是否属于用户已收藏的公众号"""
+        if not biz:
+            return False
+        try:
+            from backend.config import ACCOUNTS_FILE, load_json
+            import urllib.parse
+            accounts_sub = load_json(ACCOUNTS_FILE, [])
+            if not accounts_sub:
+                return False
+            u_biz = urllib.parse.unquote(str(biz))
+            for acc in accounts_sub:
+                fid = str(acc.get("fakeid") or "")
+                u_fid = urllib.parse.unquote(fid)
+                alias = str(acc.get("alias") or "")
+                if str(biz) in (fid, u_fid) or u_biz in (fid, u_fid) or (alias and str(biz) == alias):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
     def _resolve_biz_name(biz: str) -> str:
-        """按 fakeid 从已收藏公众号列表反查名称（用于 biz 凭证展示归属公众号）。
+        """按 fakeid 从已收藏公众号列表反查名称（仅限已收藏公众号有效名称）。
         注意：会在 add_or_update 的锁内被调用，此处不得再获取 self._lock。"""
         if not biz:
             return ""
         try:
-            from backend.accounts import _load_accounts
-            for acc in _load_accounts():
-                if (acc.get("fakeid") or acc.get("alias")) == biz:
-                    return acc.get("nickname") or acc.get("name") or ""
+            from backend.config import ACCOUNTS_FILE, load_json
+            import urllib.parse
+            accounts_sub = load_json(ACCOUNTS_FILE, [])
+            u_biz = urllib.parse.unquote(str(biz))
+            for acc in accounts_sub:
+                fid = str(acc.get("fakeid") or "")
+                u_fid = urllib.parse.unquote(fid)
+                alias = str(acc.get("alias") or "")
+                if str(biz) in (fid, u_fid) or u_biz in (fid, u_fid) or (alias and str(biz) == alias):
+                    name = acc.get("nickname") or acc.get("name") or ""
+                    if name and name not in ("未命名公众号", "公众号未命名", "未命名"):
+                        return name
         except Exception:
             pass
         return ""
@@ -276,8 +322,17 @@ class AccountPool:
         now = time.time()
         accounts = self._load()
         from backend.config import ACCOUNTS_FILE, load_json
+        import urllib.parse
         accounts_sub = load_json(ACCOUNTS_FILE, [])
-        subscribed_fakeids = {a.get("fakeid") for a in accounts_sub if a.get("fakeid")}
+        subscribed_map = {}
+        for a in accounts_sub:
+            fid = str(a.get("fakeid") or "")
+            name = a.get("nickname") or a.get("name") or ""
+            if fid and name and name not in ("未命名公众号", "公众号未命名", "未命名"):
+                subscribed_map[fid] = name
+                subscribed_map[urllib.parse.unquote(fid)] = name
+                if a.get("alias"):
+                    subscribed_map[str(a.get("alias"))] = name
 
         result = []
         for acc in accounts:
@@ -285,28 +340,33 @@ class AccountPool:
             expires_at = save_time + LOGIN_VALID_SECONDS if save_time else 0
             remaining = max(0, int(expires_at - now)) if expires_at else 0
 
-            # 展开 biz 专属凭证：仅展示已关注/订阅清单中的公众号凭证
+            # 展开 biz 专属凭证：严格只展示已收藏且有名有姓的公众号凭证，绝不展示未命名凭证
             biz_credentials = []
             for biz, entry in (acc.get("biz_tokens") or {}).items():
                 if not isinstance(entry, dict):
                     continue
-                # 仅保留已关注公众号的凭证
-                if subscribed_fakeids and biz not in subscribed_fakeids:
-                    import urllib.parse
-                    if urllib.parse.unquote(biz) not in subscribed_fakeids:
-                        continue
+
+                # 必须属于已收藏公众号且解析出名称
+                resolved_name = (
+                    subscribed_map.get(str(biz)) or
+                    subscribed_map.get(urllib.parse.unquote(str(biz))) or
+                    self._resolve_biz_name(biz)
+                )
+                if not resolved_name or resolved_name in ("未命名公众号", "公众号未命名", "未命名"):
+                    continue
 
                 updated_at = entry.get("updated_at", 0)
                 age = max(0, int(now - updated_at)) if updated_at else None
                 biz_credentials.append({
                     "biz": (biz[:10] + "...") if len(str(biz)) > 10 else str(biz),
                     "fakeid": biz,
-                    "name": entry.get("name") or self._resolve_biz_name(biz) or "未命名公众号",
+                    "name": resolved_name,
                     "updated_at": updated_at,
                     "age_seconds": age,
                     "fresh": age is not None and age < BIZ_FRESH_SECONDS,
                     "has_key": bool(entry.get("key")),
                     "getmsg_ready": bool(entry.get("getmsg_ready")),
+                    "profile_url": f"https://mp.weixin.qq.com/mp/profile_ext?action=home&__biz={urllib.parse.quote(str(biz))}#wechat_redirect",
                 })
             # 最近更新的排前面
             biz_credentials.sort(key=lambda x: -(x.get("updated_at") or 0))
@@ -401,32 +461,34 @@ class AccountPool:
                 if cred.get("avatar"):
                     target_acc["avatar"] = cred.get("avatar")
                 
-                # 更新专属 biz 凭证（不论是否带 token，只要有 biz 就记录）
-                if cred.get("biz"):
-                    biz = cred["biz"]
-                    biz_tokens = target_acc.setdefault("biz_tokens", {})
-                    app_token = cred.get("appmsg_token") or token or (biz_tokens.get(biz, {}).get("token") if isinstance(biz_tokens.get(biz), dict) else "")
-                    old_entry = biz_tokens.get(biz) if isinstance(biz_tokens.get(biz), dict) else {}
-                    getmsg_ready = cred.get("biz_source") == "profile_ext"
+                # 更新专属 biz 凭证（严格只同步已收藏且命名的公众号凭证，绝不同步未命名或非收藏公众号）
+                biz = cred.get("biz")
+                if biz and self._is_favorite_biz(biz):
+                    resolved_biz_name = self._resolve_biz_name(biz) or cred.get("biz_name")
+                    if resolved_biz_name and resolved_biz_name not in ("未命名公众号", "公众号未命名", "未命名"):
+                        biz_tokens = target_acc.setdefault("biz_tokens", {})
+                        app_token = cred.get("appmsg_token") or token or (biz_tokens.get(biz, {}).get("token") if isinstance(biz_tokens.get(biz), dict) else "")
+                        old_entry = biz_tokens.get(biz) if isinstance(biz_tokens.get(biz), dict) else {}
+                        getmsg_ready = cred.get("biz_source") == "profile_ext"
 
-                    if (old_entry.get("getmsg_ready") and not getmsg_ready
-                            and (time.time() - (old_entry.get("updated_at") or 0)) < BIZ_GETMSG_PROTECT_SECONDS):
-                        old_entry["name"] = cred.get("biz_name") or old_entry.get("name") or self._resolve_biz_name(biz)
-                        logger.debug("biz [%s] 保留已验证的 getmsg key，忽略 %s 来源捕获",
-                                     (old_entry.get("name") or biz)[:16], cred.get("biz_source"))
-                    else:
-                        biz_tokens[biz] = {
-                            "token": app_token,
-                            "appmsg_token": app_token,
-                            "key": cred.get("key") or old_entry.get("key", "") or target_acc.get("key", ""),
-                            "pass_ticket": cred.get("pass_ticket") or old_entry.get("pass_ticket", "") or target_acc.get("pass_ticket", ""),
-                            "poc_token": cred.get("poc_token") or old_entry.get("poc_token", "") or target_acc.get("poc_token", ""),
-                            "poc_sid": cred.get("poc_sid") or old_entry.get("poc_sid", "") or target_acc.get("poc_sid", ""),
-                            "wxtoken": cred.get("wxtoken") or old_entry.get("wxtoken", "") or target_acc.get("wxtoken", "777"),
-                            "updated_at": cred.get("save_time", time.time()),
-                            "name": cred.get("biz_name") or old_entry.get("name") or self._resolve_biz_name(biz),
-                            "getmsg_ready": getmsg_ready or old_entry.get("getmsg_ready", False),
-                        }
+                        if (old_entry.get("getmsg_ready") and not getmsg_ready
+                                and (time.time() - (old_entry.get("updated_at") or 0)) < BIZ_GETMSG_PROTECT_SECONDS):
+                            old_entry["name"] = resolved_biz_name
+                            logger.debug("biz [%s] 保留已验证的 getmsg key，忽略 %s 来源捕获",
+                                         resolved_biz_name, cred.get("biz_source"))
+                        else:
+                            biz_tokens[biz] = {
+                                "token": app_token,
+                                "appmsg_token": app_token,
+                                "key": cred.get("key") or old_entry.get("key", "") or target_acc.get("key", ""),
+                                "pass_ticket": cred.get("pass_ticket") or old_entry.get("pass_ticket", "") or target_acc.get("pass_ticket", ""),
+                                "poc_token": cred.get("poc_token") or old_entry.get("poc_token", "") or target_acc.get("poc_token", ""),
+                                "poc_sid": cred.get("poc_sid") or old_entry.get("poc_sid", "") or target_acc.get("poc_sid", ""),
+                                "wxtoken": cred.get("wxtoken") or old_entry.get("wxtoken", "") or target_acc.get("wxtoken", "777"),
+                                "updated_at": cred.get("save_time", time.time()),
+                                "name": resolved_biz_name,
+                                "getmsg_ready": getmsg_ready or old_entry.get("getmsg_ready", False),
+                            }
                 has_new_key = bool(cred.get("key"))
                 has_web_login = bool(is_explicit or (token and str(token).isdigit()))
 
@@ -467,15 +529,20 @@ class AccountPool:
             else:
                 # 全新账号，新增
                 biz_tokens_map = {}
-                if cred.get("biz"):
-                    app_token = cred.get("appmsg_token", token)
-                    biz_tokens_map[cred["biz"]] = {
-                        "token": app_token,
-                        "appmsg_token": app_token,
-                        "key": cred.get("key", ""),
-                        "pass_ticket": cred.get("pass_ticket", ""),
-                        "updated_at": cred.get("save_time", time.time()),
-                    }
+                biz = cred.get("biz")
+                if biz and self._is_favorite_biz(biz):
+                    resolved_biz_name = self._resolve_biz_name(biz) or cred.get("biz_name")
+                    if resolved_biz_name and resolved_biz_name not in ("未命名公众号", "公众号未命名", "未命名"):
+                        app_token = cred.get("appmsg_token", token)
+                        biz_tokens_map[biz] = {
+                            "token": app_token,
+                            "appmsg_token": app_token,
+                            "key": cred.get("key", ""),
+                            "pass_ticket": cred.get("pass_ticket", ""),
+                            "updated_at": cred.get("save_time", time.time()),
+                            "name": resolved_biz_name,
+                            "getmsg_ready": cred.get("biz_source") == "profile_ext",
+                        }
 
                 new_acc = {
                     "id": _gen_id(),
