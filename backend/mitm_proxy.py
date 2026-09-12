@@ -773,6 +773,35 @@ class ChannelsAddon:
                     print(f"Error handling call-log: {ex}")
                 self._local_json(flow, 200, b'{"code":0,"data":true}')
                 return
+            if path == "/__wx_channels_api/harvest-config":
+                # 返回自动定时采集配置，供注入脚本 automation.js 的定时调度器读取。
+                # 包成 {code:0,data:{...}} 以匹配前端 WXU.request 的约定。
+                try:
+                    from backend.config import get_settings
+                    s = get_settings()
+                    cfg = {
+                        "enabled": bool(s.get("channels_auto_harvest_enabled", False)),
+                        "interval_hours": s.get("channels_harvest_interval_hours", 6),
+                        "window_start_hour": s.get("channels_harvest_window_start_hour", 8),
+                        "window_end_hour": s.get("channels_harvest_window_end_hour", 24),
+                        "max_per_author": s.get("channels_harvest_max_per_author", 30),
+                        "session_cap": s.get("channels_harvest_session_cap", 0),
+                    }
+                    body = json.dumps(
+                        {"code": 0, "data": cfg}, ensure_ascii=False
+                    ).encode("utf-8")
+                    self._local_json(flow, 200, body)
+                except Exception as ex:
+                    print(f"Error handling harvest-config: {ex}")
+                    self._local_json(
+                        flow, 200, b'{"code":0,"data":{"enabled":false}}'
+                    )
+                return
+            if path == "/__wx_channels_api/process-uploads":
+                self._forward_to_flask(
+                    flow, "http://127.0.0.1:5200/api/channels/process-uploads"
+                )
+                return
             if path == "/__wx_channels_api/download":
                 self._forward_to_flask(
                     flow, "http://127.0.0.1:5200/api/channels/download"
@@ -1319,6 +1348,7 @@ def save_synced_feeds(username, feeds):
         if not any(item.get("id") == of_id for item in feeds_db[username]):
             feeds_db[username].append(of)
         
+    new_needs_upload = 0
     for feed in feeds:
         is_media = False
         if feed.get("type") == "media":
@@ -1401,8 +1431,33 @@ def save_synced_feeds(username, feeds):
         if not found:
             item["needs_upload"] = True
             feeds_db[username].append(item)
+            new_needs_upload += 1
             
     save_json(CHANNELS_FEEDS_FILE, feeds_db)
+
+    # 若有新作品落盘且开启了视频号自动上传，异步触发上传流程
+    if new_needs_upload > 0:
+        def _trigger_upload():
+            try:
+                from backend.config import get_settings
+                s = get_settings()
+                if s.get("channels_upload_enabled"):
+                    import urllib.request
+                    req = urllib.request.Request(
+                        "http://127.0.0.1:5200/api/channels/process-uploads",
+                        data=b"{}",
+                        headers={"Content-Type": "application/json"},
+                        method="POST"
+                    )
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        pass
+            except Exception:
+                try:
+                    from backend.channels_upload import process_pending_uploads
+                    process_pending_uploads()
+                except Exception as ex_inner:
+                    print(f"[Channels] Fallback process_pending_uploads error: {ex_inner}", flush=True)
+        threading.Thread(target=_trigger_upload, daemon=True).start()
 
 
 # ── Custom Injected Script Content (注入 JS 模板) ───────────────
