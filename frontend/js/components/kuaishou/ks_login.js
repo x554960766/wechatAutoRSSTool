@@ -4,13 +4,22 @@ const KsLoginComponent = {
     render() {
         return `
             <div class="page-header">
-                <h2 class="page-title">快手扫码登录</h2>
-                <p style="color: var(--text-secondary); margin-top: 8px;">扫码登录或手动配置 Cookie。单作品下载可匿名使用；用户主页批量下载需要登录。</p>
+                <h2 class="page-title">快手登录与凭证管理</h2>
+                <p style="color: var(--text-secondary); margin-top: 8px;">快手模块核心功能（单作品解析、作者档案解析、主页作品浏览与批量下载）<strong>均已支持免登录直接使用</strong>。</p>
             </div>
 
-            <div class="card login-card" style="max-width: 520px; margin: 40px auto; text-align: center;">
+            <div class="card login-card" style="max-width: 540px; margin: 30px auto; text-align: center;">
                 <div class="card-body">
-                    <div id="ks-login-status" style="margin: 30px 0; font-size: 1.1rem; color: var(--text-primary);">
+                    <div style="background: rgba(255, 149, 0, 0.1); border: 1px solid rgba(255, 149, 0, 0.3); border-radius: 8px; padding: 14px 16px; margin-bottom: 20px; text-align: left; font-size: 0.88rem; color: var(--text-secondary); line-height: 1.6;">
+                        <strong style="color: #ff9500;">💡 温馨提示：</strong>
+                        <ul style="margin: 6px 0 0 16px; padding: 0;">
+                            <li>快手 App 强制开启单设备登录互斥机制，<strong>主账号扫码会导致手机端被踢下线</strong>。</li>
+                            <li>当前系统内<strong>所有核心功能均免登录即可流畅使用</strong>，通常无需登录！</li>
+                            <li>如需登录，强烈建议使用无关紧要的<strong>快手小号</strong>进行扫码。</li>
+                        </ul>
+                    </div>
+
+                    <div id="ks-login-status" style="margin: 20px 0; font-size: 1.1rem; color: var(--text-primary);">
                         点击下方按钮开始登录流程
                     </div>
 
@@ -18,7 +27,7 @@ const KsLoginComponent = {
                         <p style="margin: 0 0 8px 0;">📱 <strong>登录步骤：</strong></p>
                         <ol style="text-align: left; margin: 0; padding-left: 20px;">
                             <li>在弹出的浏览器窗口中点击"登录"按钮</li>
-                            <li>使用快手 App 扫描二维码</li>
+                            <li>使用快手小号 App 扫描二维码</li>
                             <li>在手机上确认登录</li>
                             <li>登录成功后会自动保存 Cookie</li>
                         </ol>

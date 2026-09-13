@@ -181,7 +181,11 @@ const API = {
             cancel: () => API.post('/api/kuaishou/auth/cancel'),
             status: () => API.get('/api/kuaishou/auth/status', { showError: false })
         },
-        downloadSingle(url) { return API.post('/api/kuaishou/download-single', { url }); },
+        parseSingle(url) { return API.post('/api/kuaishou/parse-single', { url }); },
+        downloadSingle(payload) {
+            if (typeof payload === 'string') return API.post('/api/kuaishou/download-single', { url: payload });
+            return API.post('/api/kuaishou/download-single', { item: payload });
+        },
         userFeed(url, pcursor) { return API.post('/api/kuaishou/user-feed', { url, pcursor }); },
         downloadSelected(items) { return API.post('/api/kuaishou/download-selected', { items }); },
         downloadProfile(url, max_pages) { return API.post('/api/kuaishou/download-profile', { url, max_pages }); },
@@ -190,8 +194,15 @@ const API = {
         getHistory() { return API.get('/api/kuaishou/history'); },
         clearHistory() { return API.delete('/api/kuaishou/history'); },
         openFolder() { return API.post('/api/kuaishou/open-folder'); },
+        openAuthorFolder(author) { return API.post('/api/kuaishou/open-author-folder', { author }); },
         openFile(path) { return API.post('/api/kuaishou/open-file', { path }); },
         openParent(path) { return API.post('/api/kuaishou/open-parent', { path }); },
+        deleteHistoryItem(index, path) { return API.delete('/api/kuaishou/history/item', { body: { index, path } }); },
+        // 作者管理
+        listAccounts() { return API.get('/api/kuaishou/accounts'); },
+        addAccount(account) { return API.post('/api/kuaishou/accounts', account); },
+        removeAccount(userId) { return API.delete(`/api/kuaishou/accounts/${encodeURIComponent(userId)}`); },
+        parseAccount(url) { return API.post('/api/kuaishou/accounts/parse', { url }); },
     },
 
     // ── WeChat Channels API ──────────────────────────
