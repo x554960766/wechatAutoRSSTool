@@ -285,12 +285,21 @@ def install_system_cert(ca_cert_path):
         return check_cert_trusted()
     elif sys.platform == "win32":
         try:
-            # 使用 -f 强制覆盖，防止 certutil 弹窗询问“是否覆盖”导致后台挂起
-            _run_certutil(["-f", "-addstore", "-user", "root", str(ca_cert_path)], check=True)
-            return True
+            system_root = os.environ.get("SystemRoot", r"C:\Windows")
+            system32 = os.path.join(system_root, "System32")
+            certutil = os.path.join(system32, "certutil.exe")
+            env = os.environ.copy()
+            env["PATH"] = f"{system32}{os.pathsep}{system_root}"
+            # 向 CurrentUser/Root 导入自签名 CA 时，Windows 会弹出系统安全警告提示用户确认
+            # 此处不设隐藏窗口 flags，并设置合理超时，确保系统弹窗能正常展示给用户点击确认
+            subprocess.run(
+                [certutil, "-f", "-addstore", "-user", "root", str(ca_cert_path)],
+                capture_output=True, env=env, cwd=system32, timeout=20
+            )
+            return check_cert_trusted()
         except Exception as e:
             print(f"Failed to install Win cert: {e}")
-            return False
+            return check_cert_trusted()
     return False
 
 def uninstall_system_cert():
@@ -409,11 +418,9 @@ def _is_tcp_port_open(host: str, port: int, timeout: float = 0.25) -> bool:
         return False
 
 def detect_upstream_proxy() -> str | None:
-    """智能探测本机正在运行的 VPN / 科学上网代理服务（如 Clash, Surge, V2Ray, Clash Verge 等）。
-    探测优先级：
-    1. 检查 macOS/Windows 当前系统网络配置中原本设置的 HTTP/HTTPS/SOCKS 代理；
-    2. 主动快速探活常见的本地 VPN 默认监听端口 (7897, 7890, 10809, 10808, 1087, 20811, 6152 等)。
-    若探测到存活且非本服务的上游代理，返回格式如 'http://127.0.0.1:7897'；未运行 VPN 时返回 None。
+    """智能探测本机系统当前原本正在运行并启用的 VPN / Web 代理服务。
+    仅在用户系统网络配置中明确开启了代理服务时才返回上游代理进行链式转发。
+    避免盲目扫描本地端口导致国内微信请求被误转发给已断开或无效的上游代理造成页面无限转圈加载。
     """
     # 1. 检查 macOS 系统中原有的 Web 代理设置
     if sys.platform == "darwin":
@@ -439,7 +446,7 @@ def detect_upstream_proxy() -> str | None:
         except Exception:
             pass
 
-    # 2. 检查 Windows 注册表中原有的 ProxyServer
+    # 2. 检查 Windows 注册表中原有的 ProxyServer（仅在 ProxyEnable 为 1 时生效）
     elif sys.platform == "win32":
         try:
             import winreg
@@ -463,12 +470,6 @@ def detect_upstream_proxy() -> str | None:
                         return f"http://{srv}:{prt}"
         except Exception:
             pass
-
-    # 3. 常见本地 VPN 客户端默认端口的主动探活（如 Clash Verge 7897, Clash 7890, V2Ray 10809, Surge 6152 等）
-    common_vpn_ports = [7897, 7890, 10809, 10808, 1087, 20811, 6152]
-    for port in common_vpn_ports:
-        if port not in (5202, 5200) and _is_tcp_port_open("127.0.0.1", port):
-            return f"http://127.0.0.1:{port}"
 
     return None
 
@@ -772,6 +773,35 @@ class ChannelsAddon:
                 except Exception as ex:
                     print(f"Error handling call-log: {ex}")
                 self._local_json(flow, 200, b'{"code":0,"data":true}')
+                return
+            if path == "/__wx_channels_api/harvest-config":
+                # 返回自动定时采集配置，供注入脚本 automation.js 的定时调度器读取。
+                # 包成 {code:0,data:{...}} 以匹配前端 WXU.request 的约定。
+                try:
+                    from backend.config import get_settings
+                    s = get_settings()
+                    cfg = {
+                        "enabled": bool(s.get("channels_auto_harvest_enabled", False)),
+                        "interval_hours": s.get("channels_harvest_interval_hours", 6),
+                        "window_start_hour": s.get("channels_harvest_window_start_hour", 8),
+                        "window_end_hour": s.get("channels_harvest_window_end_hour", 24),
+                        "max_per_author": s.get("channels_harvest_max_per_author", 30),
+                        "session_cap": s.get("channels_harvest_session_cap", 0),
+                    }
+                    body = json.dumps(
+                        {"code": 0, "data": cfg}, ensure_ascii=False
+                    ).encode("utf-8")
+                    self._local_json(flow, 200, body)
+                except Exception as ex:
+                    print(f"Error handling harvest-config: {ex}")
+                    self._local_json(
+                        flow, 200, b'{"code":0,"data":{"enabled":false}}'
+                    )
+                return
+            if path == "/__wx_channels_api/process-uploads":
+                self._forward_to_flask(
+                    flow, "http://127.0.0.1:5200/api/channels/process-uploads"
+                )
                 return
             if path == "/__wx_channels_api/download":
                 self._forward_to_flask(
@@ -1319,6 +1349,7 @@ def save_synced_feeds(username, feeds):
         if not any(item.get("id") == of_id for item in feeds_db[username]):
             feeds_db[username].append(of)
         
+    new_needs_upload = 0
     for feed in feeds:
         is_media = False
         if feed.get("type") == "media":
@@ -1401,8 +1432,33 @@ def save_synced_feeds(username, feeds):
         if not found:
             item["needs_upload"] = True
             feeds_db[username].append(item)
+            new_needs_upload += 1
             
     save_json(CHANNELS_FEEDS_FILE, feeds_db)
+
+    # 若有新作品落盘且开启了视频号自动上传，异步触发上传流程
+    if new_needs_upload > 0:
+        def _trigger_upload():
+            try:
+                from backend.config import get_settings
+                s = get_settings()
+                if s.get("channels_upload_enabled"):
+                    import urllib.request
+                    req = urllib.request.Request(
+                        "http://127.0.0.1:5200/api/channels/process-uploads",
+                        data=b"{}",
+                        headers={"Content-Type": "application/json"},
+                        method="POST"
+                    )
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        pass
+            except Exception:
+                try:
+                    from backend.channels_upload import process_pending_uploads
+                    process_pending_uploads()
+                except Exception as ex_inner:
+                    print(f"[Channels] Fallback process_pending_uploads error: {ex_inner}", flush=True)
+        threading.Thread(target=_trigger_upload, daemon=True).start()
 
 
 # ── Custom Injected Script Content (注入 JS 模板) ───────────────

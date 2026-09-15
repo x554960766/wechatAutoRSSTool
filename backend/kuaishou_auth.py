@@ -2,6 +2,7 @@
 快手扫码登录模块 - 使用 Playwright 原生窗口
 参考 douyin_auth 的实现方式，登录后保存 .kuaishou.com 域 Cookie
 """
+import re
 import time
 import threading
 from flask import Blueprint, jsonify
@@ -33,7 +34,13 @@ def set_login_expired(expired: bool = True):
 
 
 # 登录标记 Cookie 名称（任一出现即视为已登录）
-LOGIN_MARKER_KEYS = {"passToken", "kuaishou.web.cp.api_st", "kuaishou.server.web_st"}
+LOGIN_MARKER_KEYS = {"passToken", "kuaishou.web.cp.api_st", "kuaishou.server.webday7_st", "kuaishou.server.web_st", "userId"}
+
+
+def _extract_user_id(cookie_str: str) -> str:
+    """从 Cookie 字符串中提取快手 userId"""
+    m = re.search(r"(?:^|;\s*)userId=([^;]+)", cookie_str)
+    return m.group(1).strip() if m else ""
 
 
 def _set_state(status: str, message: str = "", cookie: str = None):
@@ -111,7 +118,6 @@ def check_status():
         if _login_state["status"] == "scanning":
             return jsonify(_login_state)
 
-    # 否则，以配置中的 Cookie 为准
     settings = get_settings()
     cookie = settings.get("kuaishou_cookie", "")
     if cookie and any(k in cookie for k in LOGIN_MARKER_KEYS):
@@ -121,11 +127,12 @@ def check_status():
                 "message": "登录已失效，请重新扫码登录",
                 "cookie": cookie,
             })
+        uid = _extract_user_id(cookie)
         return jsonify({
             "status": "success",
-            "message": "登录有效",
+            "message": f"登录有效 (UID: {uid})" if uid else "登录有效",
             "cookie": cookie,
-            "account_info": {},
+            "account_info": {"user_id": uid} if uid else {},
         })
 
     with _login_lock:
@@ -166,6 +173,15 @@ def _do_login():
             page.goto("https://www.kuaishou.com/", timeout=60000)
 
             _set_state("scanning", "请在浏览器窗口中完成扫码登录")
+
+            # 尝试自动触发登录弹窗（点击页面左侧「立即登录」展示二维码）
+            try:
+                page.wait_for_timeout(2000)
+                btn = page.locator("text=/立即.*登录/").first
+                if btn.count() > 0:
+                    btn.click()
+            except Exception:
+                pass
 
             login_success = False
             timeout_seconds = 300
@@ -209,7 +225,8 @@ def _do_login():
                 save_settings(settings)
 
                 set_login_expired(False)
-                _set_state("success", "登录完成！Cookie 已保存", cookie=cookie_str)
+                uid = _extract_user_id(cookie_str)
+                _set_state("success", f"登录完成！(UID: {uid})" if uid else "登录完成！Cookie 已保存", cookie=cookie_str)
                 time.sleep(2)
             else:
                 if _login_state["status"] not in ["error", "cancelled"]:

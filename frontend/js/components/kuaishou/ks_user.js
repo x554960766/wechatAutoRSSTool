@@ -12,24 +12,30 @@ const KsUserPage = {
         return `
             <div class="page-header">
                 <h2 class="page-title">用户主页</h2>
-                <p class="page-description">粘贴快手用户主页链接，查看作品列表，多选或批量下载（需先扫码登录）</p>
+                <p class="page-description">粘贴快手用户主页链接或 App 分享口令，查看作品列表，多选或批量下载</p>
             </div>
 
             <div class="card" style="margin-bottom: var(--spacing-lg);">
                 <div class="form-group">
                     <label class="form-label">用户主页链接</label>
                     <div style="display: flex; gap: var(--spacing-md);">
-                        <input type="text" id="ks-user-url-input" class="form-input" placeholder="粘贴主页链接 (https://v.kuaishou.com/... 或 https://www.kuaishou.com/profile/...)" style="flex: 1;">
+                        <input type="text" id="ks-user-url-input" class="form-input" placeholder="粘贴主页链接或 App 分享完整口令 (如 https://v.kuaishou.com/...)" style="flex: 1;" onkeydown="if(event.key==='Enter') KsUserPage.loadList()">
                         <button class="btn btn-primary" onclick="KsUserPage.loadList()" id="ks-user-load-btn">加载列表</button>
                     </div>
                 </div>
             </div>
 
             <div class="card" id="ks-user-author-card" style="display: none; margin-bottom: var(--spacing-lg);">
-                <div style="display: flex; gap: var(--spacing-lg); align-items: center;">
+                <div style="display: flex; gap: var(--spacing-lg); align-items: center; flex-wrap: wrap;">
                     <img id="ks-user-avatar" src="" alt="头像" style="width: 72px; height: 72px; border-radius: 50%; object-fit: cover; border: 2px solid var(--border-color);">
-                    <div style="flex: 1;">
-                        <h2 id="ks-user-nickname" style="font-size: 1.3rem; margin: 0;"></h2>
+                    <div style="flex: 1; min-width: 200px;">
+                        <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 4px;">
+                            <h2 id="ks-user-nickname" style="font-size: 1.3rem; margin: 0;"></h2>
+                            <button id="ks-user-fav-btn" class="btn btn-secondary btn-sm" onclick="KsUserPage.toggleFavorite()" style="padding: 4px 10px; font-size: 0.8rem; border-radius: 20px;">
+                                ⭐ 收藏博主
+                            </button>
+                        </div>
+                        <p id="ks-user-subinfo" style="font-size: 0.85rem; color: var(--text-muted); margin: 0;"></p>
                     </div>
                     <button class="btn btn-primary" onclick="KsUserPage.downloadAll()" id="ks-user-all-btn">
                         <svg viewBox="0 0 24 24" fill="none" style="width: 16px; height: 16px; margin-right: 6px; display: inline-block; vertical-align: text-bottom;">
@@ -49,15 +55,35 @@ const KsUserPage = {
                 </div>
                 <div id="ks-user-grid" class="video-grid" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: var(--spacing-md);"></div>
                 <div id="ks-user-grid-empty" style="display: none; text-align: center; padding: var(--spacing-xl); color: var(--text-muted);">暂无作品</div>
-                <div id="ks-user-more-container" style="text-align: center; display: none; padding: var(--spacing-md) 0; margin-top: var(--spacing-lg);">
-                    <button id="ks-user-more-btn" class="btn btn-secondary" onclick="KsUserPage.loadMore()" style="min-width: 150px;">加载更多</button>
+                <div id="ks-user-more-container" style="text-align: center; padding: var(--spacing-md) 0; margin-top: var(--spacing-lg);">
+                    <div style="display: inline-flex; align-items: center; gap: 8px; padding: 10px 20px; background: var(--bg-secondary); border-radius: 20px; color: var(--text-muted); font-size: 0.85rem;">
+                        <span>✨ 已展示作者最新全部公开作品 (共 <span id="ks-user-count-display">0</span> 条)</span>
+                    </div>
+                    <p style="margin: 8px 0 0 0; font-size: 0.8rem; color: var(--text-muted); opacity: 0.7;">
+                        提示：快手官方对更早期历史作品强制开启风控验证，无需登录即可免除被踢风险并下载上述全部内容。如需其他作品，可直接在「解析链接」中粘贴下载。
+                    </p>
                 </div>
             </div>
         `;
     },
 
-    init() {},
-    onShow() {},
+    init(params) {
+        if (params && params.url) {
+            const input = document.getElementById('ks-user-url-input');
+            if (input) input.value = params.url;
+            this.loadList();
+        }
+    },
+
+    onShow(params) {
+        if (params && params.url) {
+            const input = document.getElementById('ks-user-url-input');
+            if (input && input.value !== params.url) {
+                input.value = params.url;
+                this.loadList();
+            }
+        }
+    },
 
     // ── 列表加载 ──────────────────────────────────────────
     async loadList() {
@@ -84,7 +110,7 @@ const KsUserPage = {
             this.pcursor = data.pcursor || '';
             this.hasMore = !!data.has_more;
 
-            this.renderAuthor();
+            await this.renderAuthor();
             this.renderGrid();
             this.updateHeaderActions();
 
@@ -113,8 +139,24 @@ const KsUserPage = {
             this.hasMore = !!data.has_more;
             this.appendCards(newItems, startIndex);
             this.updateMoreButton();
+            if (newItems.length > 0) {
+                Toast.show(`已加载 ${newItems.length} 个新作品，当前共 ${this.items.length} 个`, 'success');
+            } else {
+                Toast.show('已无更多作品', 'info');
+            }
         } catch (err) {
-            Toast.show(err.message, 'error');
+            const msg = err.message || '';
+            if (msg.includes('登录凭证') || msg.includes('扫码登录')) {
+                Modal.confirm(
+                    '需要扫码登录快手',
+                    '快手限制未登录用户只能浏览首批作品。若需分页「加载更多」或翻页浏览全部作品，请先扫码登录快手账号。<br><br>是否立即前往扫码登录页面？',
+                    () => {
+                        Router.navigate('ks_login');
+                    }
+                );
+            } else {
+                Toast.show(msg, 'error');
+            }
         } finally {
             this.loadingMore = false;
             if (moreBtn) { moreBtn.disabled = false; moreBtn.textContent = '加载更多'; }
@@ -122,15 +164,86 @@ const KsUserPage = {
     },
 
     // ── 渲染 ──────────────────────────────────────────────
-    renderAuthor() {
+    async renderAuthor() {
         const card = document.getElementById('ks-user-author-card');
-        if (!this.author || (!this.author.name && !this.author.avatar)) {
+        if (!this.author || (!this.author.name && !this.author.avatar && !this.author.nickname)) {
             card.style.display = 'none';
             return;
         }
         document.getElementById('ks-user-avatar').src = this.author.avatar || '';
-        document.getElementById('ks-user-nickname').textContent = this.author.name || '快手用户';
+        const name = this.author.name || this.author.nickname || '快手用户';
+        document.getElementById('ks-user-nickname').textContent = name;
+        
+        const subinfo = document.getElementById('ks-user-subinfo');
+        if (subinfo) {
+            const parts = [];
+            const kid = this.author.kwaiId || this.author.user_id;
+            if (kid) parts.push(`快手号: ${kid}`);
+            if (this.author.fans) parts.push(`粉丝: ${this.author.fans}`);
+            subinfo.textContent = parts.join(' | ');
+        }
+
         card.style.display = 'block';
+        await this.checkFavoriteStatus();
+    },
+
+    async checkFavoriteStatus() {
+        const favBtn = document.getElementById('ks-user-fav-btn');
+        if (!favBtn || !this.author) return;
+        try {
+            const res = await API.kuaishou.listAccounts();
+            const accounts = res.accounts || [];
+            const targetId = this.author.user_id || this.author.kwaiId || this.author.eid;
+            const targetName = this.author.name || this.author.nickname;
+            const isFav = accounts.some(a => 
+                (targetId && (a.user_id === targetId || a.kwaiId === targetId || a.eid === targetId)) ||
+                (targetName && (a.nickname === targetName || a.name === targetName))
+            );
+            if (isFav) {
+                favBtn.innerHTML = '★ 已收藏';
+                favBtn.className = 'btn btn-primary btn-sm';
+                favBtn.dataset.favorited = 'true';
+            } else {
+                favBtn.innerHTML = '⭐ 收藏博主';
+                favBtn.className = 'btn btn-secondary btn-sm';
+                favBtn.dataset.favorited = 'false';
+            }
+        } catch (e) {
+            console.warn('Check favorite status failed:', e);
+        }
+    },
+
+    async toggleFavorite() {
+        const favBtn = document.getElementById('ks-user-fav-btn');
+        if (!favBtn || !this.author) return;
+        const isFav = favBtn.dataset.favorited === 'true';
+        const targetId = this.author.user_id || this.author.kwaiId || this.author.eid || this.author.name;
+
+        if (isFav) {
+            try {
+                await API.kuaishou.removeAccount(targetId);
+                Toast.show('已取消收藏博主', 'success');
+                favBtn.innerHTML = '⭐ 收藏博主';
+                favBtn.className = 'btn btn-secondary btn-sm';
+                favBtn.dataset.favorited = 'false';
+            } catch (err) {
+                Toast.show('取消收藏失败: ' + err.message, 'error');
+            }
+        } else {
+            try {
+                const payload = {
+                    ...this.author,
+                    url: this.url
+                };
+                await API.kuaishou.addAccount(payload);
+                Toast.show('博主收藏成功', 'success');
+                favBtn.innerHTML = '★ 已收藏';
+                favBtn.className = 'btn btn-primary btn-sm';
+                favBtn.dataset.favorited = 'true';
+            } catch (err) {
+                Toast.show('收藏失败: ' + err.message, 'error');
+            }
+        }
     },
 
     renderGrid() {
@@ -177,7 +290,9 @@ const KsUserPage = {
 
     updateMoreButton() {
         const c = document.getElementById('ks-user-more-container');
-        if (c) c.style.display = this.hasMore ? 'block' : 'none';
+        const countDisp = document.getElementById('ks-user-count-display');
+        if (countDisp) countDisp.textContent = this.items.length;
+        if (c) c.style.display = this.items.length > 0 ? 'block' : 'none';
     },
 
     // ── 多选模式 ──────────────────────────────────────────
@@ -283,17 +398,10 @@ const KsUserPage = {
         }
     },
     async downloadAll() {
-        const btn = document.getElementById('ks-user-all-btn');
-        btn.disabled = true;
-        try {
-            const data = await API.kuaishou.downloadProfile(this.url, 0);
-            if (data.error) throw new Error(data.error);
-            Toast.show('批量下载全部已启动，正在跳转到进度页面...', 'success');
-            Router.navigate('ks_parse'); // 跳转到下载进度页面
-        } catch (err) {
-            Toast.show(err.message, 'error');
-        } finally {
-            btn.disabled = false;
+        if (!this.items || this.items.length === 0) {
+            Toast.show('当前列表暂无作品可下载', 'warning');
+            return;
         }
+        await this._startDownload(this.items);
     }
 };

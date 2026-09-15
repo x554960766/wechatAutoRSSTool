@@ -35,6 +35,13 @@ def main():
             "listen_port": args.port,
             "confdir": confdir,
             "ssl_insecure": True,
+            # 仅对视频号与公众号目标域名进行 TLS 拦截解密，其余流量由 TCP 层面直接透传，
+            # 彻底杜绝破坏微信 MMTLS 底层长连接与其它系统应用的 HTTPS 连接
+            "allow_hosts": [
+                r"channels\.weixin\.qq\.com",
+                r"mp\.weixin\.qq\.com",
+                r"res\.wx\.qq\.com",
+            ],
         }
         if args.upstream:
             opts_kwargs["mode"] = [f"upstream:{args.upstream}"]
