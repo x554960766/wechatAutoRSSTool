@@ -154,6 +154,7 @@ const ChannelsAccountsPage = {
         try {
             const res = await API.channels.fetchVideoProfile(shareUrl);
             const ai = res.data && res.data.authorInfo;
+            const fi = res.data && res.data.feedInfo;
 
             if (!ai || (!ai.username && !ai.nickname)) {
                 throw new Error('解析成功，但未能提取到作者信息（昵称与 ID 均为空）');
@@ -167,18 +168,17 @@ const ChannelsAccountsPage = {
             };
 
             // 如果有解析的视频本身，顺便把这条视频保存下来作为作者的初始视频
-            const fi_data = res.data.feedInfo;
-            if (fi_data && fi_data.videoUrl) {
+            if (fi && fi.videoUrl) {
                 // 异步存入该作者的作品库，不做阻碍
                 API.channels.addAuthorVideo(this.resolvedAuthor.username, {
-                    id: fi_data.id || String(Date.now()),
-                    description: fi_data.description || '',
-                    cover_url: fi_data.coverUrl || '',
-                    video_url: fi_data.videoUrl || '',
-                    video_url_h264: fi_data.h264VideoInfo?.videoUrl || '',
-                    video_url_h265: fi_data.h265VideoInfo?.videoUrl || '',
-                    createtime: fi_data.createtime ? String(fi_data.createtime) : String(Math.floor(Date.now() / 1000)),
-                    decode_key: fi_data.media?.decodeKey || fi_data.decodeKey || ''
+                    id: fi.id || String(Date.now()),
+                    description: fi.description || '',
+                    cover_url: fi.coverUrl || '',
+                    video_url: fi.videoUrl || '',
+                    video_url_h264: fi.h264VideoInfo?.videoUrl || '',
+                    video_url_h265: fi.h265VideoInfo?.videoUrl || '',
+                    createtime: fi.createtime ? String(fi.createtime) : String(Math.floor(Date.now() / 1000)),
+                    decode_key: fi.media?.decodeKey || fi.decodeKey || ''
                 }).catch(e => console.error('保存初始视频失败:', e));
             }
 

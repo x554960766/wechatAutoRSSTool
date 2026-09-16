@@ -13,12 +13,18 @@ import threading
 import subprocess
 from pathlib import Path
 from backend.config import DATA_DIR
+from backend.runtime import configure_runtime
 
-# Force unbuffered output for real-time background logging
+configure_runtime()
+
+# Force unbuffered output for real-time background logging and suppress BrokenPipeError
 import builtins
 def print(*args, **kwargs):
     kwargs.setdefault('flush', True)
-    builtins.print(*args, **kwargs)
+    try:
+        builtins.print(*args, **kwargs)
+    except (BrokenPipeError, OSError):
+        pass
 
 CA_KEY_PATH = DATA_DIR / "ca.key"
 CA_CERT_PATH = DATA_DIR / "ca.crt"
@@ -440,6 +446,20 @@ def detect_upstream_proxy() -> str | None:
                             if m_srv and m_prt:
                                 srv, prt = m_srv.group(1), int(m_prt.group(1))
                                 if prt not in (5202, 5200) and _is_tcp_port_open(srv, prt):
+                                    if opt == "-getsocksfirewallproxy":
+                                        # mitmproxy 的 upstream 模式仅支持 HTTP/HTTPS 代理协议。
+                                        # 检测该端口是否同时支持 HTTP 代理请求（如 Clash/v2ray/Shadowrocket 的 mixed-port），
+                                        # 若支持则以 http:// 格式供 mitmproxy 链式转发；若为纯 SOCKS5 端口则跳过以防抛出 Invalid server scheme 异常。
+                                        try:
+                                            with socket.create_connection((srv, prt), timeout=0.3) as s:
+                                                s.sendall(b"CONNECT 127.0.0.1:80 HTTP/1.1\r\nHost: 127.0.0.1:80\r\n\r\n")
+                                                s.settimeout(0.3)
+                                                resp = s.recv(16)
+                                                if resp.startswith(b"HTTP/"):
+                                                    return f"http://{srv}:{prt}"
+                                        except Exception:
+                                            pass
+                                        continue
                                     return f"http://{srv}:{prt}"
                     except Exception:
                         pass
@@ -503,7 +523,7 @@ def set_mac_proxy(enabled, host="127.0.0.1", port=5202):
                         if "Enabled: Yes" in s_out:
                             m_s = re.search(r"Server:\s*(\S+)", s_out)
                             m_p = re.search(r"Port:\s*(\d+)", s_out)
-                            if m_s and m_p and int(m_p.group(1)) not in (port, 5200):
+                            if m_p and m_p and int(m_p.group(1)) not in (port, 5200):
                                 info["secure"] = (m_s.group(1), m_p.group(1))
                     except Exception:
                         pass
@@ -513,6 +533,7 @@ def set_mac_proxy(enabled, host="127.0.0.1", port=5202):
                 try:
                     pac_out = subprocess.check_output(["networksetup", "-getautoproxyurl", service], timeout=2, text=True)
                     if "Enabled: Yes" in pac_out:
+                        _original_mac_proxy_backup.setdefault(service, {})["pac"] = True
                         subprocess.run(["networksetup", "-setautoproxystate", service, "off"], capture_output=True)
                 except Exception:
                     pass
@@ -534,6 +555,12 @@ def set_mac_proxy(enabled, host="127.0.0.1", port=5202):
                     subprocess.run(["networksetup", "-setsecurewebproxystate", service, "on"], check=True)
                 else:
                     subprocess.run(["networksetup", "-setsecurewebproxystate", service, "off"], check=True)
+
+                if orig.get("pac"):
+                    try:
+                        subprocess.run(["networksetup", "-setautoproxystate", service, "on"], capture_output=True)
+                    except Exception:
+                        pass
         except Exception as e:
             print(f"Error setting Mac proxy for {service} (enabled={enabled}): {e}")
 
@@ -2242,6 +2269,30 @@ def _restore_no_proxy():
     print("NO_PROXY restored to original.")
 
 
+def get_worker_python() -> str:
+    """获取运行 mitmproxy worker 的最佳 Python 解释器。
+    在打包模式下返回 sys.executable；
+    在源码模式下优先返回项目同级的 venv312 解释器，避免 macOS Homebrew Python
+    或外部 Python 启动子进程时因丢失虚拟环境路径导致找不到 mitmproxy 模块。
+    """
+    if getattr(sys, 'frozen', False):
+        return sys.executable
+    project_root = Path(__file__).resolve().parent.parent
+    if sys.platform == "win32":
+        venv_py = project_root / "venv312" / "Scripts" / "python.exe"
+    else:
+        venv_py = project_root / "venv312" / "bin" / "python"
+    if venv_py.exists():
+        return str(venv_py)
+    if sys.platform == "win32":
+        prefix_py = Path(sys.prefix) / "Scripts" / "python.exe"
+    else:
+        prefix_py = Path(sys.prefix) / "bin" / "python"
+    if prefix_py.exists():
+        return str(prefix_py)
+    return sys.executable
+
+
 # ── Proxy Service Manager (代理服务单例管理器) ─────────────────────
 
 class ProxyManager:
@@ -2341,22 +2392,24 @@ class ProxyManager:
                       f"已启用链式上游转发 (Upstream Chaining)，实现 VPN 与同步助手无缝并存！")
 
             # 3. 以完全隔离的独立子进程启动 mitmproxy worker
+            worker_py = get_worker_python()
             if getattr(sys, 'frozen', False):
                 cmd = [
-                    sys.executable,
+                    worker_py,
                     "--proxy-worker",
                     "--port", str(self.port),
                     "--confdir", str(confdir),
                 ]
             else:
                 cmd = [
-                    sys.executable,
+                    worker_py,
                     "-m", "backend.proxy_worker",
                     "--port", str(self.port),
                     "--confdir", str(confdir),
                 ]
             if upstream_proxy:
                 cmd.extend(["--upstream", upstream_proxy])
+
             
             popen_kwargs = {
                 "stdout": subprocess.PIPE,

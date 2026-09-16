@@ -54,11 +54,61 @@ def app_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+import signal
+
+
+class SafeStream:
+    """Wraps stdout/stderr to prevent crash on [Errno 32] Broken pipe when running detached."""
+
+    def __init__(self, target):
+        self._target = target
+
+    def write(self, s):
+        try:
+            if self._target:
+                return self._target.write(s)
+        except (BrokenPipeError, OSError):
+            pass
+
+    def flush(self):
+        try:
+            if self._target:
+                return self._target.flush()
+        except (BrokenPipeError, OSError):
+            pass
+
+    def isatty(self):
+        try:
+            return self._target.isatty() if self._target else False
+        except Exception:
+            return False
+
+    def fileno(self):
+        try:
+            return self._target.fileno()
+        except Exception:
+            raise OSError(32, "Broken pipe")
+
+    def __getattr__(self, name):
+        return getattr(self._target, name)
+
+
 def log_file() -> Path:
     return app_dir() / "wechat_mp_tools.log"
 
 
 def configure_runtime():
+    if hasattr(signal, "SIGPIPE"):
+        try:
+            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+        except Exception:
+            pass
+
+    if sys.stdout is not None and not isinstance(sys.stdout, SafeStream):
+        sys.stdout = SafeStream(sys.stdout)
+    if sys.stderr is not None and not isinstance(sys.stderr, SafeStream):
+        sys.stderr = SafeStream(sys.stderr)
+
     bundled_browsers = resource_dir() / "ms-playwright"
     if bundled_browsers.exists():
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(bundled_browsers)
