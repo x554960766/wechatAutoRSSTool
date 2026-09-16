@@ -14,6 +14,9 @@ project_root = Path(__file__).resolve().parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
+from backend.runtime import configure_runtime
+configure_runtime()
+
 from mitmproxy.tools.dump import DumpMaster
 from mitmproxy import options
 from backend.mitm_proxy import ChannelsAddon, prepare_mitm_confdir
@@ -44,7 +47,7 @@ def main():
             ],
         }
         if args.upstream:
-            opts_kwargs["mode"] = [f"upstream:{args.upstream}"]
+            opts_kwargs["mode"] = [f"upstream:{args.upstream}@{args.port}"]
         else:
             opts_kwargs["mode"] = [f"regular@{args.port}"]
 
