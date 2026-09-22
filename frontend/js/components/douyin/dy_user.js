@@ -22,6 +22,43 @@ const DyUserPage = {
                     <p style="margin-top: var(--spacing-md); color: var(--text-muted);">加载中...</p>
                 </div>
 
+                <!-- 创作者选择列表区域（参考微信视频号作者主页收藏设计，精简小巧） -->
+                <div id="dy-user-selector-section" style="display: none;">
+                    <div class="card animate-fade-in" style="margin-bottom: var(--spacing-lg);">
+                        <div class="card-header" style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); padding-bottom: var(--spacing-md); margin-bottom: var(--spacing-md);">
+                            <div style="display: flex; align-items: center; gap: 10px;">
+                                <h3 class="card-title" style="margin: 0; display: flex; align-items: center; gap: 8px; font-size: 1.05rem; color: var(--text-primary);">
+                                    👥 已收藏作者
+                                </h3>
+                                <span id="dy-user-fav-count" class="badge" style="background: rgba(254, 44, 85, 0.1); color: var(--primary); border: 1px solid rgba(254, 44, 85, 0.2); font-size: 0.75rem; padding: 2px 8px; border-radius: 12px; font-weight: 500;">已收藏 0 位</span>
+                            </div>
+                            <button class="btn btn-secondary btn-sm" onclick="Router.navigate('dy_search')" style="font-size: 0.85rem; padding: 6px 12px; font-weight: 500; display: flex; align-items: center; gap: 6px;">
+                                ➕ 搜索/添加新作者
+                            </button>
+                        </div>
+
+                        <!-- 创作者网格 -->
+                        <div id="dy-user-favorites-grid" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: var(--spacing-md);">
+                            <!-- 动态加载 -->
+                        </div>
+
+                        <!-- 暂无收藏空状态 -->
+                        <div id="dy-user-favorites-empty" class="empty-state" style="display: none; padding: 48px 24px; text-align: center;">
+                            <div class="empty-state-icon" style="color: var(--text-muted); margin-bottom: 16px;">
+                                <svg viewBox="0 0 24 24" fill="none" width="52" height="52" stroke="currentColor" stroke-width="1.5">
+                                    <path d="M17 21V19C17 16.79 15.21 15 13 15H5C2.79 15 1 16.79 1 19V21"/>
+                                    <circle cx="9" cy="7" r="4"/>
+                                </svg>
+                            </div>
+                            <div class="empty-state-title" style="font-size: 1.05rem; font-weight: 600; color: var(--text-primary);">暂无收藏的作者</div>
+                            <div class="empty-state-desc" style="color: var(--text-muted); font-size: 0.85rem; margin-top: 6px;">在“搜索用户”中找到喜欢的创作者并添加收藏，即可在此快速访问主页。</div>
+                            <button class="btn btn-primary" onclick="Router.navigate('dy_search')" style="margin-top: 16px; padding: 8px 18px; font-size: 0.88rem;">
+                                🔍 前往搜索用户
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
                 <div id="dy-user-content" style="display: none;">
                     <!-- 用户信息卡片 -->
                     <div class="card" style="margin-bottom: var(--spacing-lg);">
@@ -44,14 +81,23 @@ const DyUserPage = {
                                         <span style="color: var(--text-muted); margin-left: 4px;">获赞</span>
                                     </div>
                                 </div>
-                                <button class="btn btn-primary" onclick="DyUserPage.downloadAll()" id="dy-user-download-btn">
-                                    <svg viewBox="0 0 24 24" fill="none" style="width: 16px; height: 16px; margin-right: 6px;">
-                                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                                        <polyline points="7 10 12 15 17 10" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                                        <line x1="12" y1="15" x2="12" y2="3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                                    </svg>
-                                    批量下载全部作品
-                                </button>
+                                <div style="display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
+                                    <button class="btn btn-primary" onclick="DyUserPage.downloadAll()" id="dy-user-download-btn">
+                                        <svg viewBox="0 0 24 24" fill="none" style="width: 16px; height: 16px; margin-right: 6px;">
+                                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                            <polyline points="7 10 12 15 17 10" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                            <line x1="12" y1="15" x2="12" y2="3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                        </svg>
+                                        批量下载全部作品
+                                    </button>
+                                    <button class="btn btn-secondary" onclick="DyUserPage.toggleFavoriteAuthor()" id="dy-user-fav-btn" style="display: flex; align-items: center; gap: 6px; padding: 0 16px; height: 38px;">
+                                        <span id="dy-user-fav-star">⭐</span>
+                                        <span id="dy-user-fav-text">收藏作者</span>
+                                    </button>
+                                    <button class="btn btn-secondary" onclick="DyUserPage.backToFavorites()" style="display: flex; align-items: center; gap: 6px; padding: 0 14px; height: 38px;" title="查看已收藏作者列表">
+                                        <span>👥 已收藏作者</span>
+                                    </button>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -73,23 +119,11 @@ const DyUserPage = {
                         </div>
                     </div>
                 </div>
-
-                <div id="dy-user-empty" style="display: block; text-align: center; padding: var(--spacing-2xl);">
-                    <div style="width: 64px; height: 64px; margin: 0 auto var(--spacing-md); background: rgba(102, 126, 234, 0.1); border-radius: 20px; display: flex; align-items: center; justify-content: center;">
-                        <svg viewBox="0 0 24 24" fill="none" style="width: 32px; height: 32px; color: var(--primary);">
-                            <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                            <circle cx="12" cy="7" r="4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                        </svg>
-                    </div>
-                    <p style="font-size: 1.1rem; margin-bottom: 8px;">请先搜索用户</p>
-                    <p style="color: var(--text-muted);">通过搜索功能找到用户后查看主页</p>
-                </div>
             </div>
         `;
     },
 
     async init() {
-        // 检查是否有传入的 sec_uid
         const hash = window.location.hash;
         const queryString = hash.includes('?') ? hash.split('?')[1] : '';
         const urlParams = new URLSearchParams(queryString || window.location.search);
@@ -97,12 +131,36 @@ const DyUserPage = {
 
         this.isSelectMode = false;
 
+        if (!this._favListenerAdded) {
+            this._favListenerAdded = true;
+            window.addEventListener('dy-fav-changed', (e) => {
+                if (this.secUid && (!e.detail || !e.detail.secUid || e.detail.secUid === this.secUid)) {
+                    this.updateFavoriteAuthorButton();
+                }
+                this.renderFavoriteAuthors();
+            });
+        }
+
         if (secUid) {
             await this.loadUser(secUid);
+        } else {
+            this.showFavoritesSelector();
         }
     },
 
     onShow() {
+        const hash = window.location.hash;
+        const queryString = hash.includes('?') ? hash.split('?')[1] : '';
+        const urlParams = new URLSearchParams(queryString || window.location.search);
+        const secUid = urlParams.get('sec_uid');
+
+        if (secUid && secUid !== this.secUid) {
+            this.loadUser(secUid);
+        } else if (!secUid && !this.secUid) {
+            this.showFavoritesSelector();
+        } else if (this.secUid) {
+            this.updateFavoriteAuthorButton();
+        }
         if (this.user) {
             fetch('/api/douyin/progress')
                 .then(res => res.json())
@@ -121,6 +179,10 @@ const DyUserPage = {
         this.hasMore = false;
         this.videos = [];
         this.isSelectMode = false;
+        this.currentTab = 'post';
+
+        const selector = document.getElementById('dy-user-selector-section');
+        if (selector) selector.style.display = 'none';
         this.currentTab = 'post';
 
         // Reset tab UI classes
@@ -239,8 +301,10 @@ const DyUserPage = {
     },
 
     renderUser() {
-        document.getElementById('dy-user-empty').style.display = 'none';
-        document.getElementById('dy-user-content').style.display = 'block';
+        const selector = document.getElementById('dy-user-selector-section');
+        if (selector) selector.style.display = 'none';
+        const content = document.getElementById('dy-user-content');
+        if (content) content.style.display = 'block';
 
         const avatar = this.user.avatar_thumb?.url_list?.[0] || this.user.avatar_larger?.url_list?.[0] || '';
         const nickname = this.user.nickname || '未知用户';
@@ -288,6 +352,8 @@ const DyUserPage = {
                 this.updateDownloadAllButton(data.status);
             })
             .catch(() => {});
+
+        this.updateFavoriteAuthorButton();
     },
 
     renderVideos() {
@@ -368,12 +434,17 @@ const DyUserPage = {
         const awemeId = video.aweme_id;
         const likes = this.formatNumber(video.statistics?.digg_count || 0);
         const comments = this.formatNumber(video.statistics?.comment_count || 0);
+        const isReplay = Boolean(video.is_live_replay || video.aweme_type === 101);
+        const badgeHtml = isReplay 
+            ? `<div style="position: absolute; top: 8px; left: ${this.isSelectMode ? '34px' : '8px'}; background: #6366f1; color: white; padding: 2px 6px; border-radius: 4px; font-size: 0.72rem; z-index: 3; font-weight: 600;">直播回放</div>` 
+            : '';
 
         return `
             <div class="video-card" style="border-radius: 12px; overflow: hidden; background: var(--bg-secondary); transition: transform 0.3s, box-shadow 0.3s; cursor: pointer;" onmouseenter="this.style.transform='translateY(-4px)'; this.style.boxShadow='0 8px 24px rgba(0,0,0,0.15)';" onmouseleave="this.style.transform=''; this.style.boxShadow='';" onclick="DyUserPage.handleCardClick(event, '${awemeId}')">
                 <div style="position: relative; padding-top: 56.25%; background: var(--bg-body);">
                     <img src="${cover}" alt="${title}" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover;">
                     <input type="checkbox" id="dy-user-check-${awemeId}" class="dy-user-checkbox" style="position: absolute; top: 8px; left: 8px; width: 18px; height: 18px; cursor: pointer; z-index: 5; display: ${this.isSelectMode ? 'block' : 'none'};" onclick="event.stopPropagation(); DyUserPage.updateDownloadButton();" />
+                    ${badgeHtml}
                     <div style="position: absolute; top: 8px; right: 8px; background: rgba(0,0,0,0.6); color: white; padding: 4px 8px; border-radius: 4px; font-size: 0.75rem; z-index: 2;">
                         ${this.formatDuration(video.video?.duration || 0)}
                     </div>
@@ -384,11 +455,22 @@ const DyUserPage = {
                         <span>❤️ ${likes}</span>
                         <span>💬 ${comments}</span>
                     </div>
-                    <button class="btn btn-primary btn-sm" onclick="DyUserPage.downloadVideo('${awemeId}')" style="width: 100%;">下载视频</button>
+                    <div style="display: flex; gap: 8px; margin-top: 8px;">
+                        <button class="btn btn-primary btn-sm" onclick="event.stopPropagation(); DyUserPage.downloadVideo('${awemeId}')" style="flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 6px;">
+                            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink: 0;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                            <span>${isReplay ? '下载回放' : '下载视频'}</span>
+                        </button>
+                        <button class="btn btn-sm" onclick="event.stopPropagation(); DyUserPage.downloadComments('${awemeId}')" title="下载并导出该视频全部评论" style="padding: 0 12px; height: 32px; font-size: 0.82rem; font-weight: 600; white-space: nowrap; display: inline-flex; align-items: center; gap: 5px; background: rgba(102, 126, 234, 0.15); color: #8ea5ff; border: 1px solid rgba(102, 126, 234, 0.4); border-radius: var(--radius-md); transition: all 0.2s;" onmouseenter="this.style.background='rgba(102, 126, 234, 0.28)'; this.style.borderColor='rgba(102, 126, 234, 0.7)';" onmouseleave="this.style.background='rgba(102, 126, 234, 0.15)'; this.style.borderColor='rgba(102, 126, 234, 0.4)';">
+                            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink: 0;"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                            <span>下载评论</span>
+                        </button>
+                    </div>
                 </div>
             </div>
         `;
     },
+
+
 
     async downloadVideo(awemeId) {
         const videoObj = this.videos.find(v => v.aweme_id === awemeId);
@@ -654,23 +736,53 @@ const DyUserPage = {
     },
 
     showLoading() {
-        document.getElementById('dy-user-loading').style.display = 'block';
-        document.getElementById('dy-user-content').style.display = 'none';
-        document.getElementById('dy-user-empty').style.display = 'none';
+        const loading = document.getElementById('dy-user-loading');
+        const content = document.getElementById('dy-user-content');
+        const selector = document.getElementById('dy-user-selector-section');
+        if (loading) loading.style.display = 'block';
+        if (content) content.style.display = 'none';
+        if (selector) selector.style.display = 'none';
     },
 
     hideLoading() {
-        document.getElementById('dy-user-loading').style.display = 'none';
+        const loading = document.getElementById('dy-user-loading');
+        if (loading) loading.style.display = 'none';
     },
 
     showEmpty() {
-        document.getElementById('dy-user-empty').style.display = 'block';
-        document.getElementById('dy-user-content').style.display = 'none';
+        this.showFavoritesSelector();
+    },
+
+    showFavoritesSelector() {
+        this.secUid = '';
+        this.user = null;
+        this.videos = [];
+        const content = document.getElementById('dy-user-content');
+        const loading = document.getElementById('dy-user-loading');
+        const selector = document.getElementById('dy-user-selector-section');
+        if (content) content.style.display = 'none';
+        if (loading) loading.style.display = 'none';
+        if (selector) selector.style.display = 'block';
+        this.renderFavoriteAuthors();
+    },
+
+    backToFavorites() {
+        window.location.hash = '#dy_user';
+        this.showFavoritesSelector();
+    },
+
+    selectAuthor(secUid) {
+        window.location.hash = `#dy_user?sec_uid=${encodeURIComponent(secUid)}`;
+        this.loadUser(secUid);
     },
 
     formatNumber(num) {
+        if (!num || isNaN(num)) return '0';
+        num = Number(num);
         if (num >= 10000) {
             return (num / 10000).toFixed(1) + 'w';
+        } else if (num >= 1000) {
+            return (num / 1000).toFixed(1) + 'k';
         }
         return num.toString();
     },
@@ -686,6 +798,183 @@ const DyUserPage = {
             return `${hrs}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
         }
         return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    },
+
+    // ── 评论下载 ──────────────────────────────────────────────
+    async downloadComments(awemeId) {
+        const videoObj = this.videos.find(v => v.aweme_id === awemeId);
+        const title = videoObj ? (videoObj.desc || videoObj.item_title || `aweme_${awemeId}`) : `aweme_${awemeId}`;
+        const sourceName = this.user ? `${this.user.nickname}的作品` : '';
+        const nickname = this.user ? this.user.nickname : '';
+
+        DyCommentDialog.open({
+            title: title,
+            onConfirm: async ({ max_comments, include_replies }) => {
+                try {
+                    Toast.show('正在抓取并导出评论...', 'info');
+                    const res = await fetch('/api/douyin/comments/download', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({
+                            aweme_id: awemeId,
+                            title: title,
+                            nickname: nickname,
+                            source_name: sourceName,
+                            max_comments: max_comments,
+                            include_replies: include_replies
+                        })
+                    });
+                    const data = await res.json();
+                    if (data.error) throw new Error(data.error);
+                    Toast.show(`✅ 成功抓取 ${data.count} 条评论并保存在作者目录下！`, 'success');
+                } catch (err) {
+                    Toast.show(`导出评论失败: ${err.message}`, 'error');
+                }
+            }
+        });
+    },
+
+    // ── 作者收藏管理 ──────────────────────────────────────────
+    esc(str) {
+        if (!str) return '';
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    },
+
+    getFavoriteAuthors() {
+        try {
+            return JSON.parse(localStorage.getItem('dy_favorite_authors') || '[]');
+        } catch (e) {
+            return [];
+        }
+    },
+
+    isFavoriteAuthor(secUid) {
+        if (!secUid) return false;
+        const list = this.getFavoriteAuthors();
+        return list.some(item => item.sec_uid === secUid);
+    },
+
+    toggleFavoriteAuthor() {
+        if (!this.user || !this.secUid) return;
+        const list = this.getFavoriteAuthors();
+        const existingIdx = list.findIndex(item => item.sec_uid === this.secUid);
+        let isFav = false;
+        if (existingIdx >= 0) {
+            list.splice(existingIdx, 1);
+            Toast.show('已取消收藏该作者', 'info');
+            isFav = false;
+        } else {
+            const avatar = this.user.avatar_thumb?.url_list?.[0] || this.user.avatar_larger?.url_list?.[0] || '';
+            list.unshift({
+                sec_uid: this.secUid,
+                nickname: this.user.nickname || '未知作者',
+                avatar: avatar,
+                signature: this.user.signature || '',
+                unique_id: this.user.unique_id || this.user.short_id || '',
+                time: Date.now()
+            });
+            Toast.show('⭐ 已收藏该作者！可在主页作者列表中快速访问', 'success');
+            isFav = true;
+        }
+        try {
+            localStorage.setItem('dy_favorite_authors', JSON.stringify(list));
+        } catch (e) {}
+        this.updateFavoriteAuthorButton();
+        this.renderFavoriteAuthors();
+        window.dispatchEvent(new CustomEvent('dy-fav-changed', { detail: { secUid: this.secUid, isFav } }));
+    },
+
+    renderFavoriteAuthors() {
+        const grid = document.getElementById('dy-user-favorites-grid');
+        const empty = document.getElementById('dy-user-favorites-empty');
+        const countEl = document.getElementById('dy-user-fav-count');
+        if (!grid || !empty) return;
+
+        const list = this.getFavoriteAuthors();
+        if (countEl) countEl.textContent = `已收藏 ${list.length} 位`;
+
+        if (list.length === 0) {
+            grid.style.display = 'none';
+            empty.style.display = 'block';
+            return;
+        }
+
+        empty.style.display = 'none';
+        grid.style.display = 'grid';
+
+        const defaultAvatar = "data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23888'><path d='M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z'/></svg>";
+
+        grid.innerHTML = list.map(author => {
+            const avatar = author.avatar || defaultAvatar;
+            const name = author.nickname || '未知创作者';
+            const secUid = author.sec_uid || '';
+            const uniqueId = author.unique_id || '';
+            const escSecUid = this.esc(secUid);
+            const escName = this.esc(name);
+            const escAvatar = this.esc(avatar);
+            const escUniqueId = this.esc(uniqueId);
+
+            return `
+                <div class="favorite-card card" 
+                     style="display: flex; gap: 10px; align-items: center; padding: 12px 14px; cursor: pointer; transition: transform 0.2s, border-color 0.2s, box-shadow 0.2s; border-radius: 10px; border: 1.5px solid var(--border-color); background: var(--bg-card); position: relative;"
+                     onmouseenter="this.style.transform='translateY(-3px)'; this.style.borderColor='var(--primary)'; this.style.boxShadow='var(--shadow-md)';"
+                     onmouseleave="this.style.transform=''; this.style.borderColor='var(--border-color)'; this.style.boxShadow='';"
+                     onclick="DyUserPage.selectAuthor('${escSecUid}')">
+                    <img src="${escAvatar}" alt="${escName}" 
+                         style="width: 44px; height: 44px; border-radius: 50%; object-fit: cover; border: 1.5px solid rgba(0,0,0,0.08); background: var(--bg-secondary); flex-shrink: 0;" 
+                         onerror="this.src='${defaultAvatar}'">
+                    <div style="flex: 1; min-width: 0; overflow: hidden;">
+                        <h4 style="margin: 0; font-size: 0.96rem; font-weight: 600; color: var(--text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.3;" title="${escName}">${escName}</h4>
+                        <p style="margin: 4px 0 0 0; font-family: monospace; font-size: 0.75rem; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${escUniqueId}">${escUniqueId ? 'ID: ' + escUniqueId : '点击进入主页'}</p>
+                    </div>
+                    <button onclick="event.stopPropagation(); DyUserPage.removeFavoriteAuthor('${escSecUid}')" 
+                            title="取消收藏" 
+                            style="width: 22px; height: 22px; border-radius: 50%; border: 1px solid var(--border-color); background: transparent; color: var(--text-muted); display: flex; align-items: center; justify-content: center; font-size: 12px; cursor: pointer; flex-shrink: 0; transition: all 0.2s; padding: 0;" 
+                            onmouseenter="this.style.background='rgba(239, 68, 68, 0.12)'; this.style.color='#ef4444'; this.style.borderColor='rgba(239, 68, 68, 0.3)';" 
+                            onmouseleave="this.style.background='transparent'; this.style.color='var(--text-muted)'; this.style.borderColor='var(--border-color)';">✕</button>
+                </div>
+            `;
+        }).join('');
+    },
+
+    removeFavoriteAuthor(secUid) {
+        let list = this.getFavoriteAuthors().filter(item => item.sec_uid !== secUid);
+        try {
+            localStorage.setItem('dy_favorite_authors', JSON.stringify(list));
+        } catch (e) {}
+        this.renderFavoriteAuthors();
+        if (this.secUid === secUid) {
+            this.updateFavoriteAuthorButton();
+        }
+        window.dispatchEvent(new CustomEvent('dy-fav-changed', { detail: { secUid, isFav: false } }));
+        Toast.show('已移除该收藏作者', 'info');
+    },
+
+    updateFavoriteAuthorButton() {
+        const starEl = document.getElementById('dy-user-fav-star');
+        const textEl = document.getElementById('dy-user-fav-text');
+        const btn = document.getElementById('dy-user-fav-btn');
+        if (!btn || !starEl || !textEl) return;
+
+        const isFav = this.isFavoriteAuthor(this.secUid);
+        if (isFav) {
+            starEl.textContent = '★';
+            textEl.textContent = '已收藏';
+            btn.style.color = '#f59e0b';
+            btn.style.borderColor = 'rgba(245, 158, 11, 0.4)';
+            btn.style.background = 'rgba(245, 158, 11, 0.08)';
+        } else {
+            starEl.textContent = '⭐';
+            textEl.textContent = '收藏作者';
+            btn.style.color = '';
+            btn.style.borderColor = '';
+            btn.style.background = '';
+        }
     },
 
     destroy() {

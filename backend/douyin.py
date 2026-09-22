@@ -131,19 +131,28 @@ def ensure_douyin_dirs():
     DOUYIN_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ── 工具函数 ──────────────────────────────────────────────
+from backend.douyin_mstoken import get_real_ms_token
 
-def clean_filename(filename: str) -> str:
-    """清理文件名，移除不支持的字符"""
-    filename = re.sub(r'[\\/:*?"<>|\n\r\t]', "", filename)
-    filename = filename.strip().replace(" ", "_")
-    return filename[:80] if filename else "untitled"
+# Windows 禁用字符与控制字符; POSIX 只禁 / 与 NUL
+_ILLEGAL_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_EDGE_STRIP_CHARS = ". "
+
+
+def clean_filename(filename: str, max_length: int = 80) -> str:
+    """清理文件名：只处理底层真正不能落盘的非法字符与控制字符，保留 #话题、连续空格等合法内容"""
+    if not filename:
+        return "untitled"
+    filename = filename.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    filename = _ILLEGAL_FILENAME_CHARS_RE.sub("_", filename)
+    filename = filename.strip(_EDGE_STRIP_CHARS)
+    if len(filename) > max_length:
+        filename = filename[:max_length].rstrip(_EDGE_STRIP_CHARS)
+    return filename if filename else "untitled"
 
 
 def generate_ms_token(size: int = 107) -> str:
-    """生成随机 msToken"""
-    chars = string.ascii_letters + string.digits
-    return ''.join(random.choice(chars) for _ in range(size))
+    """生成有效 msToken（优先请求真实 Token 并自动降级）"""
+    return get_real_ms_token(USER_AGENT)
 
 
 def generate_verify_fp() -> str:
@@ -153,18 +162,18 @@ def generate_verify_fp() -> str:
     return f"verify_0{random_str}"
 
 
-def add_history_item(title: str, item_type: str, file_path: str, size_bytes: int):
+def add_history_item(title: str, item_type: str, file_path: str, size_bytes: int, source: str = ""):
     """保存下载记录到历史记录文件"""
-    # 提取来源（下载目录下的第一级子目录名）
-    source = ""
+    # 提取来源（优先使用传入的 source，否则从下载目录下的第一级子目录名提取）
     path_str = str(file_path)
-    marker = "douyin_downloads/"
-    idx = path_str.find(marker)
-    if idx >= 0:
-        rest = path_str[idx + len(marker):]
-        parts = rest.split("/")
-        if parts:
-            source = parts[0]
+    if not source:
+        marker = "douyin_downloads/"
+        idx = path_str.find(marker)
+        if idx >= 0:
+            rest = path_str[idx + len(marker):]
+            parts = rest.split("/")
+            if parts:
+                source = parts[0]
 
     history = load_json(HISTORY_FILE, [])
     history.insert(0, {
@@ -1168,25 +1177,75 @@ class DouyinClient:
 
         return aweme_list, next_cursor, has_more
 
-    def get_user_mixes(self, sec_uid: str, cursor: int = 0, count: int = 20) -> tuple:
-        """获取用户的合集列表，返回 (mix_infos, next_cursor, has_more)"""
-        data = self.api_get("https://www.douyin.com/aweme/v1/web/mix/list/", {
+    def get_user_series(self, sec_uid: str, cursor: int = 0, count: int = 20) -> tuple:
+        """获取用户的短剧/系列合集列表 (series/list?read_new_mix=true)"""
+        params = {
             "sec_user_id": sec_uid,
             "cursor": str(cursor),
             "count": str(count),
-        }, skip_sign=False)
+            "read_new_mix": "true",
+            "req_from": "channel_pc_web",
+        }
+        try:
+            data = self.api_get("https://www.douyin.com/aweme/v1/web/series/list/", params, skip_sign=False)
+            series_infos = data.get("series_infos") or []
+            has_more = data.get("has_more", 0)
+            if isinstance(has_more, bool):
+                has_more = has_more
+            else:
+                has_more = int(has_more) == 1
+            next_cursor = data.get("cursor", 0)
+            # 整形成 mix_infos 结构以兼容下游
+            mix_like_items = []
+            for entry in series_infos:
+                if isinstance(entry, dict) and entry.get("series_id"):
+                    mix_like_items.append({
+                        "mix_id": str(entry.get("series_id") or ""),
+                        "mix_name": entry.get("series_name") or "",
+                        "statis": entry.get("stats") or {},
+                        "author": entry.get("author") or {},
+                        "cover_url": entry.get("cover_url"),
+                    })
+            return mix_like_items, next_cursor, has_more
+        except Exception as e:
+            _add_log(f"⚠️ 获取 series 合集列表分支异常: {e}")
+            return [], 0, False
 
-        if data.get("status_code") != 0:
-            msg = data.get("status_msg", "未知错误")
-            raise Exception(f"获取合集列表失败: {msg}")
+    def get_user_mixes(self, sec_uid: str, cursor: int = 0, count: int = 20) -> tuple:
+        """获取用户的合集列表，合并传统 mix/list 与新版 series/list 双来源，返回 (mix_infos, next_cursor, has_more)"""
+        mix_infos = []
+        next_cursor = 0
+        has_more = False
+        mix_error = None
 
-        mix_infos = data.get("mix_infos") or []
-        has_more = data.get("has_more", 0)
-        if isinstance(has_more, bool):
-            has_more = has_more
-        else:
-            has_more = int(has_more) == 1
-        next_cursor = data.get("cursor", 0)
+        # 1. 请求传统合集 mix/list
+        try:
+            data = self.api_get("https://www.douyin.com/aweme/v1/web/mix/list/", {
+                "sec_user_id": sec_uid,
+                "cursor": str(cursor),
+                "count": str(count),
+            }, skip_sign=False)
+            if data.get("status_code") == 0:
+                mix_infos = data.get("mix_infos") or []
+                hm = data.get("has_more", 0)
+                has_more = hm if isinstance(hm, bool) else int(hm) == 1
+                next_cursor = data.get("cursor", 0)
+        except Exception as e:
+            mix_error = e
+
+        # 2. 首页时尝试拉取短剧/系列合集 series/list (2026-09 最新结构，互不相交)
+        if cursor == 0:
+            series_items, _, _ = self.get_user_series(sec_uid, cursor=0, count=count)
+            if series_items:
+                existing_ids = {str(item.get("mix_id")) for item in mix_infos if item.get("mix_id")}
+                for s_item in series_items:
+                    if str(s_item.get("mix_id")) not in existing_ids:
+                        mix_infos.append(s_item)
+                        existing_ids.add(str(s_item.get("mix_id")))
+
+        # 如果两者都空且传统合集遇到明确错误，再抛出异常
+        if not mix_infos and mix_error is not None and cursor == 0:
+            raise mix_error
 
         return mix_infos, next_cursor, has_more
 
@@ -1305,6 +1364,93 @@ class DouyinClient:
 
         return replays, next_cursor, has_more
 
+    def get_aweme_comments(self, aweme_id: str, cursor: int = 0, count: int = 20, include_replies: bool = False) -> dict:
+        """
+        获取单个作品的评论列表（单页）
+        参考 douyin-downloader: /aweme/v1/web/comment/list/
+        """
+        self.session.headers["Referer"] = f"https://www.douyin.com/video/{aweme_id}"
+        params = {
+            "aweme_id": str(aweme_id),
+            "cursor": str(cursor),
+            "count": str(min(count, 20)),
+            "item_type": "0",
+            "insert_ids": "",
+            "whale_cut_token": "",
+            "cut_version": "1",
+            "rcFT": "",
+        }
+        res = self.api_get("https://www.douyin.com/aweme/v1/web/comment/list/", params, skip_sign=False)
+        comments = res.get("comments") or []
+        if include_replies:
+            for c in comments:
+                if isinstance(c, dict):
+                    cid = c.get("cid") or c.get("comment_id")
+                    reply_total = int(c.get("reply_comment_total") or 0)
+                    if cid and reply_total > 0:
+                        try:
+                            replies_res = self.get_aweme_comment_replies(aweme_id=str(aweme_id), comment_id=str(cid), count=count)
+                            c["_replies"] = replies_res.get("comments") or []
+                        except Exception:
+                            c["_replies"] = []
+        return res
+
+    def get_aweme_comment_replies(self, aweme_id: str, comment_id: str, cursor: int = 0, count: int = 20) -> dict:
+        """
+        获取单条评论的二级回复列表
+        参考 douyin-downloader: /aweme/v1/web/comment/list/reply/
+        """
+        self.session.headers["Referer"] = f"https://www.douyin.com/video/{aweme_id}"
+        params = {
+            "item_id": str(aweme_id),
+            "comment_id": str(comment_id),
+            "cursor": str(cursor),
+            "count": str(count),
+        }
+        return self.api_get("https://www.douyin.com/aweme/v1/web/comment/list/reply/", params, skip_sign=False)
+
+    def get_all_comments(self, aweme_id: str, max_comments: int = 0, include_replies: bool = False, delay: float = 0.3) -> list:
+        """
+        自动翻页抓取作品的全部（或上限条数）评论
+        """
+        all_comments = []
+        cursor = 0
+        seen_ids = set()
+
+        while True:
+            res = self.get_aweme_comments(aweme_id, cursor=cursor, count=20, include_replies=include_replies)
+            items = res.get("comments") or []
+            if not items:
+                break
+
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                cid = item.get("cid") or item.get("comment_id")
+                key = str(cid) if cid else None
+                if key and key in seen_ids:
+                    continue
+                if key:
+                    seen_ids.add(key)
+                all_comments.append(item)
+                if 0 < max_comments <= len(all_comments):
+                    return all_comments[:max_comments]
+
+            has_more = res.get("has_more", 0)
+            if isinstance(has_more, bool):
+                has_more = has_more
+            else:
+                has_more = int(has_more) == 1
+            if not has_more:
+                break
+
+            next_cursor = res.get("cursor") or 0
+            if next_cursor == cursor:
+                break
+            cursor = next_cursor
+            time.sleep(delay)
+
+        return all_comments
 
     # ── 解析资源信息 ──────────────────────────────────────
 
@@ -2336,6 +2482,7 @@ def _run_user_download_task(sec_uid: str, types: list, max_pages: int, target_di
                         return
                     _set_task_state(current_index=idx)
                     try:
+                        media_info = DouyinClient.parse_media_info(item)
                         _add_log(f"[{idx}/{len(all_items)}] 正在下载收藏: {media_info['title'][:30]}")
                         result = download_media(media_info, target_dir, custom_dir=collect_dir)
                         downloaded += 1
@@ -2591,8 +2738,8 @@ def _run_batch_items_download_task(items: list, target_dir: Path, source_name: s
             time.sleep(delay)
 
     _add_log(f"🎉 批量下载任务结束! 成功: {downloaded}，失败: {failed}")
-    if source_name:
-        add_history_item(source_name, "批量", target_dir / source_name, downloaded)
+    if source_name and len(items) > 1 and downloaded > 0:
+        add_history_item(f"{source_name} (批量下载)", "批量", target_dir / source_name, 0)
     _set_task_state(status="completed")
 
 
@@ -3238,7 +3385,17 @@ def get_progress():
 def get_history():
     """获取抖音下载历史记录"""
     history = load_json(HISTORY_FILE, [])
-    return jsonify(history)
+    # 自动过滤并清理 0.00 MB 或无效的虚假批量记录
+    valid_history = []
+    cleaned = False
+    for item in history:
+        if item.get("type") == "批量" and (item.get("size") in ["0.00 MB", "0.00 B", "0 MB", "0 B", "未知"] or not item.get("path") or not Path(item.get("path", "")).exists()):
+            cleaned = True
+            continue
+        valid_history.append(item)
+    if cleaned:
+        save_json(HISTORY_FILE, valid_history)
+    return jsonify(valid_history)
 
 
 @douyin_bp.route("/history", methods=["DELETE"])
@@ -3257,6 +3414,19 @@ def clear_history():
             except Exception as e:
                 _add_log(f"⚠️ 清理文件 {item.name} 失败: {e}")
     return jsonify({"message": "历史记录和已下载的文件已清空"})
+
+
+@douyin_bp.route("/history/delete-item", methods=["POST"])
+def delete_history_item():
+    """从下载历史中删除单条记录"""
+    data = request.get_json() or {}
+    idx = data.get("index")
+    history = load_json(HISTORY_FILE, [])
+    if isinstance(idx, int) and 0 <= idx < len(history):
+        removed = history.pop(idx)
+        save_json(HISTORY_FILE, history)
+        return jsonify({"message": "记录已删除", "item": removed})
+    return jsonify({"error": "记录索引无效"}), 400
 
 
 @douyin_bp.route("/open-folder", methods=["POST"])
@@ -3628,4 +3798,101 @@ def open_parent():
         return jsonify({"message": "已打开"})
     except Exception as e:
         return jsonify({"error": f"打开失败: {str(e)}"}), 500
+
+
+@douyin_bp.route("/comments", methods=["GET"])
+def api_comments():
+    """获取视频评论列表（单页）"""
+    aweme_id = request.args.get("aweme_id", "").strip()
+    if not aweme_id:
+        return jsonify({"error": "aweme_id 不能为空"}), 400
+    cursor = int(request.args.get("cursor", 0))
+    count = int(request.args.get("count", 20))
+    include_replies = request.args.get("include_replies", "false").lower() in ("true", "1")
+
+    try:
+        client = DouyinClient()
+        data = client.get_aweme_comments(aweme_id, cursor=cursor, count=count, include_replies=include_replies)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@douyin_bp.route("/comments/download", methods=["POST"])
+def api_download_comments():
+    """下载并导出作品的全部评论为 JSON 文件（与视频保存在同一作者目录下）"""
+    data = request.get_json() or {}
+    aweme_id = str(data.get("aweme_id", "")).strip()
+    if not aweme_id:
+        return jsonify({"error": "aweme_id 不能为空"}), 400
+
+    title = data.get("title", f"aweme_{aweme_id}")
+    nickname = str(data.get("nickname", "")).strip()
+    source_name = str(data.get("source_name", "")).strip()
+    max_comments = int(data.get("max_comments", 0))
+    include_replies = bool(data.get("include_replies", False))
+    save_dir_str = data.get("save_dir", "").strip()
+
+    try:
+        client = DouyinClient()
+        if not nickname and not source_name:
+            try:
+                detail = client.get_aweme_detail(aweme_id)
+                if detail and detail.get("author"):
+                    nickname = detail["author"].get("nickname", "")
+            except Exception:
+                pass
+
+        comments = client.get_all_comments(aweme_id, max_comments=max_comments, include_replies=include_replies)
+
+        # 确定保存目录：与视频保存在同一作者目录下
+        if save_dir_str:
+            target_dir = Path(save_dir_str)
+        elif source_name:
+            target_dir = DOUYIN_DIR / clean_filename(source_name)
+        elif nickname:
+            target_dir = DOUYIN_DIR / clean_filename(nickname)
+        else:
+            # 尝试在已有下载目录中寻找此 aweme_id 的视频文件所在目录
+            found_dir = None
+            if DOUYIN_DIR.exists():
+                for sub in DOUYIN_DIR.iterdir():
+                    if sub.is_dir() and sub.name != "comments":
+                        for f in sub.iterdir():
+                            if aweme_id in f.name:
+                                found_dir = sub
+                                break
+                    if found_dir:
+                        break
+            target_dir = found_dir if found_dir else (DOUYIN_DIR / clean_filename(title))
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        clean_stem = clean_filename(title)
+        title_with_id = f"{aweme_id}_{clean_stem}"
+        file_path = target_dir / f"{title_with_id}_comments.json"
+
+        output_payload = {
+            "aweme_id": aweme_id,
+            "title": title,
+            "count": len(comments),
+            "include_replies": include_replies,
+            "collected_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "comments": comments,
+        }
+
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(output_payload, f, ensure_ascii=False, indent=2)
+
+        _add_log(f"✅ 评论抓取完成！共抓取 {len(comments)} 条评论，已保存至: {file_path.name}")
+        record_source = source_name or nickname or (target_dir.name if target_dir != DOUYIN_DIR else "单条解析")
+        add_history_item(f"{title} (评论)", "评论", file_path, file_path.stat().st_size, source=record_source)
+
+        return jsonify({
+            "message": "评论导出成功",
+            "file_path": str(file_path),
+            "count": len(comments),
+        })
+    except Exception as e:
+        return jsonify({"error": f"导出评论失败: {str(e)}"}), 500
 

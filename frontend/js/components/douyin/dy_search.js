@@ -1,4 +1,7 @@
 const DySearchPage = {
+    cachedUsers: {},
+    _favListenerAdded: false,
+
     render() {
         return `
             <div class="page-header">
@@ -25,9 +28,29 @@ const DySearchPage = {
             </div>
         `;
     },
+
     async init() {
-        document.getElementById('dy-search-input').focus();
+        const input = document.getElementById('dy-search-input');
+        if (input) input.focus();
+
+        if (!this._favListenerAdded) {
+            this._favListenerAdded = true;
+            window.addEventListener('dy-fav-changed', (e) => {
+                if (e.detail && e.detail.secUid) {
+                    const isFav = this.isFavoriteAuthor(e.detail.secUid);
+                    this.updateCardFavButton(e.detail.secUid, isFav);
+                }
+            });
+        }
     },
+
+    onShow() {
+        // 刷新当前所有已渲染卡片的收藏状态
+        Object.keys(this.cachedUsers).forEach(secUid => {
+            this.updateCardFavButton(secUid, this.isFavoriteAuthor(secUid));
+        });
+    },
+
     async doSearch() {
         const keyword = document.getElementById('dy-search-input').value.trim();
         if (!keyword) {
@@ -53,15 +76,34 @@ const DySearchPage = {
             btn.textContent = '搜索';
         }
     },
+
+    formatNumber(num) {
+        if (!num || isNaN(num)) return '0';
+        num = Number(num);
+        if (num >= 10000) {
+            return (num / 10000).toFixed(1) + 'w';
+        } else if (num >= 1000) {
+            return (num / 1000).toFixed(1) + 'k';
+        }
+        return num.toString();
+    },
+
     renderResults(data) {
         const container = document.getElementById('dy-search-results');
         const empty = document.getElementById('dy-search-empty');
         
         container.innerHTML = '';
+        this.cachedUsers = {};
         
-        // Handle Rust struct response (we might need to adapt to the Python response format here if it diverges, but assuming JSON parity for now)
-        // Python search_user returns direct API JSON, we need to parse it.
-        const users = (data.user_list || []).map(item => item.user_info || item);
+        const users = (data.user_list || []).map(item => {
+            const info = item.user_info || item;
+            return {
+                ...item,
+                ...info,
+                follower_count: info.follower_count ?? item.follower_count ?? 0,
+                total_favorited: info.total_favorited ?? item.total_favorited ?? 0,
+            };
+        });
         
         if (users.length === 0) {
             container.style.display = 'none';
@@ -78,39 +120,114 @@ const DySearchPage = {
             const nickname = user.nickname || '未知用户';
             const signature = user.signature || '暂无签名';
             const sec_uid = user.sec_uid;
+            const douyinId = user.unique_id || user.short_id || '';
+            const isFav = this.isFavoriteAuthor(sec_uid);
+
+            this.cachedUsers[sec_uid] = user;
             
             const card = document.createElement('div');
             card.className = 'card';
-            card.style.cursor = 'pointer';
+            card.style.cssText = 'cursor: pointer; transition: transform 0.2s, box-shadow 0.2s; padding: var(--spacing-lg);';
+            card.onmouseenter = () => { card.style.transform = 'translateY(-3px)'; card.style.boxShadow = '0 8px 24px rgba(0,0,0,0.15)'; };
+            card.onmouseleave = () => { card.style.transform = ''; card.style.boxShadow = ''; };
             card.onclick = () => {
-                // Navigate to user detail page and pass sec_uid via hash params or global state
                 window.location.hash = `#dy_user?sec_uid=${sec_uid}`;
             };
             
             card.innerHTML = `
-                <div style="display: flex; gap: 16px; align-items: center;">
-                    <img src="${avatar}" style="width: 64px; height: 64px; border-radius: 50%; object-fit: cover; background: var(--bg-input);">
-                    <div style="flex: 1; overflow: hidden;">
-                        <h3 style="font-size: 1.1rem; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">${nickname}</h3>
-                        <p style="font-size: 0.85rem; color: var(--text-muted); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;">${signature}</p>
+                <div style="display: flex; gap: 16px; align-items: flex-start;">
+                    <img src="${avatar}" style="width: 56px; height: 56px; border-radius: 50%; object-fit: cover; background: var(--bg-input); flex-shrink: 0;">
+                    <div style="flex: 1; min-width: 0;">
+                        <h3 style="font-size: 1.05rem; font-weight: 600; margin: 0 0 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-primary);">${nickname}</h3>
+                        ${douyinId ? `<div style="font-size: 0.78rem; color: var(--primary); margin-bottom: 6px;">抖音号: ${douyinId}</div>` : ''}
+                        <p style="font-size: 0.82rem; color: var(--text-muted); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; margin: 0; line-height: 1.4;">${signature}</p>
                     </div>
                 </div>
-                <div style="display: flex; gap: 16px; margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border-color);">
-                    <div style="flex: 1; text-align: center;">
-                        <div style="font-size: 1.1rem; font-weight: 600; color: var(--text-primary);">${user.aweme_count || 0}</div>
-                        <div style="font-size: 0.75rem; color: var(--text-muted);">作品</div>
+                <div style="display: flex; gap: 8px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border-color); align-items: center;">
+                    <div style="text-align: center; min-width: 48px;">
+                        <div style="font-size: 0.95rem; font-weight: 600; color: var(--text-primary);">${this.formatNumber(user.follower_count || 0)}</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-top: 1px;">粉丝</div>
                     </div>
-                    <div style="flex: 1; text-align: center;">
-                        <div style="font-size: 1.1rem; font-weight: 600; color: var(--text-primary);">${user.follower_count || 0}</div>
-                        <div style="font-size: 0.75rem; color: var(--text-muted);">粉丝</div>
+                    <div style="width: 1px; background: var(--border-color); height: 20px;"></div>
+                    <div style="text-align: center; min-width: 48px;">
+                        <div style="font-size: 0.95rem; font-weight: 600; color: var(--text-primary);">${this.formatNumber(user.total_favorited || 0)}</div>
+                        <div style="font-size: 0.72rem; color: var(--text-muted); margin-top: 1px;">获赞</div>
                     </div>
-                    <div style="flex: 1; text-align: center;">
-                        <div style="font-size: 1.1rem; font-weight: 600; color: var(--text-primary);">${user.total_favorited || 0}</div>
-                        <div style="font-size: 0.75rem; color: var(--text-muted);">获赞</div>
+                    <div style="flex: 1; display: flex; gap: 6px; justify-content: flex-end; align-items: center;">
+                        <button class="btn btn-sm btn-secondary" id="dy-search-fav-${sec_uid}" onclick="event.stopPropagation(); DySearchPage.toggleFavorite('${sec_uid}')" style="padding: 4px 10px; font-size: 0.78rem; display: inline-flex; align-items: center; gap: 4px; border-radius: 6px; ${isFav ? 'color: #f59e0b; border-color: rgba(245, 158, 11, 0.5); background: rgba(245, 158, 11, 0.12);' : ''}">
+                            <span>${isFav ? '★' : '☆'}</span> <span>${isFav ? '已收藏' : '收藏'}</span>
+                        </button>
+                        <button class="btn btn-sm btn-primary" onclick="event.stopPropagation(); window.location.hash='#dy_user?sec_uid=${sec_uid}';" style="padding: 4px 10px; font-size: 0.78rem; border-radius: 6px;">进入主页</button>
                     </div>
                 </div>
             `;
             container.appendChild(card);
         });
+    },
+
+    getFavoriteAuthors() {
+        try {
+            return JSON.parse(localStorage.getItem('dy_favorite_authors') || '[]');
+        } catch (e) {
+            return [];
+        }
+    },
+
+    isFavoriteAuthor(secUid) {
+        if (!secUid) return false;
+        const list = this.getFavoriteAuthors();
+        return list.some(item => item.sec_uid === secUid);
+    },
+
+    toggleFavorite(secUid) {
+        const user = this.cachedUsers[secUid];
+        let list = this.getFavoriteAuthors();
+        const existingIdx = list.findIndex(item => item.sec_uid === secUid);
+        let isFav = false;
+
+        if (existingIdx >= 0) {
+            list.splice(existingIdx, 1);
+            Toast.show('已取消收藏该作者', 'info');
+            isFav = false;
+        } else {
+            const avatar = (user && user.avatar_thumb && user.avatar_thumb.url_list && user.avatar_thumb.url_list[0]) || (user && user.avatar) || '';
+            const nickname = (user && user.nickname) || '未知作者';
+            const signature = (user && user.signature) || '';
+            const uniqueId = (user && (user.unique_id || user.short_id)) || '';
+
+            list.unshift({
+                sec_uid: secUid,
+                nickname: nickname,
+                avatar: avatar,
+                signature: signature,
+                unique_id: uniqueId,
+                time: Date.now()
+            });
+            Toast.show('⭐ 已收藏该作者！', 'success');
+            isFav = true;
+        }
+
+        try {
+            localStorage.setItem('dy_favorite_authors', JSON.stringify(list));
+        } catch (e) {}
+
+        this.updateCardFavButton(secUid, isFav);
+        window.dispatchEvent(new CustomEvent('dy-fav-changed', { detail: { secUid, isFav } }));
+    },
+
+    updateCardFavButton(secUid, isFav) {
+        const btn = document.getElementById(`dy-search-fav-${secUid}`);
+        if (!btn) return;
+        if (isFav) {
+            btn.innerHTML = '<span>★</span> <span>已收藏</span>';
+            btn.style.color = '#f59e0b';
+            btn.style.borderColor = 'rgba(245, 158, 11, 0.5)';
+            btn.style.background = 'rgba(245, 158, 11, 0.12)';
+        } else {
+            btn.innerHTML = '<span>☆</span> <span>收藏</span>';
+            btn.style.color = '';
+            btn.style.borderColor = '';
+            btn.style.background = '';
+        }
     }
 };
