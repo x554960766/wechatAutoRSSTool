@@ -31,6 +31,11 @@ const API = {
 
             if (!resp.ok || !isJson) {
                 const errMsg = data.error || data.message || `HTTP ${resp.status}`;
+                if (data && (data.need_verify || data.waterwall)) {
+                    if (window.WaterWall && typeof WaterWall.handleDetection === 'function') {
+                        WaterWall.handleDetection(data.waterwall || data);
+                    }
+                }
                 if (showError) Toast.error(errMsg);
                 throw new Error(errMsg);
             }
@@ -133,7 +138,7 @@ const API = {
             return API.delete(`/api/articles/history/${index}`);
         },
         openFolder(account = '') { return API.post('/api/articles/open-folder', { account }); },
-        openFile(path) { return API.post('/api/articles/open-file', { path }); },
+        openFile(path, type = null) { return API.post('/api/articles/open-file', { path, type }); },
         openParent(path) { return API.post('/api/articles/open-parent', { path }); },
     },
 
@@ -151,9 +156,6 @@ const API = {
     settings: {
         get() { return API.get('/api/settings'); },
         save(settings) { return API.post('/api/settings', settings); },
-        exportBackup() { return API.get('/api/settings/backup/export'); },
-        importBackup(data) { return API.post('/api/settings/backup/import', data); },
-        openDataFolder() { return API.post('/api/settings/open-data-folder'); },
     },
 
     // ── Douyin Downloader API ────────────────────────
@@ -217,8 +219,6 @@ const API = {
         cookieAcquisitionStatus() { return API.get('/api/channels/cookie_acquisition_status', { showError: false }); },
         getHistory() { return API.get('/api/channels/history'); },
         clearHistory() { return API.delete('/api/channels/history'); },
-        getUploadLog(limit = 100) { return API.get(`/api/channels/upload-log?limit=${limit}`); },
-        processUploads() { return API.post('/api/channels/process-uploads'); },
         openFile(path) { return API.post('/api/channels/open-file', { path }); },
         openParent(path) { return API.post('/api/channels/open-parent', { path }); },
         getFavorites() { return API.get('/api/channels/favorites'); },
@@ -241,7 +241,12 @@ const API = {
         downloadFFmpegStatus() { return API.get('/api/transcode/download-ffmpeg-status', { showError: false }); },
         scanDownloads() { return API.get('/api/transcode/scan-downloads'); },
         videoInfo(path) { return API.post('/api/transcode/video-info', { path }); },
-        start(inputPath, params) { return API.post('/api/transcode/start', { input_path: inputPath, params }); },
+        start(inputPath, params) {
+            if (typeof inputPath === 'object' && inputPath !== null && !params) {
+                return API.post('/api/transcode/start', inputPath);
+            }
+            return API.post('/api/transcode/start', { input_path: inputPath, params });
+        },
         status() { return API.get('/api/transcode/status', { showError: false }); },
         clearCompleted() { return API.post('/api/transcode/clear-completed'); },
         openParent(path) { return API.post('/api/transcode/open-parent', { path }); },
@@ -297,15 +302,6 @@ const API = {
         openFolder(account = '')    { return API.post('/api/xhs/open-folder', { account }); },
         openFile(path)              { return API.post('/api/xhs/open-file', { path }); },
         openParent(path)            { return API.post('/api/xhs/open-parent', { path }); },
-        // 自动采集 API
-        getAutoCollectStatus()      { return API.get('/api/xhs/auto-collect/status'); },
-        toggleAutoCollect(data)     { return API.post('/api/xhs/auto-collect/toggle', data); },
-        triggerAutoCollect(userId)  { return API.post(`/api/xhs/auto-collect/trigger/${userId}`); },
-        triggerAllAutoCollect()     { return API.post('/api/xhs/auto-collect/trigger-all'); },
-        stopAutoCollect(userId)     { return API.post(`/api/xhs/auto-collect/stop/${userId}`); },
-        stopAllAutoCollect()        { return API.post('/api/xhs/auto-collect/stop-all'); },
-        saveAutoCollectSettings(d)  { return API.post('/api/xhs/auto-collect/settings', d); },
-        getAutoCollectLogs(limit=50){ return API.get(`/api/xhs/auto-collect/logs?limit=${limit}`); },
     },
 
     // ── Version Update API ──────────────────────────────

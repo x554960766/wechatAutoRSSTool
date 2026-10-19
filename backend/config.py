@@ -14,7 +14,7 @@ from pathlib import Path
 from backend.runtime import app_dir
 
 # ── 版本号 ────────────────────────────────────────────────
-APP_VERSION = "2.2.3"
+APP_VERSION = "2.2.4"
 
 # ── 路径配置 ──────────────────────────────────────────────
 if getattr(sys, 'frozen', False):
@@ -33,6 +33,7 @@ DOWNLOAD_HISTORY_FILE = DATA_DIR / "download_history.json"
 
 # ── 微信 API 配置 ─────────────────────────────────────────
 BASE_URL = "https://mp.weixin.qq.com"
+WEREAD_PLATFORM_URL = "https://weread.111965.xyz"
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -52,6 +53,8 @@ DEFAULT_SETTINGS = {
     "concurrent_downloads": 1,
     "auto_save_images": True,
     "auto_save_videos": True,
+    "save_markdown": True,
+    "save_pdf": True,
     "device_id": "公众号_caiji100",
     "rss_start_hour": 0,
     "rss_start_minute": 0,
@@ -59,62 +62,14 @@ DEFAULT_SETTINGS = {
     "rss_end_minute": 0,
     "rss_upload_enabled": False,
     "rss_upload_url": "",
-    "channels_upload_enabled": False,
-    "channels_upload_url": "",
-    "channels_auto_harvest_enabled": False,
-    "channels_harvest_interval_hours": 6,
-    "channels_harvest_window_start_hour": 8,
-    "channels_harvest_window_end_hour": 24,
-    "channels_harvest_max_per_author": 30,  # 单作者单次采集上限，0 = 不限
-    "channels_harvest_session_cap": 12,  # 单次采集作者数上限，默认 12（分批轮替防风控），0 = 不限
-    # 腾讯云 COS 配置（支持向接口动态获取 STS 临时凭证，或填写静态 COS 凭证）
-    "cos_token_api_url": "",
-    "cos_secret_id": "",
-    "cos_secret_key": "",
-    "cos_region": "",
-    "cos_bucket": "",
-    "cos_prefix": "channels/",
-    "cos_cds_domain": "",
-    "channels_device_id": "视频号_caiji2",
-    # 小红书自动采集与上传配置
-    "xhs_auto_collect_enabled": False,
-    "xhs_collect_interval_minutes": 120,
-    "xhs_collect_window_start_hour": 8,
-    "xhs_collect_window_end_hour": 24,
-    "xhs_collect_max_per_account": 20,
-    "xhs_collect_cooldown_minutes": 15,
-    "xhs_upload_enabled": False,
-    "xhs_upload_url": "",
-    "xhs_device_id": "小红书_caiji100",
-    "xhs_cos_bucket": "chenshipin-hg-1305012248",
-    "xhs_cos_cds_domain": "https://chenshipin-hg-1305012248.cos.ap-guangzhou.myqcloud.com/",
-    "xhs_cos_prefix": "channels/",
+    "weread_platform_url": WEREAD_PLATFORM_URL,
 }
-
-
-def _migrate_legacy_data_if_needed():
-    """如果是打包运行且数据保存在 APPDATA，从旧版 exe 同级 data 自动迁移配置和收藏，防止更新丢失"""
-    if getattr(sys, 'frozen', False):
-        try:
-            exe_dir = Path(sys.executable).resolve().parent
-            legacy_data_dir = exe_dir / "data"
-            if legacy_data_dir.exists() and legacy_data_dir.resolve() != DATA_DIR.resolve():
-                DATA_DIR.mkdir(parents=True, exist_ok=True)
-                for item in legacy_data_dir.iterdir():
-                    if item.is_file():
-                        target = DATA_DIR / item.name
-                        if not target.exists() or item.stat().st_mtime > target.stat().st_mtime:
-                            import shutil
-                            shutil.copy2(item, target)
-        except Exception as e:
-            print(f"[Migration] 旧版本数据自动迁移提示: {e}")
 
 
 def ensure_dirs():
     """确保必要的目录存在"""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    _migrate_legacy_data_if_needed()
 
 
 def load_json(filepath: Path, default=None):
@@ -153,57 +108,6 @@ def get_settings() -> dict:
 def save_settings(settings: dict):
     """保存应用设置"""
     save_json(APP_SETTINGS_FILE, settings)
-
-
-def export_backup_data() -> dict:
-    """导出包含所有自动化采集配置与收藏公众号的备份数据"""
-    return {
-        "version": APP_VERSION,
-        "export_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "app_settings": load_json(APP_SETTINGS_FILE, {}),
-        "accounts": load_json(ACCOUNTS_FILE, []),
-        "channels_favorites": load_json(DATA_DIR / "channels_favorites.json", []),
-        "account_pool": load_json(ACCOUNT_POOL_FILE, []),
-        "proxy_config": load_json(PROXY_CONFIG_FILE, {}),
-        "rss_subscriptions": load_json(DATA_DIR / "rss_subscriptions.json", []),
-        "wechat_mp_config": load_json(CONFIG_FILE, {}),
-    }
-
-
-def import_backup_data(data: dict) -> dict:
-    """导入并恢复自动化采集配置与收藏公众号"""
-    imported_count = 0
-    if isinstance(data.get("app_settings"), dict) and data["app_settings"]:
-        current_settings = get_settings()
-        current_settings.update(data["app_settings"])
-        save_settings(current_settings)
-        imported_count += 1
-    
-    if isinstance(data.get("accounts"), list):
-        save_json(ACCOUNTS_FILE, data["accounts"])
-        imported_count += 1
-
-    if isinstance(data.get("channels_favorites"), list):
-        save_json(DATA_DIR / "channels_favorites.json", data["channels_favorites"])
-        imported_count += 1
-
-    if isinstance(data.get("account_pool"), (list, dict)):
-        save_json(ACCOUNT_POOL_FILE, data["account_pool"])
-        imported_count += 1
-
-    if isinstance(data.get("proxy_config"), dict) and data["proxy_config"]:
-        save_json(PROXY_CONFIG_FILE, data["proxy_config"])
-        imported_count += 1
-
-    if isinstance(data.get("rss_subscriptions"), list):
-        save_json(DATA_DIR / "rss_subscriptions.json", data["rss_subscriptions"])
-        imported_count += 1
-
-    if isinstance(data.get("wechat_mp_config"), dict) and data["wechat_mp_config"]:
-        save_json(CONFIG_FILE, data["wechat_mp_config"])
-        imported_count += 1
-
-    return {"success": True, "imported_count": imported_count}
 
 
 # ── 代理管理器全局状态管理 ────────────────────────────────────
@@ -456,5 +360,4 @@ def get_default_wechat_ua() -> str:
     if sys.platform == "win32":
         return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.5304.110 Safari/537.36 NetType/WIFI MicroMessenger/7.0.20.1781(0x6700143B) WindowsWechat ClientCanvas/1.0.0"
     return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.5304.110 Safari/537.36 NetType/WIFI MicroMessenger/6.8.0(0x16080000) MacWechat/store ClientCanvas/1.0.0"
-
 
