@@ -674,10 +674,11 @@ class RssScheduler:
 
                 if new_articles:
                     # 准备下载目录
-                    out_dir = OUTPUT_DIR / nickname
+                    settings = get_settings()
+                    download_dir = Path(settings.get("download_dir") or str(OUTPUT_DIR))
+                    out_dir = download_dir / nickname
                     out_dir.mkdir(parents=True, exist_ok=True)
 
-                    settings = get_settings()
                     delay = settings.get("request_delay", 0.8)
                     max_retries = settings.get("max_retries", 3)
 
@@ -726,6 +727,7 @@ class RssScheduler:
                                 existing_history_item["time"] = time.time()
                                 existing_history_item["error"] = error_msg if not success else None
                                 existing_history_item["path"] = downloaded_path
+                                existing_history_item["account"] = nickname
                                 if result.get("cover_url"):
                                     existing_history_item["cover_url"] = result.get("cover_url")
                                 if result.get("digest"):
