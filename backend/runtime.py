@@ -3,6 +3,7 @@ Runtime helpers for source and PyInstaller builds.
 """
 
 import os
+import shutil
 import sys
 import traceback
 from pathlib import Path
@@ -25,9 +26,7 @@ def app_dir() -> Path:
     to avoid App Translocation read-only filesystem errors that occur when
     the .app is launched from a DMG or unsigned download location.
 
-    On Windows (frozen), data is stored in APPDATA to preserve settings and
-    bookmarked accounts across version reinstalls.
-
+    On Windows (frozen), data is stored next to the executable.
     In dev mode, data is stored in the project root.
     """
     if is_frozen():
@@ -37,77 +36,78 @@ def app_dir() -> Path:
             support = Path.home() / "Library" / "Application Support" / "WeChat MP Tools"
             support.mkdir(parents=True, exist_ok=True)
             return support
-        elif sys.platform == "win32":
-            # Windows: store user data in APPDATA
-            appdata = os.environ.get("APPDATA")
-            if appdata:
-                support = Path(appdata) / "WeChat MP Tools"
-            else:
-                support = Path.home() / "AppData" / "Roaming" / "WeChat MP Tools"
-            support.mkdir(parents=True, exist_ok=True)
-            return support
-        else:
-            # Linux: standard user config dir
-            config_dir = Path.home() / ".config" / "WeChat MP Tools"
-            config_dir.mkdir(parents=True, exist_ok=True)
-            return config_dir
+        # Windows / Linux: keep data next to the executable
+        return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent
-
-
-import signal
-
-
-class SafeStream:
-    """Wraps stdout/stderr to prevent crash on [Errno 32] Broken pipe when running detached."""
-
-    def __init__(self, target):
-        self._target = target
-
-    def write(self, s):
-        try:
-            if self._target:
-                return self._target.write(s)
-        except (BrokenPipeError, OSError):
-            pass
-
-    def flush(self):
-        try:
-            if self._target:
-                return self._target.flush()
-        except (BrokenPipeError, OSError):
-            pass
-
-    def isatty(self):
-        try:
-            return self._target.isatty() if self._target else False
-        except Exception:
-            return False
-
-    def fileno(self):
-        try:
-            return self._target.fileno()
-        except Exception:
-            raise OSError(32, "Broken pipe")
-
-    def __getattr__(self, name):
-        return getattr(self._target, name)
 
 
 def log_file() -> Path:
     return app_dir() / "wechat_mp_tools.log"
 
 
-def configure_runtime():
-    if hasattr(signal, "SIGPIPE"):
-        try:
-            signal.signal(signal.SIGPIPE, signal.SIG_IGN)
-        except Exception:
-            pass
+def desktop_available() -> bool:
+    """当前环境是否有可用的桌面文件管理器。
 
-    if sys.stdout is not None and not isinstance(sys.stdout, SafeStream):
-        sys.stdout = SafeStream(sys.stdout)
-    if sys.stderr is not None and not isinstance(sys.stderr, SafeStream):
-        sys.stderr = SafeStream(sys.stderr)
+    容器里没有 xdg-open，调用会抛 FileNotFoundError；这里提前判断，
+    让「打开文件夹」能给出可读提示，而不是 errno 报错。
+    可用环境变量 WECHAT_MP_DESKTOP=0/1 强制覆盖。
+    """
+    override = os.environ.get("WECHAT_MP_DESKTOP")
+    if override is not None and override.strip() != "":
+        return override.strip().lower() not in ("0", "false", "no", "off")
+
+    if sys.platform in ("darwin", "win32"):
+        return True
+
+    # Linux / 容器
+    if os.path.exists("/.dockerenv"):
+        return False
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return False
+    return shutil.which("xdg-open") is not None
+
+
+def host_path_hint(path) -> str:
+    """把容器内路径映射成宿主机上能直接找到的路径，用于提示文案。
+
+    容器里 /app/data 对应宿主机 ./data，通过 HOST_DATA_DIR 告诉服务端。
+    桌面模式下没有该环境变量，原样返回。
+    """
+    try:
+        container_data = str((app_dir() / "data").resolve())
+    except OSError:
+        return str(path)
+
+    target = str(path)
+    host_data = os.environ.get("HOST_DATA_DIR", "").strip()
+    if host_data and target.startswith(container_data):
+        return host_data.rstrip("/") + target[len(container_data):]
+    return target
+
+
+def configure_runtime():
+    # 修复在 Windows / 临时解压目录（如 360zip / PyInstaller）运行时，
+    # 环境变量 REQUESTS_CA_BUNDLE / SSL_CERT_FILE / CURL_CA_BUNDLE 指向已失效临时路径导致的 TLS 证书报错
+    for env_var in ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSL_CERT_FILE"):
+        val = os.environ.get(env_var)
+        if val and not os.path.exists(val):
+            os.environ.pop(env_var, None)
+
+    try:
+        import certifi
+        ca_path = certifi.where()
+        if ca_path and not os.path.exists(ca_path):
+            res_dir = resource_dir()
+            for candidate in (
+                res_dir / "_internal" / "certifi" / "cacert.pem",
+                res_dir / "certifi" / "cacert.pem",
+            ):
+                if candidate.exists():
+                    os.environ["REQUESTS_CA_BUNDLE"] = str(candidate)
+                    os.environ["SSL_CERT_FILE"] = str(candidate)
+                    break
+    except Exception:
+        pass
 
     bundled_browsers = resource_dir() / "ms-playwright"
     if bundled_browsers.exists():
@@ -190,6 +190,42 @@ def launch_chromium(chromium, **launch_kwargs):
         kwargs.update(override)
         try:
             return chromium.launch(**kwargs)
+        except Exception as exc:
+            last_error = exc
+
+    raise RuntimeError(
+        "未检测到可用浏览器。请安装 Google Chrome / Microsoft Edge，"
+        "或使用内置 Chromium 的完整版安装包。"
+    ) from last_error
+
+
+def launch_persistent_context(chromium, user_data_dir, **launch_kwargs):
+    """Launch persistent browser context when present, otherwise fall back to system browsers."""
+    attempts = []
+    if "channel" in launch_kwargs:
+        attempts.append({})
+    elif bundled_browsers_available():
+        if launch_kwargs.get("headless"):
+            attempts.append({"channel": "chromium"})
+        else:
+            attempts.append({})
+        attempts.extend({"channel": channel} for channel in _system_browser_channels())
+        attempts.append({})
+    else:
+        attempts.extend({"channel": channel} for channel in _system_browser_channels())
+        attempts.append({})
+
+    seen = set()
+    last_error = None
+    for override in attempts:
+        key = tuple(sorted(override.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        kwargs = launch_kwargs.copy()
+        kwargs.update(override)
+        try:
+            return chromium.launch_persistent_context(str(user_data_dir), **kwargs)
         except Exception as exc:
             last_error = exc
 

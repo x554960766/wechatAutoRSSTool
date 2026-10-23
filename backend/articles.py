@@ -25,6 +25,9 @@ from backend.config import (
 )
 from backend.account_pool import borrow_session, borrow_weread_session, account_pool, get_weread_session
 from backend.accounts import biz_to_book_id
+from backend.wechat_url import normalize_wechat_short_url, short_id_from_review_id
+from backend.runtime import desktop_available, host_path_hint
+from backend.request_profile import sleep_backoff, sleep_throttled
 
 articles_bp = Blueprint("articles", __name__, url_prefix="/api/articles")
 
@@ -73,10 +76,9 @@ def _resolve_review_doc_url(review_id: str, headers: dict) -> str:
         return ""
     # 优先直接使用 review_id 包含的短链标识（如 MP_WXS_2940696320_yvrxT0XE-9ELBG4gQZhB4g -> yvrxT0XE-9ELBG4gQZhB4g）
     # 短链在微信网关下直接返回文章内容，完全绕过长链接引发的风控验证码
-    if "_" in review_id:
-        sid = review_id.split("_")[-1]
-        if len(sid) >= 15:
-            return f"https://mp.weixin.qq.com/s/{sid}"
+    short_id = short_id_from_review_id(review_id)
+    if short_id:
+        return f"https://mp.weixin.qq.com/s/{short_id}"
 
     with _review_cache_lock:
         if review_id in _review_url_cache:
@@ -89,9 +91,9 @@ def _resolve_review_doc_url(review_id: str, headers: dict) -> str:
             mp_info = resp.json().get("review", {}).get("mpInfo", {})
             orig_id = mp_info.get("originalId", "")
             if orig_id and len(orig_id) >= 15:
-                doc_url = f"https://mp.weixin.qq.com/s/{orig_id}"
+                doc_url = normalize_wechat_short_url(f"https://mp.weixin.qq.com/s/{orig_id}")
             else:
-                doc_url = mp_info.get("doc_url", "")
+                doc_url = normalize_wechat_short_url(mp_info.get("doc_url", ""))
             if doc_url:
                 with _review_cache_lock:
                     _review_url_cache[review_id] = doc_url
@@ -121,7 +123,12 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
     s = get_weread_session()
 
     def _do_get(url: str):
-        """内部请求函数：遇到 401 自动静默续期并重试，遇到 499 自动标记频控并尝试轮询账号池下一账号"""
+        """内部请求函数：对齐官方 SyncKeyRequestFeature 与 WRRetryHandler 错误码自愈策略"""
+        req_url = url
+        # 遵循 APK SyncKeyRequestFeature: 同步型接口自动补全 synckey=0 规避 499 拒止
+        if any(k in req_url for k in ("/mp/chapters", "/mp/list", "/shelf/sync", "/subscription/books")) and "synckey=" not in req_url:
+            req_url = f"{req_url}&synckey=0" if "?" in req_url else f"{req_url}?synckey=0"
+
         last_resp = None
         last_h = None
         last_acc = None
@@ -133,23 +140,26 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
             last_h = h
             last_acc = acc_id
             try:
-                r = s.get(url, headers=h, timeout=10)
+                r = s.get(req_url, headers=h, timeout=10)
                 last_resp = r
 
                 # ── 优先检测腾讯防水墙 (TCaptcha) ──
                 from backend.waterwall import detect_waterwall, waterwall_hit, record_failure
                 ww_marker = detect_waterwall(r.status_code, r.text)
                 if ww_marker:
-                    record_failure(url, r.status_code, r.headers, r.text, ww_marker)
-                    waterwall_hit(url, r.status_code, ww_marker)
+                    record_failure(req_url, r.status_code, r.headers, r.text, ww_marker)
+                    waterwall_hit(req_url, r.status_code, ww_marker)
                     return r, h, acc_id
 
+                # 401 Token 过期: 自动静默续期重试
                 if r.status_code == 401:
                     print(f"[_fetch_articles_page] 微信读书 401 Token 过期，触发自动静默续期 (第 {att+1} 次)...", flush=True)
                     account_pool.report(acc_id, status_code=401)
                     time.sleep(0.5)
                     continue
-                if r.status_code == 499:
+
+                # 429 或 499: 精准匹配官方错误码 (对齐 OverFreqInterceptor 与 WRRetryHandler 策略)
+                if r.status_code in (429, 499):
                     err_json = {}
                     try:
                         err_json = r.json()
@@ -157,28 +167,59 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
                         pass
                     err_c = err_json.get("errcode")
                     err_m = str(err_json.get("errmsg") or "")
-                    if err_c == -2041 or "2041" in err_m:
-                        print(f"[_fetch_articles_page] 账号 [{acc_id}] 触发终端会话未激活 (-2041)，调用 activate_terminal_session 模拟真机同步...", flush=True)
+
+                    # 1. 微信读书频控 -2014 (OverFreqInterceptor): 短时间瞬时并发过高，自动退避 1.5 秒后降频重试
+                    if err_c == -2014 or "-2014" in r.text:
+                        print(f"[_fetch_articles_page] 触发微信读书网关频控 (-2014)，自动退避 1.5 秒后降频重试...", flush=True)
+                        time.sleep(1.5)
+                        try:
+                            r_retry = s.get(req_url, headers=h, timeout=10)
+                            if r_retry.status_code == 200:
+                                return r_retry, h, acc_id
+                        except Exception as ex_retry:
+                            logger.debug("频控退避重试网络异常: %s", ex_retry)
+
+                    # 2. 网关超时 -2012 (对齐 WRRetryHandler.canRetryTimeOut / whetherNeedToRetry 策略)
+                    elif err_c == -2012 or "-2012" in r.text:
+                        print(f"[_fetch_articles_page] 上游网关超时 (-2012)，遵循官方策略等待 0.5 秒自动重试...", flush=True)
+                        time.sleep(0.5)
+                        try:
+                            r_retry = s.get(req_url, headers=h, timeout=10)
+                            if r_retry.status_code == 200:
+                                return r_retry, h, acc_id
+                        except Exception:
+                            pass
+
+                    # 3. 账号人机验证 / 终端同步态 -2041 (对齐 WRRetryHandler.canRetryAfterVerify 策略)
+                    elif err_c == -2041 or "2041" in r.text:
+                        print(f"[_fetch_articles_page] 账号 [{acc_id}] 触发终端会话在线态核验 (-2041)，调用 activate_terminal_session 模拟真机同步...", flush=True)
                         from backend.weread_signer import activate_terminal_session
                         if activate_terminal_session(h, session=s):
                             try:
-                                r_retry = s.get(url, headers=h, timeout=10)
+                                r_retry = s.get(req_url, headers=h, timeout=10)
                                 if r_retry.status_code == 200:
                                     print(f"[_fetch_articles_page] 账号 [{acc_id}] 移动端会话同步激活成功，重试请求通过！", flush=True)
                                     return r_retry, h, acc_id
                             except Exception as ex:
                                 logger.debug("重试请求异常: %s", ex)
-                        print(f"[_fetch_articles_page] 账号 [{acc_id}] 激活后仍受限，自动轮换账号池备用账号...", flush=True)
-                        account_pool.report(acc_id, status_code=499, ret=-2041, error_msg="微信读书需安全激活 (-2041)：请在手机微信读书App中打开任意公众号阅读一次以激活")
+
+                        # 若移动会话已激活但仍返回 -2041，确定触发官方 TCaptcha 人机验证，唤起前端滑块弹窗！
+                        print(f"[_fetch_articles_page] 账号 [{acc_id}] 移动会话已激活但仍返回 -2041，确认为官方强制 TCaptcha 人机验证！", flush=True)
+                        record_failure(req_url, r.status_code, r.headers, r.text, "-2041")
+                        waterwall_hit(req_url, r.status_code, "-2041")
+                        account_pool.report(acc_id, status_code=499, ret=-2041, error_msg="触发腾讯人机验证 (-2041)，需在网页完成滑块验证")
+                        return r, h, acc_id
                     else:
-                        print(f"[_fetch_articles_page] 账号 [{acc_id}] 遇到 499 频控限制 ({err_c} {err_m})，自动轮换账号池备用账号...", flush=True)
-                        account_pool.report(acc_id, status_code=499, ret=err_c, error_msg=f"请求频控 ({err_c} {err_m})，临时冷却 60 秒")
-                    time.sleep(0.3)
+                        print(f"[_fetch_articles_page] 账号 [{acc_id}] 遇到 499/429 限制 ({err_c} {err_m})，自动轮换账号池备用账号...", flush=True)
+                        account_pool.report(acc_id, status_code=r.status_code, ret=err_c, error_msg=f"请求频控 ({err_c} {err_m})，临时冷却")
+
+                    # 频控后指数退避，避免轮换账号的瞬间形成密集重试
+                    sleep_backoff(att + 1, base=0.4, cap=4.0)
                     continue
                 return r, h, acc_id
             except Exception as e:
                 logger.debug("[_fetch_articles_page] 网络异常: %s", e)
-                time.sleep(0.5)
+                sleep_backoff(att + 1, base=0.5, cap=4.0)
         return last_resp, last_h, last_acc
 
     articles = []
@@ -249,11 +290,10 @@ def _fetch_articles_page(fakeid: str, begin: int, count: int, keyword: str = "",
         import concurrent.futures
         def _get_url(it):
             rid = it.get("reviewId", "")
-            if rid and "_" in rid:
-                sid = rid.split("_")[-1]
-                if len(sid) >= 15:
-                    return f"https://mp.weixin.qq.com/s/{sid}"
-            doc_u = it.get("mpInfo", {}).get("doc_url", "")
+            short_id = short_id_from_review_id(rid)
+            if short_id:
+                return f"https://mp.weixin.qq.com/s/{short_id}"
+            doc_u = normalize_wechat_short_url(it.get("mpInfo", {}).get("doc_url", ""))
             if doc_u:
                 return doc_u
             return _resolve_review_doc_url(rid, active_headers or {})
@@ -504,6 +544,8 @@ def download_by_url():
     if not extracted_urls:
         return jsonify({"error": "未检测到有效的微信公众号文章链接"}), 400
 
+    extracted_urls = list(dict.fromkeys(normalize_wechat_short_url(u) for u in extracted_urls))
+
     # 批量将长链接预解析为免风控的标准短链与 reviewId
     url_info_map = {}
     long_urls_to_resolve = [u for u in extracted_urls if "__biz=" in u]
@@ -516,13 +558,12 @@ def download_by_url():
             for r_item in res.get("reviewIds", []):
                 orig_u = r_item.get("url", "")
                 rid = r_item.get("reviewId", "")
-                if rid and "_" in rid:
-                    sid = rid.split("_")[-1]
-                    if len(sid) >= 15:
-                        url_info_map[orig_u] = {
-                            "short_url": f"https://mp.weixin.qq.com/s/{sid}",
-                            "review_id": rid,
-                        }
+                short_id = short_id_from_review_id(rid)
+                if short_id:
+                    url_info_map[orig_u] = {
+                        "short_url": f"https://mp.weixin.qq.com/s/{short_id}",
+                        "review_id": rid,
+                    }
         except Exception as e:
             logger.debug(f"[download_by_url] 批量预解析短链异常: {e}")
 
@@ -698,6 +739,33 @@ def _sync_history_from_disk(history: list) -> bool:
     return changed
 
 
+def _resolve_history_path(raw_path: str, download_dir: str) -> str:
+    """把历史记录里的路径重定位到当前下载目录。
+
+    迁移场景：桌面版记的是 /Users/xxx/.../articles_full/公众号/文章，
+    容器里这份路径不存在。这里按 articles_full 之后的部分拼到当前
+    download_dir 下，只有目标确实存在才替换，避免误伤。
+    """
+    if not raw_path:
+        return raw_path
+    try:
+        if Path(raw_path).exists():
+            return raw_path
+    except OSError:
+        pass
+
+    parts = Path(raw_path).parts
+    if "articles_full" in parts:
+        idx = len(parts) - 1 - parts[::-1].index("articles_full")
+        candidate = Path(download_dir).joinpath(*parts[idx + 1:])
+        try:
+            if candidate.exists():
+                return str(candidate)
+        except OSError:
+            pass
+    return raw_path
+
+
 @articles_bp.route("/history", methods=["GET"])
 def get_history():
     """获取下载历史"""
@@ -706,6 +774,8 @@ def get_history():
     # 自动从磁盘同步丢失的历史记录
     if _sync_history_from_disk(history):
         save_json(DOWNLOAD_HISTORY_FILE, history)
+
+    download_dir = get_settings().get("download_dir") or str(OUTPUT_DIR)
 
     indexed_history = []
     for index, item in enumerate(history):
@@ -716,6 +786,10 @@ def get_history():
             if not indexed.get("account") and indexed.get("account_name"):
                 indexed["account"] = indexed["account_name"]
             indexed["_index"] = index
+            if indexed.get("path"):
+                # 旧机器的绝对路径重定位到当前下载目录；界面上再显示宿主机路径
+                indexed["path"] = _resolve_history_path(indexed["path"], download_dir)
+                indexed["display_path"] = host_path_hint(indexed["path"])
             indexed_history.append(indexed)
     indexed_history.sort(key=lambda x: x.get("time", 0), reverse=True)
     # 限制返回数量
@@ -836,7 +910,7 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
                     save_json(DOWNLOAD_HISTORY_FILE, history)
                     return
 
-            link = article.get("link", "")
+            link = normalize_wechat_short_url(article.get("link", ""))
             title = article.get("title", f"article_{i+1}")
 
             with _download_lock:
@@ -864,7 +938,9 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
                     error_msg = result.get("error", "未知错误")
                 except Exception as e:
                     error_msg = str(e)
-                time.sleep(1)
+                if attempt < max_retries:
+                    # 指数退避 + 抖动，避免失败后齐步重试形成尖峰
+                    sleep_backoff(attempt, base=1.0, cap=8.0)
 
             if result.get("title"):
                 title = result["title"]
@@ -885,12 +961,15 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
                         "title": title, "success": False, "error": error_msg
                     })
 
-            real_account = result.get("author") or (account_name if account_name != "url_download" else "链接下载")
+            real_account = result.get("source")
+            if not real_account or real_account == "url_download":
+                real_account = account_name if account_name != "url_download" else "链接下载"
             # 记录到下载历史
             history.append({
                 "title": title,
-                "link": article.get("original_url") or link,
+                "link": normalize_wechat_short_url(article.get("original_url") or link),
                 "account": real_account,
+                "author": result.get("author", ""),
                 "success": success,
                 "time": time.time(),
                 "error": error_msg if not success else None,
@@ -903,8 +982,10 @@ def _do_batch_download(task_id: str, articles: list, account_name: str):
             })
 
             if i < len(articles) - 1:
-                import random
-                time.sleep(max(1.0, delay) + random.uniform(0.3, 1.2))
+                # 对数正态节流：均值与原实现 max(1.0, delay)+U(0.3,1.2) 的期望（约 1.75s）对齐，
+                # 只是把原本 1.3~2.2s 的窄带换成带长尾的分布；min_delay 抬住下沿，
+                # 保证没有任何一次间隔比原来的 1.3s 更密
+                sleep_throttled(max(1.0, delay) + 0.75, min_delay=1.3)
 
         # 保存历史
         save_json(DOWNLOAD_HISTORY_FILE, history)
@@ -939,7 +1020,7 @@ def _download_article_into_task(task_id: str, article: dict, account_name: str, 
     out_dir = download_dir / account_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    link = article.get("link", "")
+    link = normalize_wechat_short_url(article.get("link", ""))
     title = article.get("title", f"article_{index + 1}")
     review_id = article.get("id") or article.get("aid") or ""
 
@@ -957,7 +1038,7 @@ def _download_article_into_task(task_id: str, article: dict, account_name: str, 
     success = False
     error_msg = ""
     result = {}
-    for _ in range(max_retries):
+    for attempt in range(1, max_retries + 1):
         try:
             result = download_single_article(link, out_dir, title, review_id=review_id)
             if result.get("success"):
@@ -966,7 +1047,9 @@ def _download_article_into_task(task_id: str, article: dict, account_name: str, 
             error_msg = result.get("error", "未知错误")
         except Exception as e:
             error_msg = str(e)
-        time.sleep(1)
+        if attempt < max_retries:
+            # 指数退避 + 抖动，避免失败后齐步重试形成尖峰
+            sleep_backoff(attempt, base=1.0, cap=8.0)
 
     if result.get("title"):
         title = result["title"]
@@ -1065,10 +1148,10 @@ def _do_range_download(
 
                 _download_article_into_task(task_id, article, account_name, history, downloaded_index)
                 downloaded_index += 1
-                # 增加防风控随机抖动延迟 (1.2s - 2.5s) 模拟人类请求
-                import random
-                sleep_time = max(1.0, delay) + random.uniform(0.3, 1.2)
-                time.sleep(sleep_time)
+                # 对数正态节流：均值与原实现 max(1.0, delay)+U(0.3,1.2) 的期望（约 1.75s）对齐，
+                # 只是把原本 1.3~2.2s 的窄带换成带长尾的分布；min_delay 抬住下沿，
+                # 保证没有任何一次间隔比原来的 1.3s 更密
+                sleep_throttled(max(1.0, delay) + 0.75, min_delay=1.3)
 
             # 当前页所有文章都早于 start_time，说明后续页也不会有范围内的文章了
             if out_of_range_count > 0 and out_of_range_count >= len(articles):
@@ -1127,6 +1210,17 @@ def open_folder():
     try:
         path.mkdir(parents=True, exist_ok=True)
         resolved_path = str(path.resolve())
+
+        # 容器部署没有桌面环境，调 xdg-open 只会抛 FileNotFoundError
+        if not desktop_available():
+            hint = host_path_hint(resolved_path)
+            return jsonify({
+                "error": f"容器部署没有桌面环境，请在宿主机打开：{hint}",
+                "mode": "headless",
+                "container_path": resolved_path,
+                "host_path": hint,
+            }), 501
+
         if sys.platform == "darwin":
             subprocess.run(["open", resolved_path])
         elif sys.platform == "win32":
@@ -1174,6 +1268,18 @@ def open_file():
                     return jsonify({"error": "未找到 Markdown 文件"}), 404
 
         resolved_path = str(resolved_target.resolve())
+
+        # 容器部署：把「用系统程序打开」换成「浏览器直接访问」，前端会打开返回的 url
+        if not desktop_available():
+            url = "/api/articles/serve-file?path=" + urllib.parse.quote(resolved_path, safe="")
+            return jsonify({
+                "message": "已在浏览器中打开",
+                "mode": "headless",
+                "url": url,
+                "container_path": resolved_path,
+                "host_path": host_path_hint(resolved_path),
+            })
+
         if sys.platform == "darwin":
             subprocess.run(["open", resolved_path])
         elif sys.platform == "win32":
@@ -1205,6 +1311,16 @@ def open_parent():
             return jsonify({"error": "文件或文件夹不存在"}), 404
             
         resolved_path = str(path.resolve())
+
+        if not desktop_available():
+            target_dir = path.parent.resolve() if path.is_file() else path.resolve()
+            hint = host_path_hint(str(target_dir))
+            return jsonify({
+                "error": f"容器部署没有桌面环境，请在宿主机打开：{hint}",
+                "mode": "headless",
+                "host_path": hint,
+            }), 501
+
         if path.is_file():
             if sys.platform == "darwin":
                 subprocess.run(["open", "-R", resolved_path])
@@ -1225,6 +1341,48 @@ def open_parent():
         return jsonify({"message": "已打开"})
     except Exception as e:
         return jsonify({"error": f"打开失败: {str(e)}"}), 500
+
+
+@articles_bp.route("/content-filter", methods=["GET"])
+def get_content_filter():
+    """获取内容过滤规则（屏蔽广告、二维码、小节标题横幅图等）"""
+    from backend.content_filter import DEFAULT_RULES, last_stats, load_rules
+
+    return jsonify({
+        "rules": load_rules(),
+        "defaults": DEFAULT_RULES,
+        "last_stats": last_stats(),
+    })
+
+
+@articles_bp.route("/content-filter", methods=["POST"])
+def save_content_filter():
+    """保存内容过滤规则，新下载的文章立即生效"""
+    from backend.content_filter import save_rules
+
+    data = request.get_json() or {}
+    rules = data.get("rules") if isinstance(data.get("rules"), dict) else data
+    return jsonify({"rules": save_rules(rules), "message": "规则已保存"})
+
+
+@articles_bp.route("/content-filter/apply-existing", methods=["POST"])
+def apply_content_filter_existing():
+    """对已下载文章重跑过滤。
+
+    默认 dry_run=true 只统计不改文件；确认后传 {"dry_run": false} 才真正改写，
+    改写前会把原 .html 备份成 .html.bak。
+    """
+    from backend.content_filter import refilter_existing
+
+    data = request.get_json() or {}
+    settings = get_settings()
+    download_dir = settings.get("download_dir") or str(OUTPUT_DIR)
+    result = refilter_existing(
+        download_dir,
+        dry_run=bool(data.get("dry_run", True)),
+        force=bool(data.get("force", False)),
+    )
+    return jsonify(result)
 
 
 @articles_bp.route("/serve-file", methods=["GET"])
@@ -1347,145 +1505,27 @@ def serve_file(filepath=""):
     return send_from_directory(target_path.parent, target_path.name)
 
 
+
+
+@articles_bp.route("/avatars/<filename>", methods=["GET"])
+def get_account_avatar_file(filename):
+    from backend.avatar_cache import avatar_response
+
+    return avatar_response(filename)
+
+
 @articles_bp.route("/rss", methods=["GET"])
 @articles_bp.route("/rss/<account>", methods=["GET"])
 def get_rss(account=None):
+    """RSS 2.0 订阅输出。
+
+    具体实现见 backend/rss_feed.py：
+      - 每次请求只读一次 rss_articles.json 并建索引（原实现按账号重复全量解析）
+      - 按发布时间倒序，支持 ?limit= ?offset= 截断（默认 50，上限 500）
+      - ?full=0 只输出摘要，不读 content.txt
+      - 进程内缓存 + ETag/304，阅读器轮询基本不产生 IO
+      - 反向代理下按 X-Forwarded-* 或 rss_base_url 生成链接
     """
-    Generate an RSS 2.0 feed of successfully downloaded articles.
-    Merges manually downloaded articles with auto-fetched RSS subscription articles.
-    """
-    import email.utils
-    from urllib.parse import quote
-    import html
+    from backend.rss_feed import rss_response
 
-    history = load_json(DOWNLOAD_HISTORY_FILE, [])
-    # Filter successful downloads and exclude channels
-    items = [item for item in history if isinstance(item, dict) and item.get("success") and item.get("account") != "微信视频号"]
-
-    # Filter by account if specified
-    if account:
-        items = [item for item in items if item.get("account") == account]
-        feed_title = f"微信公众号 - {account} RSS"
-        feed_desc = f"{account} 微信公众号文章订阅"
-    else:
-        feed_title = "微信公众号 RSS"
-        feed_desc = "微信公众号文章订阅"
-
-    # Merge auto-fetched RSS articles
-    try:
-        from backend.rss_scheduler import rss_scheduler
-        if account:
-            rss_arts = rss_scheduler.get_articles(account)
-        else:
-            # Get articles from all subscriptions
-            rss_arts = []
-            for sub in rss_scheduler.get_subscriptions():
-                rss_arts.extend(rss_scheduler.get_articles(sub.get("nickname", "")))
-
-        # Convert auto-fetched articles to the same format, dedup by link
-        existing_links = {item.get("link") for item in items if item.get("link")}
-        for art in rss_arts:
-            link = art.get("link", "")
-            if link and link not in existing_links:
-                items.append({
-                    "title": art.get("title", ""),
-                    "link": link,
-                    "account": account or art.get("author", ""),
-                    "success": True,
-                    "time": art.get("update_time", 0),
-                    "publish_time": art.get("update_time", 0),
-                    "cover_url": art.get("cover", ""),
-                    "digest": art.get("digest", ""),
-                    "path": art.get("path", ""),
-                })
-                existing_links.add(link)
-    except Exception:
-        pass  # If scheduler not available, just use download history
-        
-    # Get server host/port dynamically to construct local URLs
-    host_url = request.host_url
-    
-    xml_items = []
-    for item in items:
-        # Defensively convert all values to strings to prevent AttributeError on html.escape(None)
-        title_val = item.get("title") or ""
-        title = html.escape(str(title_val))
-        
-        acc_name_val = item.get("account") or "unknown"
-        acc_name = str(acc_name_val)
-        
-        safe_title = item.get("title") or ""
-        
-        # Check if local HTML file exists
-        local_exists = False
-        path_str = item.get("path")
-        if path_str:
-            try:
-                local_path = Path(path_str)
-                if local_path.exists():
-                    local_exists = True
-            except Exception:
-                pass
-
-        orig_url_val = item.get("link") or ""
-        orig_url = html.escape(str(orig_url_val))
-
-        if local_exists:
-            p_obj = Path(path_str)
-            local_url = f"{host_url}api/articles/serve-file/{quote(p_obj.parent.name)}/{quote(p_obj.name)}/{quote(p_obj.name)}.html"
-            xml_link = html.escape(local_url)
-        else:
-            xml_link = orig_url
-        
-        pub_time_val = item.get("publish_time") or item.get("time") or time.time()
-        try:
-            pub_time = float(pub_time_val)
-        except Exception:
-            pub_time = time.time()
-        pub_date = email.utils.formatdate(pub_time, usegmt=True)
-        
-        digest_val = item.get("digest") or ""
-        digest = html.escape(str(digest_val))
-        
-        cover_url_val = item.get("cover_url") or ""
-        cover_url = html.escape(str(cover_url_val))
-        
-        # Read content.txt if available for full text
-        content_encoded = ""
-        if path_str:
-            try:
-                txt_path = Path(path_str) / "content.txt"
-                if txt_path.exists():
-                    clean_text = txt_path.read_text(encoding="utf-8")
-                    clean_text = clean_text.replace("]]>", "]]&gt;")
-                    content_encoded = f"<content:encoded><![CDATA[{clean_text}]]></content:encoded>"
-            except Exception:
-                pass
-                
-        enclosure = f'<enclosure url="{cover_url}" type="image/jpeg" length="0"/>' if cover_url else ""
-        
-        xml_items.append(f"""    <item>
-      <title>{title}</title>
-      <link>{xml_link}</link>
-      <guid isPermaLink="false">{orig_url or xml_link}</guid>
-      <pubDate>{pub_date}</pubDate>
-      <description>{digest}</description>
-      {enclosure}
-      {content_encoded}
-    </item>""")
-    
-    items_str = "\n".join(xml_items)
-    
-    rss_xml = f"""<?xml version="1.0" encoding="utf-8"?>
-<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
-  <channel>
-    <title>{html.escape(feed_title)}</title>
-    <link>{host_url}</link>
-    <description>{html.escape(feed_desc)}</description>
-    <language>zh-CN</language>
-    <lastBuildDate>{email.utils.formatdate(time.time(), usegmt=True)}</lastBuildDate>
-{items_str}
-  </channel>
-</rss>"""
-
-    return Response(rss_xml, mimetype="application/xml")
+    return rss_response(request, account)
