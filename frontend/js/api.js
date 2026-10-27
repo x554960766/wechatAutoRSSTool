@@ -40,6 +40,12 @@ const API = {
                 throw new Error(errMsg);
             }
 
+            if (data && (data.need_verify || (data.waterwall && data.waterwall.active))) {
+                if (window.WaterWall && typeof WaterWall.handleDetection === 'function') {
+                    WaterWall.handleDetection(data.waterwall || data);
+                }
+            }
+
             return data;
         } catch (err) {
             if (err.name === 'TypeError' && err.message.includes('fetch')) {
