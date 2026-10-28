@@ -11,9 +11,6 @@ import shutil
 import threading
 import queue
 import atexit
-import json
-import base64
-import html
 import requests
 import httpx
 import math
@@ -54,10 +51,70 @@ def lognormal_sleep(avg_delay: float = 6.0, sigma: float = 0.6):
     time.sleep(wait_time)
 
 def clean_filename(filename: str) -> str:
-    """清理文件名，移除不支持的字符"""
-    filename = re.sub(r'[\\/:*?"<>|\n\r\t]', "", filename)
+    """清理文件名，移除不支持的字符。
+
+    空输入返回空串（不再返回 "untitled"）：调用方普遍写 `clean_filename(x) or 兜底`，
+    若这里返回 "untitled" 会把兜底吃掉，导致标题为空时文件名变成 untitled。
+    """
+    filename = re.sub(r'[\\/:*?"<>|\n\r\t]', "", filename or "")
     filename = filename.strip().replace(" ", "_")
-    return filename[:80] if filename else "untitled"
+    return filename[:80]
+
+
+class XhsLoginRequired(Exception):
+    """未登录或登录已失效：需要用户先完成小红书扫码登录。"""
+
+    def __init__(self, message: str = "未登录小红书，请先扫码登录后再试。", hint: str = ""):
+        super().__init__(message)
+        self.message = message
+        self.hint = hint or "登录后可获取无水印视频，以及博主笔记列表"
+
+
+_TOPIC_MARK_RE = re.compile(r"\[话题\]")
+_HASH_RE = re.compile(r"[#＃]+")
+
+# 实测带水印的 streamType：259（WEB_259，H.264 兼容版，烧录了动态水印）
+WATERMARKED_STREAM_TYPES = frozenset({259})
+
+
+def title_from_desc(desc: str, note_id: str = "") -> str:
+    """视频笔记的 title 普遍为空、文案都在 desc 里，且带 `#话题#[话题]#` 标记。
+
+    取首行、剥掉话题标记但保留话题文字，作为标题兜底；
+    例如 `#实话实说而已[话题]#` → `实话实说而已`。
+    """
+    text = (desc or "").strip()
+    first = text.splitlines()[0].strip() if text else ""
+    if not first:
+        return note_id or ""
+    cleaned = _TOPIC_MARK_RE.sub("", first)
+    cleaned = _HASH_RE.sub(" ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ，。,.!！?？:：;；、")
+    return cleaned[:40] or note_id or ""
+
+
+def is_watermarked_stream(stream: dict) -> bool:
+    """判断视频流是否带水印。
+
+    实测同一篇笔记（逐条下载后抽帧比对）：
+      · 258 / X264_MP4      h264  720x1280  → 无
+      · **259 / WEB_259**   h264  720x1280  → **有**（左上「小红书」logo + 右上昵称，位置会移动）
+      · 520 / WEB_520       hevc  720x1280  → 无
+      · 617 / WEB_618       hevc  1080x1920  → 无
+
+    所以 259 是小红书烧录了动态水印的 H.264 兼容版本。
+    特别注意：**不能按「H.264 优先」排序**，259 恰好是 H.264，
+    旧逻辑会把唯一带水印的版本排到第一位，这才是「下载的视频一直有水印」的真正原因。
+    """
+    if not isinstance(stream, dict):
+        return False
+    try:
+        if int(stream.get("streamType") or 0) in WATERMARKED_STREAM_TYPES:
+            return True
+    except (TypeError, ValueError):
+        pass
+    desc = str(stream.get("streamDesc") or "").upper()
+    return desc.endswith("259") or "WATERMARK" in desc
 
 def write_note_text(note_dir: Path, detail: dict) -> int:
     """把笔记文字内容写入 文案.txt（对应 XHS-Downloader 记录的作品标题/描述/标签/数据字段）。
@@ -85,8 +142,8 @@ def write_note_text(note_dir: Path, detail: dict) -> int:
         print(f"写入文案失败: {e}")
         return 0
 
-def write_note_html(note_dir: Path, detail: dict, video_file: str = None, image_items: list = None, cos_url: str = None) -> int:
-    """生成与原文相似、可直接双击打开的 index.html，包含完整图文/视频媒体链接。
+def write_note_html(note_dir: Path, detail: dict, video_file: str = None, image_items: list = None) -> int:
+    """生成与原文相似、可直接双击打开的 index.html，引用本地已下载的媒体文件（离线可看）。
     返回写入字节数；失败不抛异常。"""
     try:
         from html import escape
@@ -99,23 +156,15 @@ def write_note_html(note_dir: Path, detail: dict, video_file: str = None, image_
         ptime = escape(detail.get("publish_time", ""))
         link = escape(detail.get("note_url", ""))
         desc = escape(detail.get("desc", "") or "")
-        images = detail.get("images", []) or []
 
         media_html = ""
-        effective_video = cos_url or detail.get("cos_url") or detail.get("video_url") or video_file or detail.get("video")
-        if effective_video:
-            media_html += f'<video controls src="{escape(str(effective_video))}"></video>'
-
-        if images:
-            for img_url in images:
-                if img_url:
-                    media_html += f'<img src="{escape(img_url)}" referrerpolicy="no-referrer" />'
-        elif image_items:
-            for it in image_items:
-                if it.get("img"):
-                    media_html += f'<img src="{escape(it["img"])}" />'
-                if it.get("live"):
-                    media_html += f'<video controls src="{escape(it["live"])}"></video>'
+        if video_file:
+            media_html += f'<video controls src="{escape(video_file)}"></video>'
+        for it in image_items:
+            if it.get("img"):
+                media_html += f'<img src="{escape(it["img"])}" />'
+            if it.get("live"):
+                media_html += f'<video controls src="{escape(it["live"])}"></video>'
 
         tags_html = " ".join(f'<span class="tag">#{escape(t)}</span>' for t in tags)
         stats_line = (f"赞 {escape(str(stats.get('liked','')))} · 藏 {escape(str(stats.get('collected','')))}"
@@ -157,272 +206,6 @@ img,video{{width:100%;border-radius:8px;margin:8px 0;display:block;}}
         print(f"写入 HTML 失败: {e}")
         return 0
 
-def upload_xhs_video_to_cos(video_path: Path, note_id: str, max_retries: int = 3, return_error: bool = False) -> str | None | tuple[str | None, str | None]:
-    """把本地下载的小红书视频文件上传到腾讯云 COS，返回公网链接。
-    - 上传路径前缀统一为 channels/ (如 channels/{note_id}.mp4)
-    - 强制使用小红书专属存储桶 chenshipin-hg-1305012248 与对应域名，完全隔离公众号/视频号
-    - 失败自动重试 3 次，若使用 STS 临时凭证接口则在重试时强行刷新 token
-    - 详细打印并输出 COS 失败原因
-    - 若 return_error=True，返回 (cos_url, error_msg)；否则直接返回 cos_url (兼容旧调用)
-    """
-    if not video_path or not video_path.exists():
-        err = f"视频文件不存在: {video_path}"
-        print(f"[小红书 COS] 错误: {err}", flush=True)
-        return (None, err) if return_error else None
-
-    if video_path.stat().st_size == 0:
-        err = f"视频文件大小为 0 字节: {video_path}"
-        print(f"[小红书 COS] 错误: {err}", flush=True)
-        return (None, err) if return_error else None
-
-    settings = get_settings()
-    token_api_url = (settings.get("cos_token_api_url") or "").strip()
-
-    # 小红书专属存储桶配置（彻底与公众号/视频号隔离，不受全局 cos_bucket 覆盖影响）
-    target_bucket = str(settings.get("xhs_cos_bucket") or "chenshipin-hg-1305012248").strip()
-    target_region = str(settings.get("xhs_cos_region") or settings.get("cos_region") or "ap-guangzhou").strip()
-    target_domain = str(settings.get("xhs_cos_cds_domain") or f"https://{target_bucket}.cos.{target_region}.myqcloud.com/").strip()
-    target_prefix = str(settings.get("xhs_cos_prefix") or "channels/").strip()
-    if not target_prefix.endswith("/"):
-        target_prefix += "/"
-    target_prefix = target_prefix.lstrip("/")
-
-    def _get_cos_cfg(force_refresh: bool = False) -> tuple[dict | None, str | None]:
-        if token_api_url:
-            try:
-                from backend.channels_upload import _fetch_cos_token
-                cfg = _fetch_cos_token(token_api_url, force_refresh=force_refresh)
-                if cfg:
-                    return cfg, None
-            except Exception as e:
-                return None, f"获取 STS 临时凭证失败: {e}"
-
-        s_id = str(settings.get("cos_secret_id") if settings.get("cos_secret_id") is not None else "").strip()
-        s_key = str(settings.get("cos_secret_key") if settings.get("cos_secret_key") is not None else "").strip()
-        if s_id and s_key:
-            return {
-                "secret_id": s_id,
-                "secret_key": s_key,
-                "region": target_region,
-                "bucket": target_bucket,
-            }, None
-
-        missing = []
-        if not s_id: missing.append("cos_secret_id")
-        if not s_key: missing.append("cos_secret_key")
-        return None, f"未配置腾讯云 COS 凭证密钥（缺少 {', '.join(missing)} 且未配置 cos_token_api_url）"
-
-    # 获取初始凭证
-    cos_cfg, cfg_err = _get_cos_cfg(force_refresh=False)
-    if not cos_cfg:
-        print(f"[小红书 COS] 跳过上传: {cfg_err}", flush=True)
-        return (None, cfg_err) if return_error else None
-
-    try:
-        from qcloud_cos import CosConfig, CosS3Client
-    except ImportError as e:
-        err = f"未安装 qcloud_cos 依赖包: {e}"
-        print(f"[小红书 COS] 错误: {err}", flush=True)
-        return (None, err) if return_error else None
-
-    key = f"{target_prefix}{note_id or int(time.time())}.mp4"
-
-    try:
-        data = video_path.read_bytes()
-    except Exception as e:
-        err = f"读取视频文件数据失败: {e}"
-        print(f"[小红书 COS] 错误: {err}", flush=True)
-        return (None, err) if return_error else None
-
-    last_err = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            # 重试时若走 STS 接口则强行刷新凭证
-            if attempt > 1 and token_api_url:
-                refreshed_cfg, _ = _get_cos_cfg(force_refresh=True)
-                if refreshed_cfg:
-                    cos_cfg = refreshed_cfg
-
-            cos_config_kwargs = {
-                "Region": target_region,
-                "SecretId": cos_cfg["secret_id"],
-                "SecretKey": cos_cfg["secret_key"],
-            }
-            if cos_cfg.get("token"):
-                cos_config_kwargs["Token"] = cos_cfg["token"]
-
-            config = CosConfig(**cos_config_kwargs)
-            client = CosS3Client(config)
-            client.put_object(Bucket=target_bucket, Body=data, Key=key)
-
-            cos_url = f"{target_domain.rstrip('/')}/{key.lstrip('/')}"
-            print(f"[小红书 COS] 视频上传成功 (尝试 {attempt}/{max_retries}): {cos_url}", flush=True)
-            return (cos_url, None) if return_error else cos_url
-        except Exception as e:
-            last_err = e
-            print(f"[小红书 COS] 视频上传失败 (第 {attempt}/{max_retries} 次重试, note_id={note_id}): {e}", flush=True)
-            if attempt < max_retries:
-                time.sleep(1.0 * attempt)
-
-    final_err_msg = f"重试 {max_retries} 次均失败: {last_err}"
-    print(f"[小红书 COS] 视频上传最终失败 (note_id={note_id}): {final_err_msg}", flush=True)
-    return (None, final_err_msg) if return_error else None
-
-def generate_note_content(detail: dict, cos_url: str = None) -> str:
-    """区分视频和图文生成 content：
-    - 视频：文案描述 + 标签 + <video src="腾讯云视频链接"></video>
-    - 图文：纯正文 HTML 片段格式，包含段落 <p> 与所有高清原图 <p><img src="..." referrerpolicy="no-referrer" /></p>
-    """
-    note_type = detail.get("type", "图文")
-    desc = detail.get("desc") or ""
-    tags = detail.get("tags") or []
-    images = detail.get("images") or []
-    effective_video_url = cos_url or detail.get("cos_url") or detail.get("video_url") or detail.get("video") or ""
-
-    is_video = (note_type == "视频") or bool(effective_video_url)
-
-    if is_video:
-        # 视频笔记：文案描述 + 标签 + <video src="..."></video> 拼接到最后
-        parts = []
-        if desc:
-            parts.append(desc)
-        if tags:
-            tags_str = " ".join("#" + t for t in tags)
-            parts.append(tags_str)
-        if effective_video_url:
-            parts.append(f'<video src="{effective_video_url}"></video>')
-        return "\n\n".join(parts) if parts else (f'<video src="{effective_video_url}"></video>' if effective_video_url else desc)
-
-    # 图文笔记：纯正文 HTML 片段（包含文字段落、标签与所有图片标签）
-    html_parts = []
-    if desc:
-        lines = [line.strip() for line in desc.split("\n") if line.strip()]
-        for line in lines:
-            html_parts.append(f"<p>{html.escape(line)}</p>")
-
-    if tags:
-        tags_str = " ".join("#" + html.escape(t) for t in tags)
-        html_parts.append(f"<p>{tags_str}</p>")
-
-    if images:
-        for img_url in images:
-            if img_url:
-                html_parts.append(f'<p><img src="{html.escape(img_url)}" referrerpolicy="no-referrer" /></p>')
-
-    return "".join(html_parts) if html_parts else (f"<p>{html.escape(desc)}</p>" if desc else "")
-
-def write_note_data_json(note_dir: Path, detail: dict, cos_url: str = None, video_file: str = None, image_items: list = None) -> dict:
-    """生成与公众号对齐的 data.json，视频与图文分别使用对应的 content 格式"""
-    try:
-        author = detail.get("author", {}) or {}
-        author_nick = author.get("nickname") or author.get("nickName") or "未知博主"
-        title = detail.get("title") or detail.get("note_id") or "无标题"
-        note_url = detail.get("note_url") or f"https://www.xiaohongshu.com/explore/{detail.get('note_id', '')}"
-        cover_url = detail.get("cover") or (detail.get("images", [""])[0] if detail.get("images") else "")
-        publish_time = detail.get("publish_time") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        desc = detail.get("desc") or ""
-        tags = detail.get("tags") or []
-        images = detail.get("images") or []
-
-        # 区分视频与图文生成 content 内容
-        content = generate_note_content(detail, cos_url=cos_url)
-
-        data = {
-            "source": author_nick,
-            "title": title,
-            "url": note_url,
-            "cover_url": cover_url,
-            "publish_time": publish_time,
-            "content": content,
-            "desc": desc,
-            "type": detail.get("type", "图文"),
-            "tags": tags,
-            "images": images,
-            "stats": detail.get("stats", {}),
-            "video_url": cos_url or detail.get("video") or "",
-            "cos_url": cos_url or "",
-            "note_id": detail.get("note_id", ""),
-            "author": author,
-            "local_dir": str(note_dir),
-            "created_time": time.time(),
-        }
-
-        data_path = note_dir / "data.json"
-        data_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8", errors="replace")
-        return data
-    except Exception as e:
-        print(f"写入 data.json 失败: {e}")
-        return {}
-
-def post_xhs_note_to_server(data_json: dict) -> tuple[bool, str | None]:
-    """把小红书笔记（以公众号相同的格式）推送到远端服务器"""
-    if not data_json or not isinstance(data_json, dict):
-        return False, "缺少有效的笔记数据"
-
-    settings = get_settings()
-    upload_enabled = settings.get("xhs_upload_enabled")
-    if upload_enabled is None:
-        upload_enabled = settings.get("rss_upload_enabled", False)
-
-    if not upload_enabled:
-        return False, "服务器上传功能未启用"
-
-    upload_url = (settings.get("xhs_upload_url") or settings.get("rss_upload_url") or "").strip()
-    if not upload_url:
-        return False, "未配置上传接口地址 (xhs_upload_url / rss_upload_url)"
-
-    content_str = data_json.get("content") or data_json.get("desc") or ""
-    content_b64 = base64.b64encode(content_str.encode("utf-8")).decode("ascii")
-
-    device_id = settings.get("xhs_device_id") or settings.get("device_id") or "小红书_caiji100"
-
-    article_item = {
-        "source": data_json.get("source", ""),
-        "title": data_json.get("title", ""),
-        "url": data_json.get("url", ""),
-        "cover_url": data_json.get("cover_url", ""),
-        "publish_time": data_json.get("publish_time", ""),
-        "content": content_b64,
-        "video_url": data_json.get("video_url") or data_json.get("cos_url") or "",
-        "cos_url": data_json.get("cos_url") or "",
-        "desc": data_json.get("desc", ""),
-        "type": data_json.get("type", "图文"),
-        "tags": data_json.get("tags", []),
-        "images": data_json.get("images", []),
-        "note_id": data_json.get("note_id", ""),
-    }
-
-    payload = {
-        "articles": [article_item],
-        "deviceId": device_id,
-    }
-
-    try:
-        resp = requests.post(
-            upload_url,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            proxies=get_proxies_dict(),
-            timeout=30
-        )
-        resp_text = resp.content.decode("utf-8", errors="replace") if hasattr(resp, "content") and resp.content else (resp.text or "")
-        print(f"[小红书服务器POST] 上传响应状态码: {resp.status_code}, 响应: {resp_text[:300]}")
-        resp.raise_for_status()
-
-        try:
-            body = json.loads(resp_text)
-            if isinstance(body, dict) and body.get("success") is False:
-                return False, body.get("message") or body.get("error") or "远端接口返回失败"
-        except Exception:
-            pass
-
-        return True, None
-    except Exception as e:
-        err_msg = str(e)
-        print(f"[小红书服务器POST] 上传失败: {err_msg}")
-        return False, err_msg
-
-
 # ── 小红书 API 客户端 ─────────────────────────────────────
 class XhsClient:
     USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -449,6 +232,18 @@ class XhsClient:
         if cookie:
             headers["cookie"] = cookie.strip()
         return headers
+
+    def login_state(self) -> dict:
+        """探测当前 Cookie 的登录态。
+
+        返回 {logged_in, guest, user_id}；logged_in 为 None 表示无法判定
+        （未装 xhshow / 网络失败），调用方不应据此判定为游客。
+        任何异常都不向外抛，避免登录探测本身阻塞下载主流程。
+        """
+        try:
+            return check_xhs_login(get_settings().get("xhs_cookie", ""))
+        except Exception as e:
+            return {"logged_in": None, "guest": None, "user_id": "", "error": str(e)}
         
     def _request(self, url: str, method: str = "GET", retries: int = None, **kwargs) -> curl_requests.Response:
         if retries is None:
@@ -464,7 +259,8 @@ class XhsClient:
 
         last_err = None
         for attempt in range(retries):
-            lognormal_sleep(avg_delay=3.5)
+            if attempt > 0:
+                lognormal_sleep(avg_delay=2.0)
 
             proxies = get_proxies_dict()
             proxy_url = proxies.get("http") if proxies else None
@@ -609,7 +405,15 @@ class XhsClient:
                 break
                 
         if not state_text:
-            if "login" in resp.url or "captcha" in html or "验证码" in html or "404?source=" in resp.url or "error_code=" in resp.url:
+            if "captcha" in html or "验证码" in html:
+                raise ValueError("触发小红书验证码拦截，请稍后重试或更新 Cookie。")
+            # 登录引导页同样不含 __INITIAL_STATE__，先判登录态，避免把「未登录」误报成「风控」
+            state_info = self.login_state()
+            if state_info.get("logged_in") is False:
+                raise XhsLoginRequired(
+                    "未登录小红书，该页面需要登录后才能访问。请先扫码登录小红书账号。"
+                )
+            if "login" in resp.url or "404?source=" in resp.url or "error_code=" in resp.url:
                 raise ValueError("触发风控或 Cookie 失效，请在登录页更新 Cookie。")
             raise ValueError("未在页面中找到 window.__INITIAL_STATE__，请检查链接或更新 Cookie。")
             
@@ -649,40 +453,31 @@ class XhsClient:
         except Exception:
             return str(count)
 
-    def get_note_detail(self, url: str) -> dict:
-        state = self.get_initial_state(url)
-        
-        note = None
-        if "noteData" in state:
-            note = state.get("noteData", {}).get("data", {}).get("noteData")
-        if not note and "note" in state:
-            note_detail_map = state.get("note", {}).get("noteDetailMap", {})
-            if note_detail_map and isinstance(note_detail_map, dict):
-                note = list(note_detail_map.values())[-1].get("note")
-                
-        if not note:
-            raise ValueError("触发风控或 Cookie 失效，请在登录页更新 Cookie。")
-            
-        note_id = note.get("noteId") or note.get("id", "")
-        title = note.get("title", "").strip()
-        desc = note.get("desc", "").strip()
-        
-        tag_list = note.get("tagList", [])
+    def _parse_note_detail(self, note: dict, note_id: str = "", url: str = "") -> dict:
+        """标准化解析单篇笔记的详情字段，兼容 Web API (feed) 和 SSR state 数据结构"""
+        if not isinstance(note, dict):
+            return {}
+
+        note_id = note_id or note.get("noteId") or note.get("note_id") or note.get("id", "")
+        desc = (note.get("desc") or "").strip()
+        title = (note.get("title") or note.get("display_title") or note.get("displayTitle") or "").strip() or title_from_desc(desc, note_id)
+
+        tag_list = note.get("tagList") or note.get("tag_list") or []
         tags = []
         if isinstance(tag_list, list):
             for tag in tag_list:
                 if isinstance(tag, dict) and tag.get("name"):
                     tags.append(tag["name"])
-                    
-        interact = note.get("interactInfo", {})
+
+        interact = note.get("interactInfo") or note.get("interact_info") or {}
         stats = {
-            "liked": self.format_count(interact.get("likedCount")),
-            "collected": self.format_count(interact.get("collectedCount")),
-            "comment": self.format_count(interact.get("commentCount")),
-            "share": self.format_count(interact.get("shareCount"))
+            "liked": self.format_count(interact.get("likedCount") or interact.get("liked_count")),
+            "collected": self.format_count(interact.get("collectedCount") or interact.get("collected_count")),
+            "comment": self.format_count(interact.get("commentCount") or interact.get("comment_count")),
+            "share": self.format_count(interact.get("shareCount") or interact.get("share_count"))
         }
-        
-        t = note.get("time")
+
+        t = note.get("time") or note.get("last_update_time")
         if t:
             try:
                 dt = datetime.fromtimestamp(float(t) / 1000)
@@ -694,56 +489,60 @@ class XhsClient:
         else:
             publish_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             timestamp = int(time.time())
-            
-        user_info = note.get("user", {})
-        author_id = user_info.get("userId", "")
+
+        user_info = note.get("user") or {}
+        author_id = user_info.get("userId") or user_info.get("user_id") or ""
         author = {
             "user_id": author_id,
-            "nickname": user_info.get("nickname", user_info.get("nickName", "未知博主")),
-            "avatar": user_info.get("avatar", ""),
+            "nickname": user_info.get("nickname") or user_info.get("nickName") or "未知博主",
+            "avatar": user_info.get("avatar") or "",
             "url": f"https://www.xiaohongshu.com/user/profile/{author_id}" if author_id else ""
         }
-        
+
         note_type_raw = note.get("type", "normal")
-        image_list = note.get("imageList", [])
+        image_list = note.get("imageList") or note.get("image_list") or []
         if not isinstance(image_list, list):
             image_list = []
-            
-        if note_type_raw == "video" or note.get("video"):
+
+        if note_type_raw == "video" or note.get("video") or note.get("media"):
             note_type = "视频"
         else:
             note_type = "图文"
-            
+
         images = []
         lives = []
-        
+
         settings = get_settings()
         img_fmt = settings.get("xhs_image_format", "png")
         live_enabled = settings.get("xhs_download_live", True)
-        
+
         for img in image_list:
             if not isinstance(img, dict):
                 continue
-            img_url = img.get("urlDefault") or img.get("url") or ""
+            img_url = img.get("urlDefault") or img.get("url_default") or img.get("url") or img.get("url_pre") or ""
+            if not img_url and img.get("info_list"):
+                info_list = img.get("info_list")
+                if isinstance(info_list, list) and len(info_list) > 0:
+                    img_url = info_list[0].get("url", "")
             if img_url:
                 try:
                     img_url = bytes(img_url, "utf-8").decode("unicode_escape")
                 except Exception:
                     pass
-                
+
                 parts = img_url.split("/")
                 if len(parts) >= 6:
                     token = "/".join(parts[5:]).split("!")[0]
                 else:
                     token = parts[-1].split("!")[0]
-                    
+
                 if img_fmt == "auto":
                     final_img_url = f"https://sns-img-bd.xhscdn.com/{token}"
                 else:
                     final_img_url = f"https://ci.xiaohongshu.com/{token}?imageView2/format/{img_fmt}"
-                    
+
                 images.append(final_img_url)
-                
+
                 live_url = None
                 if live_enabled:
                     stream = img.get("stream")
@@ -754,14 +553,15 @@ class XhsClient:
                             if isinstance(item, dict):
                                 live_url = item.get("masterUrl")
                 lives.append(live_url)
-                
+
         video = None
         video_candidates = []
+        video_watermarked = False
         video_info = note.get("video") or note.get("media") or {}
         if isinstance(video_info, dict) and video_info:
             media = video_info.get("media", {}) if isinstance(video_info.get("media"), dict) else (video_info if "stream" in video_info else {})
             stream = media.get("stream", {}) if isinstance(media.get("stream"), dict) else (video_info.get("stream", {}) if isinstance(video_info.get("stream"), dict) else (note.get("stream", {}) if isinstance(note.get("stream"), dict) else {}))
-            
+
             all_streams = []
             if isinstance(stream, dict):
                 for k, v in stream.items():
@@ -772,18 +572,19 @@ class XhsClient:
 
             def stream_sort_key(s):
                 if not isinstance(s, dict):
-                    return (-1, 0, 0)
+                    return (-1, 0, 0, 0)
                 v_codec = str(s.get("videoCodec", "")).lower()
                 s_desc = str(s.get("streamDesc", "")).lower()
-                # 优先 H.264/AVC 编码（EF4 或包含 264），全设备与浏览器完美播放绝不黑屏
-                is_h264 = 1 if (v_codec in ("ef4", "h264", "avc", "avc1") or "264" in s_desc or s.get("streamType") == 259) else 0
+                clean = 0 if is_watermarked_stream(s) else 1
                 res = float(s.get("height") or 0) * float(s.get("width") or 0) or float(s.get("height") or 0)
                 size = float(s.get("size") or s.get("videoBitrate") or 0)
-                return (is_h264, res, size)
+                is_h264 = 1 if (v_codec in ("ef4", "h264", "avc", "avc1") or "264" in s_desc) else 0
+                return (clean, res, size, is_h264)
 
             valid_streams = [s for s in all_streams if isinstance(s, dict)]
             if valid_streams:
                 valid_streams.sort(key=stream_sort_key, reverse=True)
+                video_watermarked = all(is_watermarked_stream(s) for s in valid_streams)
                 for s in valid_streams:
                     master_url = s.get("masterUrl")
                     if master_url and master_url not in video_candidates:
@@ -803,6 +604,8 @@ class XhsClient:
                     u = f"https://{host}/{origin_key}"
                     if u not in video_candidates:
                         video_candidates.append(u)
+                video_candidates.sort(key=lambda x: 0 if origin_key in x else 1)
+                video_watermarked = False
 
             for k in ["masterUrl", "url", "videoUrl", "mainUrl"]:
                 u = video_info.get(k) or media.get(k)
@@ -812,24 +615,26 @@ class XhsClient:
         if video_candidates:
             video = video_candidates[0]
             note_type = "视频"
-                            
+
         cover = images[0] if images else ""
         if note_type == "视频":
             cover_info = note.get("cover", {})
             if isinstance(cover_info, dict):
-                cover_url = cover_info.get("urlDefault") or cover_info.get("url")
+                cover_url = cover_info.get("urlDefault") or cover_info.get("url_default") or cover_info.get("url")
                 if cover_url:
                     try:
                         cover = bytes(cover_url, "utf-8").decode("unicode_escape")
                     except Exception:
                         cover = cover_url
-                        
-        token_match = re.search(r"xsec_token=([a-zA-Z0-9_\-]+)", url)
-        xsec_token = token_match.group(1) if token_match else ""
+
+        xsec_token = ""
+        if url:
+            token_match = re.search(r"xsec_token=([a-zA-Z0-9_\-]+)", url)
+            xsec_token = token_match.group(1) if token_match else ""
         clean_url = f"https://www.xiaohongshu.com/explore/{note_id}"
         if xsec_token:
             clean_url += f"?xsec_token={xsec_token}"
-            
+
         return {
             "note_id": note_id,
             "note_url": clean_url,
@@ -845,8 +650,163 @@ class XhsClient:
             "lives": lives,
             "video": video,
             "video_candidates": video_candidates,
+            "video_watermarked": video_watermarked,
             "cover": cover
         }
+
+    def get_note_detail_via_api(self, note_id: str, xsec_token: str = "") -> dict | None:
+        """参考 xhscrawl: 通过 edith.xiaohongshu.com/api/sns/web/v1/feed 官方接口签名提取笔记。
+        无需抓取网页 HTML，极大降低由于无头浏览器被识别导致的 461 / 验证码风控。"""
+        if Xhshow is None or not note_id:
+            return None
+        cookie = get_settings().get("xhs_cookie", "").strip()
+        if not cookie:
+            return None
+
+        from urllib.parse import unquote
+        xsec_token = unquote(xsec_token) if xsec_token else ""
+
+        payload = {
+            "source_note_id": note_id,
+            "image_formats": ["jpg", "webp", "avif"],
+            "extra": {"need_body_topic": "1"},
+        }
+        if xsec_token:
+            payload["xsec_token"] = xsec_token
+
+        uri = "/api/sns/web/v1/feed"
+        try:
+            from xhshow.config.config import CryptoConfig
+            config = CryptoConfig().with_overrides(PUBLIC_USERAGENT=self.USER_AGENT)
+            signer = Xhshow(config)
+            headers = signer.sign_headers_post(
+                uri=uri,
+                cookies=cookie,
+                payload=payload,
+                sign_format="xyw"
+            )
+            headers["cookie"] = cookie
+            headers["content-type"] = "application/json;charset=UTF-8"
+            headers["origin"] = "https://www.xiaohongshu.com"
+            headers["referer"] = "https://www.xiaohongshu.com/"
+            headers["user-agent"] = self.USER_AGENT
+            headers["accept"] = "application/json, text/plain, */*"
+
+            proxies = get_proxies_dict()
+            proxy_url = proxies.get("http") if proxies else None
+
+            resp = curl_requests.post(
+                "https://edith.xiaohongshu.com" + uri,
+                data=json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"),
+                headers=headers,
+                impersonate="chrome124",
+                proxy=proxy_url,
+                timeout=15
+            )
+            if resp.status_code == 200:
+                res_data = resp.json()
+                if res_data.get("success") and res_data.get("data"):
+                    items = res_data["data"].get("items") or []
+                    if items and isinstance(items, list):
+                        note_card = items[0].get("note_card") or items[0].get("noteCard") or {}
+                        if note_card:
+                            return self._parse_note_detail(note_card, note_id=note_id)
+        except Exception as e:
+            print(f"Feed API 提取笔记详情失败: {e}")
+        return None
+
+    def get_note_detail_via_browser(self, url: str) -> dict | None:
+        """参考 xhscrawl: 使用 Playwright + Stealth 自动化渲染获取笔记（终极防风控兜底）"""
+        from playwright.sync_api import sync_playwright
+        from backend.runtime import launch_chromium
+        try:
+            from playwright_stealth import Stealth
+            has_stealth = True
+        except ImportError:
+            has_stealth = False
+
+        cookie = get_settings().get("xhs_cookie", "").strip()
+        pairs = []
+        if cookie:
+            for part in cookie.split(";"):
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    pairs.append({"name": k.strip(), "value": v.strip(), "domain": ".xiaohongshu.com", "path": "/"})
+
+        try:
+            with sync_playwright() as p:
+                browser = launch_chromium(p.chromium, headless=True, args=['--disable-blink-features=AutomationControlled'])
+                try:
+                    context = browser.new_context(
+                        viewport={'width': 1280, 'height': 800},
+                        user_agent=self.USER_AGENT,
+                        locale="zh-CN",
+                        timezone_id="Asia/Shanghai"
+                    )
+                    if pairs:
+                        context.add_cookies(pairs)
+                    page = context.new_page()
+                    if has_stealth:
+                        Stealth().apply_stealth_sync(page)
+                    page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                    page.wait_for_timeout(1000)
+
+                    state = page.evaluate("() => window.__INITIAL_STATE__ || window.__INITIAL_DATA__ || {}")
+                    if state:
+                        note = None
+                        if "noteData" in state:
+                            note = state.get("noteData", {}).get("data", {}).get("noteData")
+                        if not note and "note" in state:
+                            note_detail_map = state.get("note", {}).get("noteDetailMap", {})
+                            if note_detail_map and isinstance(note_detail_map, dict):
+                                note = list(note_detail_map.values())[-1].get("note")
+                        if note:
+                            return self._parse_note_detail(note, url=url)
+                finally:
+                    browser.close()
+        except Exception as e:
+            print(f"浏览器兜底获取笔记详情失败: {e}")
+        return None
+
+    def get_note_detail(self, url: str) -> dict:
+        note_id = self.extract_note_id(url)
+        token_match = re.search(r"xsec_token=([a-zA-Z0-9_\-]+)", url)
+        xsec_token = token_match.group(1) if token_match else ""
+
+        # 1. 优先尝试 xhscrawl 推荐的 edith feed 官方签名接口
+        if note_id:
+            api_detail = self.get_note_detail_via_api(note_id, xsec_token)
+            if api_detail:
+                return api_detail
+
+        # 2. 备选：页面 HTTP SSR 解析
+        last_ssr_err = None
+        try:
+            state = self.get_initial_state(url)
+            note = None
+            if "noteData" in state:
+                note = state.get("noteData", {}).get("data", {}).get("noteData")
+            if not note and "note" in state:
+                note_detail_map = state.get("note", {}).get("noteDetailMap", {})
+                if note_detail_map and isinstance(note_detail_map, dict):
+                    note = list(note_detail_map.values())[-1].get("note")
+            if note:
+                return self._parse_note_detail(note, note_id=note_id, url=url)
+        except Exception as e:
+            last_ssr_err = e
+
+        # 3. 终极防风控兜底：Playwright + Stealth 自动化渲染
+        browser_detail = self.get_note_detail_via_browser(url)
+        if browser_detail:
+            return browser_detail
+
+        if last_ssr_err:
+            raise last_ssr_err
+
+        state_info = self.login_state()
+        if state_info.get("logged_in") is False:
+            raise XhsLoginRequired("未登录小红书，该页面需要登录后才能查看。请先扫码登录小红书账号。")
+        raise ValueError("触发风控或 Cookie 失效，请在登录页更新 Cookie。")
 
     def _parse_note_item(self, it: dict) -> dict | None:
         """把 user_posted API 或 SSR / DOM 的单条 note 解析成前端列表项；非 dict 返回 None。"""
@@ -881,7 +841,7 @@ class XhsClient:
         else:
             cover = ""
 
-        # 4. 提取 interact_info (liked) 与 sticky (置顶标记)
+        # 4. 提取 interact_info (liked)
         interact = (
             it.get("interact_info")
             or it.get("interactInfo")
@@ -891,28 +851,12 @@ class XhsClient:
         )
         if isinstance(interact, dict):
             liked_raw = interact.get("liked_count") or interact.get("likedCount") or it.get("liked", "0")
-            sticky = bool(interact.get("sticky") or interact.get("is_sticky") or interact.get("isSticky"))
         else:
             liked_raw = str(interact) if interact else "0"
-            sticky = bool(it.get("sticky") or note_card.get("sticky"))
-        if not sticky:
-            sticky = bool(it.get("sticky") or note_card.get("sticky"))
         liked = self.format_count(liked_raw)
 
         # 5. 提取 type
         note_type = "video" if (it.get("type") == "video" or note_card.get("type") == "video") else "normal"
-
-        # 6. 提取 timestamp 与 publish_time
-        t_raw = it.get("time") or note_card.get("time")
-        timestamp = 0
-        publish_time = ""
-        if t_raw:
-            try:
-                t_sec = float(t_raw) / 1000.0 if float(t_raw) > 1e11 else float(t_raw)
-                timestamp = int(t_sec)
-                publish_time = datetime.fromtimestamp(t_sec).strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                pass
 
         return {
             "note_id": nid,
@@ -921,9 +865,6 @@ class XhsClient:
             "cover": cover,
             "type": note_type,
             "liked": liked,
-            "sticky": sticky,
-            "timestamp": timestamp,
-            "publish_time": publish_time,
         }
 
     def get_user_posted(self, user_id: str, xsec_token: str = "", cursor: str = "", xsec_source: str = "pc_feed") -> tuple:
@@ -976,7 +917,6 @@ class XhsClient:
 
         proxies = get_proxies_dict()
         proxy_url = proxies.get("http") if proxies else None
-        lognormal_sleep(avg_delay=4.5)
         try:
             resp = curl_requests.get(
                 full_url, headers=headers, impersonate="chrome124",
@@ -1033,17 +973,6 @@ class XhsClient:
                 pass
             interact = note_card.get("interactInfo", {})
             liked = self.format_count(interact.get("likedCount", "0")) if isinstance(interact, dict) else "0"
-            sticky = bool(interact.get("sticky")) if isinstance(interact, dict) else False
-            t_raw = item.get("time") or note_card.get("time")
-            timestamp = 0
-            publish_time = ""
-            if t_raw:
-                try:
-                    t_sec = float(t_raw) / 1000.0 if float(t_raw) > 1e11 else float(t_raw)
-                    timestamp = int(t_sec)
-                    publish_time = datetime.fromtimestamp(t_sec).strftime("%Y-%m-%d %H:%M:%S")
-                except Exception:
-                    pass
             notes_list.append({
                 "note_id": item.get("id", "") or note_card.get("noteId", ""),
                 "xsec_token": item.get("xsecToken", ""),
@@ -1051,9 +980,6 @@ class XhsClient:
                 "cover": cover,
                 "type": "video" if note_card.get("type") == "video" else "normal",
                 "liked": liked,
-                "sticky": sticky,
-                "timestamp": timestamp,
-                "publish_time": publish_time,
             })
         return notes_list
 
@@ -1108,7 +1034,19 @@ class XhsClient:
             result["notes"] = notes_list
             result["has_more"] = browser_has_more
         except Exception as browser_err:
-            print(f"浏览器拦截获取笔记列表失败: {browser_err}")
+            err_msg = str(browser_err)
+            try:
+                print(f"浏览器拦截获取笔记列表失败: {err_msg}")
+            except Exception:
+                pass
+
+            # 如果明确需要登录或登录已失效，直接标记 login_required 并提示用户，无需多余重试
+            if "登录" in err_msg or "安全限制" in err_msg:
+                result["notes"] = self._parse_ssr_notes(state)
+                result["login_required"] = True
+                result["warning"] = "小红书登录凭证已失效或未登录，无法拉取完整博主笔记列表。请在左侧「登录管理」重新扫码登录。"
+                return result
+
             try:
                 notes_list, _has_more, _cursor = self.get_user_posted(user_id, xsec_token, xsec_source=xsec_source)
                 result["notes"] = notes_list
@@ -1183,7 +1121,7 @@ class _XhsBrowserSession:
         self._init_error = None
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        self._ready.wait(timeout=45)
+        self._ready.wait(timeout=15)
         if self._init_error:
             raise self._init_error
         if not self._ready.is_set():
@@ -1242,11 +1180,20 @@ class _XhsBrowserSession:
 
     def _do_scroll(self, page, max_pages: int) -> tuple:
         target = self._pages_loaded + max_pages
-        for _ in range(max_pages * 6 + 3):
+        idle_rounds = 0
+        last_captured = len(self._captured)
+        for _ in range(max_pages * 4 + 2):
             if not self._has_more or self._pages_loaded >= target:
                 break
             page.mouse.wheel(0, 1000)
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(800)
+            if len(self._captured) == last_captured:
+                idle_rounds += 1
+                if idle_rounds >= 3:
+                    break
+            else:
+                idle_rounds = 0
+                last_captured = len(self._captured)
 
         fresh = []
         for it in self._captured:
@@ -1275,15 +1222,25 @@ class _XhsBrowserSession:
                 try:
                     context = browser.new_context(
                         viewport={'width': 1280, 'height': 800},
-                        user_agent=self._user_agent
-                    )
-                    context.add_init_script(
-                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+                        user_agent=self._user_agent,
+                        locale="zh-CN",
+                        timezone_id="Asia/Shanghai"
                     )
                     context.add_cookies(self._cookie_pairs())
                     page = context.new_page()
+                    try:
+                        from playwright_stealth import Stealth
+                        Stealth().apply_stealth_sync(page)
+                    except Exception:
+                        pass
                     page.on("response", self._on_response)
-                    page.goto(profile_url, wait_until="networkidle", timeout=30000)
+                    page.goto(profile_url, wait_until="domcontentloaded", timeout=15000)
+
+                    # 检查是否重定向到登录页或遇到安全验证
+                    cur_url = (page.url or "").lower()
+                    cur_title = page.title() or ""
+                    if "/login" in cur_url or "安全限制" in cur_title or "验证码" in cur_title:
+                        raise RuntimeError("小红书登录已失效或需要重新验证，请在左侧「登录管理」重新扫码登录")
 
                     # 提取首屏（第 1 页）SSR 及 DOM 笔记
                     try:
@@ -1324,21 +1281,16 @@ class _XhsBrowserSession:
                                         const nid = item.id || item.noteId || item.note_id || card.noteId || card.note_id || '';
                                         const title = card.displayTitle || card.display_title || '';
                                         const token = item.xsecToken || item.xsec_token || card.xsecToken || card.xsec_token || '';
-                                        const isSticky = !!(interact.sticky || interact.is_sticky || card.sticky || item.sticky);
-                                        const rawTime = card.time || item.time || 0;
                                         if (nid && !seen.has(nid)) {
                                             list.push({
                                                 note_id: nid,
                                                 xsec_token: token,
                                                 display_title: title,
                                                 cover: cover,
-                                                time: rawTime,
                                                 type: (card.type === 'video' || item.type === 'video') ? 'video' : 'normal',
                                                 interact_info: {
-                                                    liked_count: String(interact.likedCount || interact.liked_count || '0'),
-                                                    sticky: isSticky
-                                                },
-                                                sticky: isSticky
+                                                    liked_count: String(interact.likedCount || interact.liked_count || '0')
+                                                }
                                             });
                                             seen.add(nid);
                                         }
@@ -1373,7 +1325,6 @@ class _XhsBrowserSession:
                                         const likeEl = el.querySelector('.like-wrapper, .count, [class*="like"], [class*="count"]');
                                         const liked = likeEl ? (likeEl.textContent || '').trim() : '0';
                                         const isVideo = !!el.querySelector('.play-icon, [class*="play"], svg[class*="play"]');
-                                        const isSticky = !!el.querySelector('[class*="sticky"], [class*="top"], .note-item-top');
                                         list.push({
                                             note_id: nid,
                                             xsec_token: token,
@@ -1381,10 +1332,8 @@ class _XhsBrowserSession:
                                             cover: cover,
                                             type: isVideo ? 'video' : 'normal',
                                             interact_info: {
-                                                liked_count: liked,
-                                                sticky: isSticky
-                                            },
-                                            sticky: isSticky
+                                                liked_count: liked
+                                            }
                                         });
                                         seen.add(nid);
                                     }
@@ -1402,11 +1351,11 @@ class _XhsBrowserSession:
                         print(f"提取首屏笔记异常: {e}")
 
                     if self._pages_loaded == 0:
-                        page.wait_for_timeout(3000)
+                        page.wait_for_timeout(1000)
                     if self._pages_loaded == 0:
-                        for _ in range(3):
+                        for _ in range(2):
                             page.mouse.wheel(0, 800)
-                            page.wait_for_timeout(2000)
+                            page.wait_for_timeout(1000)
                             if self._pages_loaded > 0:
                                 break
 
@@ -1583,7 +1532,7 @@ def _do_xhs_download_thread(task_id: str, urls: list, account_name: str):
                 
         try:
             detail = client.get_note_detail(url)
-            author_nick = clean_filename(detail["author"]["nickname"])
+            author_nick = clean_filename(detail["author"]["nickname"]) or "未知博主"
             pub_date = detail["publish_time"].split()[0]
             clean_title = clean_filename(detail["title"]) or detail["note_id"]
             
@@ -1627,15 +1576,7 @@ def _do_xhs_download_thread(task_id: str, urls: list, account_name: str):
                         except Exception as e:
                             last_download_err = e
                             continue
-                    if video_ok:
-                        # 尝试将视频上传到腾讯云 COS (支持失败自动重试3次)
-                        cos_url, cos_err = upload_xhs_video_to_cos(save_file, detail["note_id"], return_error=True)
-                        if cos_url:
-                            detail["cos_url"] = cos_url
-                            detail["video_url"] = cos_url
-                        elif cos_err:
-                            detail["cos_error"] = cos_err
-                    else:
+                    if not video_ok:
                         success = False
                         error_msg = f"视频下载失败: {last_download_err or '所有备选视频源均无法下载'}"
                 else:
@@ -1669,15 +1610,6 @@ def _do_xhs_download_thread(task_id: str, urls: list, account_name: str):
 
             # 生成可直接打开的 HTML（引用本地已下载媒体）
             total_size += write_note_html(note_dir, detail, video_file_name, image_items)
-
-            # 生成与公众号对齐的 data.json（包含视频 COS 链接与文字描述合并内容）
-            data_json = write_note_data_json(note_dir, detail, cos_url=detail.get("cos_url"), video_file=video_file_name, image_items=image_items)
-
-            # 如果开启了服务器上传，像公众号一样推送到远端服务器
-            uploaded_ok = False
-            upload_err = None
-            if success:
-                uploaded_ok, upload_err = post_xhs_note_to_server(data_json)
                     
             with _download_lock:
                 task = _download_tasks.get(task_id)
@@ -1688,8 +1620,7 @@ def _do_xhs_download_thread(task_id: str, urls: list, account_name: str):
                             "title": detail["title"] or detail["note_id"],
                             "success": True,
                             "path": str(note_dir),
-                            "cos_url": detail.get("cos_url", ""),
-                            "uploaded": uploaded_ok
+                            "watermarked": bool(detail.get("video_watermarked")),
                         })
                     else:
                         task["failed"] += 1
@@ -1709,23 +1640,24 @@ def _do_xhs_download_thread(task_id: str, urls: list, account_name: str):
                 "time": time.time(),
                 "success": success,
                 "error": error_msg,
-                "cos_url": detail.get("cos_url", ""),
-                "cos_error": detail.get("cos_error", None),
-                "uploaded": uploaded_ok if success else False,
-                "upload_error": upload_err if (success and not uploaded_ok) else None,
-                "upload_time": time.time() if (success and uploaded_ok) else None,
+                "watermarked": bool(detail.get("video_watermarked")),
             })
             save_json(XHS_HISTORY_FILE, history)
             
         except Exception as e:
             err_str = str(e)
+            # 未登录单独标记，前端据此弹「去登录」而不是当成普通下载失败
+            need_login = isinstance(e, XhsLoginRequired)
             with _download_lock:
                 task = _download_tasks.get(task_id)
                 if task:
                     task["failed"] += 1
+                    if need_login:
+                        task["login_required"] = True
                     task["results"].append({
                         "title": f"Link_{idx + 1}",
                         "success": False,
+                        "login_required": need_login,
                         "error": err_str
                     })
                     
@@ -1738,6 +1670,7 @@ def _do_xhs_download_thread(task_id: str, urls: list, account_name: str):
                 "size": 0,
                 "time": time.time(),
                 "success": False,
+                "login_required": need_login,
                 "error": err_str
             })
             save_json(XHS_HISTORY_FILE, history)
@@ -1770,7 +1703,25 @@ def parse_url():
             return jsonify({"error": "未能从输入中提取到有效小红书链接，请确保包含explore或discovery链接"}), 400
         
         detail = client.get_note_detail(links[0])
+        # 未登录也能解析出数据，但只能拿到 720P 的 258 流；登录后才有 1080P 的 617 流
+        state_info = client.login_state()
+        need_login = state_info.get("logged_in") is False
+        detail["logged_in"] = state_info.get("logged_in")
+        detail["login_required"] = need_login
+        if detail.get("video_watermarked"):
+            detail["login_hint"] = "该笔记当前只提供带水印视频流，暂无可下载的无水印版本。"
+        elif need_login:
+            detail["login_hint"] = "未登录小红书：视频只能获取 720P 版本，登录后可下载 1080P 无水印视频。"
+        if need_login or detail.get("video_watermarked"):
+            detail["login_page"] = "xhs_login"
         return jsonify(detail)
+    except XhsLoginRequired as e:
+        return jsonify({
+            "error": str(e),
+            "code": "login_required",
+            "login_page": "xhs_login",
+            "hint": e.hint,
+        }), 401
     except Exception as e:
         return jsonify({"error": f"解析失败: {str(e)}"}), 500
 
@@ -1813,7 +1764,18 @@ def download_urls():
     )
     thread.start()
     
-    return jsonify({"task_id": task_id, "message": f"已启动下载任务，共 {len(extracted_urls)} 个链接", "count": len(extracted_urls)})
+    # 未登录不阻断下载，但必须明确告知：只会拿到带水印视频
+    payload = {
+        "task_id": task_id,
+        "message": f"已启动下载任务，共 {len(extracted_urls)} 个链接",
+        "count": len(extracted_urls),
+    }
+    state_info = client.login_state()
+    if state_info.get("logged_in") is False:
+        payload["login_required"] = True
+        payload["login_page"] = "xhs_login"
+        payload["warning"] = "当前未登录小红书，视频将保存为 720P 版本。登录后可下载 1080P 无水印视频。"
+    return jsonify(payload)
 
 @xhs_bp.route("/accounts", methods=["GET"])
 def list_accounts():
@@ -2023,7 +1985,6 @@ def delete_history_item(index):
 def open_folder():
     import subprocess
     import sys
-    import os
     
     data = request.get_json() or {}
     account = data.get("account", "").strip()
@@ -2034,16 +1995,12 @@ def open_folder():
         
     try:
         path.mkdir(parents=True, exist_ok=True)
-        resolved_path = str(path.resolve())
         if sys.platform == "darwin":
-            subprocess.run(["open", resolved_path])
+            subprocess.run(["open", str(path)])
         elif sys.platform == "win32":
-            if hasattr(os, "startfile"):
-                os.startfile(resolved_path)
-            else:
-                subprocess.run(f'explorer "{resolved_path}"', shell=True)
+            subprocess.run(["explorer", str(path)])
         else:
-            subprocess.run(["xdg-open", resolved_path])
+            subprocess.run(["xdg-open", str(path)])
         return jsonify({"message": "文件夹已打开"})
     except Exception as e:
         return jsonify({"error": f"打开文件夹失败: {str(e)}"}), 500
@@ -2052,7 +2009,6 @@ def open_folder():
 def open_file():
     import subprocess
     import sys
-    import os
     
     data = request.get_json() or {}
     path_str = data.get("path", "")
@@ -2064,16 +2020,12 @@ def open_file():
         if not path.exists():
             return jsonify({"error": "文件或文件夹不存在"}), 404
             
-        resolved_path = str(path.resolve())
         if sys.platform == "darwin":
-            subprocess.run(["open", resolved_path])
+            subprocess.run(["open", str(path)])
         elif sys.platform == "win32":
-            if hasattr(os, "startfile"):
-                os.startfile(resolved_path)
-            else:
-                subprocess.run(f'explorer "{resolved_path}"', shell=True)
+            subprocess.run(["explorer", str(path)])
         else:
-            subprocess.run(["xdg-open", resolved_path])
+            subprocess.run(["xdg-open", str(path)])
         return jsonify({"message": "已打开"})
     except Exception as e:
         return jsonify({"error": f"打开失败: {str(e)}"}), 500
@@ -2082,7 +2034,6 @@ def open_file():
 def open_parent():
     import subprocess
     import sys
-    import os
     
     data = request.get_json() or {}
     path_str = data.get("path", "")
@@ -2094,112 +2045,20 @@ def open_parent():
         if not path.exists():
             return jsonify({"error": "文件或文件夹不存在"}), 404
             
-        resolved_path = str(path.resolve())
         if path.is_file():
             if sys.platform == "darwin":
-                subprocess.run(["open", "-R", resolved_path])
+                subprocess.run(["open", "-R", str(path)])
             elif sys.platform == "win32":
-                subprocess.run(f'explorer /select,"{resolved_path}"', shell=True)
+                subprocess.run(f'explorer /select,"{path.resolve()}"', shell=True)
             else:
-                subprocess.run(["xdg-open", str(path.parent.resolve())])
+                subprocess.run(["xdg-open", str(path.parent)])
         else:
             if sys.platform == "darwin":
-                subprocess.run(["open", resolved_path])
+                subprocess.run(["open", str(path)])
             elif sys.platform == "win32":
-                if hasattr(os, "startfile"):
-                    os.startfile(resolved_path)
-                else:
-                    subprocess.run(f'explorer "{resolved_path}"', shell=True)
+                subprocess.run(f'explorer "{path.resolve()}"', shell=True)
             else:
-                subprocess.run(["xdg-open", resolved_path])
+                subprocess.run(["xdg-open", str(path)])
         return jsonify({"message": "已打开"})
     except Exception as e:
         return jsonify({"error": f"打开失败: {str(e)}"}), 500
-
-
-# ── 自动采集路由 ──────────────────────────────────────────
-@xhs_bp.route("/auto-collect/status", methods=["GET"])
-def auto_collect_status():
-    from backend.xhs_scheduler import xhs_collector
-    return jsonify(xhs_collector.get_status())
-
-
-@xhs_bp.route("/auto-collect/toggle", methods=["POST"])
-def auto_collect_toggle():
-    from backend.xhs_scheduler import xhs_collector
-    data = request.get_json() or {}
-    user_id = data.get("user_id", "").strip()
-    if not user_id:
-        return jsonify({"error": "缺少 user_id"}), 400
-
-    auto_collect = data.get("auto_collect_enabled")
-    interval = data.get("collect_interval_minutes")
-    target = xhs_collector.update_account_config(user_id, auto_collect=auto_collect, interval_minutes=interval)
-    if not target:
-        return jsonify({"error": "未找到指定博主"}), 404
-    return jsonify({"message": "设置已更新", "account": target})
-
-
-@xhs_bp.route("/auto-collect/trigger/<user_id>", methods=["POST"])
-def auto_collect_trigger(user_id):
-    from backend.xhs_scheduler import xhs_collector
-    try:
-        res = xhs_collector.trigger_collect(user_id)
-        return jsonify(res)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-
-@xhs_bp.route("/auto-collect/trigger-all", methods=["POST"])
-def auto_collect_trigger_all():
-    from backend.xhs_scheduler import xhs_collector
-    res = xhs_collector.trigger_all()
-    return jsonify(res)
-
-
-@xhs_bp.route("/auto-collect/stop-all", methods=["POST"])
-def auto_collect_stop_all():
-    from backend.xhs_scheduler import xhs_collector
-    res = xhs_collector.stop_all_collect()
-    return jsonify(res)
-
-
-@xhs_bp.route("/auto-collect/stop/<user_id>", methods=["POST"])
-def auto_collect_stop_account(user_id):
-    from backend.xhs_scheduler import xhs_collector
-    res = xhs_collector.stop_account_collect(user_id)
-    return jsonify(res)
-
-
-@xhs_bp.route("/auto-collect/settings", methods=["POST"])
-def auto_collect_save_settings():
-    from backend.config import get_settings, save_settings
-    data = request.get_json() or {}
-    current = get_settings()
-
-    for key in [
-        "xhs_auto_collect_enabled",
-        "xhs_collect_interval_minutes",
-        "xhs_collect_window_start_hour",
-        "xhs_collect_window_end_hour",
-        "xhs_collect_max_per_account",
-        "xhs_collect_cooldown_minutes",
-        "xhs_upload_enabled",
-        "xhs_upload_url",
-        "xhs_device_id",
-        "xhs_cos_prefix",
-    ]:
-        if key in data:
-            current[key] = data[key]
-
-    save_settings(current)
-    return jsonify({"message": "自动采集设置已保存", "settings": current})
-
-
-@xhs_bp.route("/auto-collect/logs", methods=["GET"])
-def auto_collect_logs():
-    from backend.xhs_scheduler import xhs_collector
-    limit = request.args.get("limit", 50, type=int)
-    logs = xhs_collector.get_collect_logs(limit)
-    return jsonify({"logs": logs, "total": len(logs)})
-
