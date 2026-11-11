@@ -15,7 +15,7 @@ from pathlib import Path
 from backend.runtime import app_dir
 
 # ── 版本号 ────────────────────────────────────────────────
-APP_VERSION = "2.3.5"
+APP_VERSION = "2.3.6"
 
 # ── 路径配置 ──────────────────────────────────────────────
 if getattr(sys, 'frozen', False):
@@ -71,6 +71,7 @@ DEFAULT_SETTINGS = {
     "rss_base_url": "",
     "rss_local_avatar": True,
     "rss_avatar_from_article": True,
+    "admin_password": os.environ.get("ADMIN_PASSWORD", ""),
     "weread_platform_url": WEREAD_PLATFORM_URL,
     # ── 数据库配置 ──────────────────────────────────────────
     "db_type": os.environ.get("DB_TYPE", "sqlite"),  # "sqlite", "mysql", "json"
@@ -125,6 +126,15 @@ def get_settings() -> dict:
         if key not in settings:
             settings[key] = val
 
+    # 容器/环境变量支持：若设置文件中为空，自动回退到环境变量
+    for s_key, env_key in [
+        ("rss_base_url", "RSS_BASE_URL"),
+        ("rss_token", "RSS_TOKEN"),
+        ("admin_password", "ADMIN_PASSWORD"),
+    ]:
+        if not settings.get(s_key) and os.environ.get(env_key):
+            settings[s_key] = os.environ.get(env_key, "").strip()
+
     # 容器/迁移场景：设置里记的是另一台机器的绝对路径（比如桌面版的
     # /Users/xxx/data/articles_full），在当前环境根本不存在，会导致下载失败。
     # 这种情况下回落到环境变量 DOWNLOAD_DIR，不改写用户的设置文件。
@@ -148,6 +158,7 @@ def save_settings(settings: dict):
 # ── 代理管理器全局状态管理 ────────────────────────────────────
 _proxy_states = {}                  # 代理节点状态, key: raw_host, val: {"failures": 0, "last_used": 0.0, "cooldown_until": 0.0}
 _resolved_to_template_map = {}      # 动态子域名映射回模板, key: resolved_url, val: raw_host
+_wildcard_host_cache = {}           # 通配符子域名短时复用缓存 (30s)，key: raw_host, val: (expire_at, actual_host)
 _proxy_lock = threading.Lock()
 
 
@@ -247,9 +258,15 @@ def get_proxy_url(config: dict = None) -> str | None:
         proxy_type = selected_node.get("type", "http")
         raw_host = selected_node["host"]
         
-        # 负载均衡：节点中带通配符 * 时，自动替换为随机子域名以提高并发与防止单 IP 被微信限流
+        # 负载均衡：节点中带通配符 * 时，短时间（30秒）内复用子域名，
+        # 既保证单篇各资源复用连接池提升吞吐与防止大量创建连接池泄露，又兼顾定时轮换
         if "*" in raw_host:
-            actual_host = raw_host.replace("*", f"node-{get_random_subdomain()}")
+            cached_host = _wildcard_host_cache.get(raw_host)
+            if cached_host and cached_host[0] > current_time:
+                actual_host = cached_host[1]
+            else:
+                actual_host = raw_host.replace("*", f"node-{get_random_subdomain()}")
+                _wildcard_host_cache[raw_host] = (current_time + 30.0, actual_host)
         else:
             actual_host = raw_host
             
@@ -268,6 +285,9 @@ def get_proxy_url(config: dict = None) -> str | None:
             actual_url = f"http://{auth}{actual_host}{port_str}"
             
         with _proxy_lock:
+            if len(_resolved_to_template_map) > 200:
+                for old_k in list(_resolved_to_template_map.keys())[:100]:
+                    _resolved_to_template_map.pop(old_k, None)
             _resolved_to_template_map[actual_url] = raw_host
             
         return actual_url
@@ -280,7 +300,12 @@ def get_proxy_url(config: dict = None) -> str | None:
     proxy_type = config.get("type", "http")
     
     if "*" in host:
-        actual_host = host.replace("*", f"node-{get_random_subdomain()}")
+        cached_host = _wildcard_host_cache.get(host)
+        if cached_host and cached_host[0] > current_time:
+            actual_host = cached_host[1]
+        else:
+            actual_host = host.replace("*", f"node-{get_random_subdomain()}")
+            _wildcard_host_cache[host] = (current_time + 30.0, actual_host)
     else:
         actual_host = host
         
@@ -299,6 +324,9 @@ def get_proxy_url(config: dict = None) -> str | None:
         actual_url = f"http://{auth}{actual_host}{port_str}"
         
     with _proxy_lock:
+        if len(_resolved_to_template_map) > 200:
+            for old_k in list(_resolved_to_template_map.keys())[:100]:
+                _resolved_to_template_map.pop(old_k, None)
         _resolved_to_template_map[actual_url] = host
         
     return actual_url
@@ -330,6 +358,10 @@ def report_proxy_status(proxy_url: str, success: bool):
                         break
             except Exception:
                 raw_host = proxy_url
+
+        # 请求失败时立即清除通配符短时复用缓存，确保重试时立即换用新节点/子域名
+        if not success and raw_host in _wildcard_host_cache:
+            _wildcard_host_cache.pop(raw_host, None)
                 
         state = _proxy_states.get(raw_host)
         if not state:
@@ -388,6 +420,64 @@ def normalize_wechat_url(url: str) -> str:
     except Exception:
         pass
     return url
+
+
+def init_admin_auth(app):
+    """可选的 Web 管理后台访问安全防护中间件。
+    当配置了 ADMIN_PASSWORD 环境变量或设置项时：
+    - 公开放行：/healthz 探针、/api/articles/rss（由 RSS_TOKEN 独立保护）、/api/articles/avatars/、/api/articles/serve-file/
+    - 其余所有管理路由和接口：必须通过 HTTP Basic Auth 或 Token 校验，否则返回 401 触发浏览器密码弹窗。
+    - 未配置 ADMIN_PASSWORD 时：保持原样，局域网/本机直接免密访问。
+    """
+    import hmac
+    from flask import request, Response
+
+    @app.before_request
+    def _check_admin_auth():
+        settings = get_settings()
+        admin_pass = str(settings.get("admin_password") or os.environ.get("ADMIN_PASSWORD", "")).strip()
+        if not admin_pass:
+            return None
+
+        if request.method == "OPTIONS":
+            return None
+
+        path = request.path
+
+        # 白名单放行路由
+        if (
+            path == "/healthz"
+            or path.startswith("/api/articles/rss")
+            or path.startswith("/api/articles/avatars/")
+            or path.startswith("/api/articles/serve-file/")
+        ):
+            return None
+
+        # 1. 优先校验 HTTP Basic Auth（用户名随意，密码等于 admin_password）
+        auth = request.authorization
+        if auth and auth.password and hmac.compare_digest(auth.password, admin_pass):
+            return None
+
+        # 2. 兼容 Bearer Token、URL 参数 ?auth=xxx 或 Cookie admin_auth=xxx
+        supplied = ""
+        auth_hdr = request.headers.get("Authorization", "")
+        if auth_hdr.lower().startswith("bearer "):
+            supplied = auth_hdr[7:].strip()
+        elif request.args.get("auth"):
+            supplied = request.args.get("auth", "").strip()
+        elif request.cookies.get("admin_auth"):
+            supplied = request.cookies.get("admin_auth", "").strip()
+
+        if supplied and hmac.compare_digest(supplied, admin_pass):
+            return None
+
+        return Response(
+            "需要管理员权限，请输入管理密码",
+            status=401,
+            headers={"WWW-Authenticate": 'Basic realm="Wechat Tools Admin", charset="UTF-8"'},
+            mimetype="text/plain; charset=utf-8",
+        )
+
 
 
 def get_default_wechat_ua() -> str:

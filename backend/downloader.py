@@ -8,9 +8,11 @@ import sys
 import os
 import re
 import json
+import time
+import signal
+import threading
 import shutil
 import subprocess
-import requests
 import logging
 from pathlib import Path
 from datetime import datetime, timezone
@@ -20,6 +22,14 @@ from html.parser import HTMLParser
 
 from backend.config import (
     DEFAULT_HEADERS, get_proxies_dict, get_settings, report_proxy_status
+)
+from backend.wechat_url import normalize_wechat_short_url, short_id_from_review_id
+from backend.avatar_cache import extract_account_avatar, extract_avatar_account_id
+from backend.request_profile import (
+    SIGNATURE_WINDOW,
+    get_cdn_client,
+    get_data_client,
+    resolve_suffix_path,
 )
 
 logger = logging.getLogger(__name__)
@@ -380,8 +390,45 @@ def find_chromium_executable() -> str | None:
     return None
 
 
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """确保进程及其所属进程组的所有后代进程全部被强制清理"""
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=1)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if sys.platform != "win32" and hasattr(os, "killpg"):
+        try:
+            # 当启用 start_new_session=True 时，PGID 即为 proc.pid
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+
+
+def _reap_zombies() -> None:
+    """非阻塞回收已退出的子进程/孤儿后代，防止僵尸进程 (<defunct>) 在容器内持续积累"""
+    if sys.platform != "win32" and hasattr(os, "waitpid") and hasattr(os, "WNOHANG"):
+        # 仅当 Python 自身作为容器内 PID 1 运行且未配置 init 时，孤儿进程才会重定向到自身，此时需主动回收；
+        # 若已有 init (如 docker-compose 的 init: true 或 tini)，则由 init 自动收割，避免影响其它并发线程的子进程
+        if hasattr(os, "getpid") and os.getpid() == 1:
+            try:
+                while True:
+                    wpid, _ = os.waitpid(-1, os.WNOHANG)
+                    if wpid <= 0:
+                        break
+            except (ChildProcessError, OSError):
+                pass
+
+
 def export_html_to_pdf(html_path: Path, pdf_path: Path, title: str = "") -> bool:
-    """使用 Headless Chrome 将 HTML 文件转换为 PDF"""
+    """使用 Headless Chrome 将 HTML 文件转换为 PDF，并确保完整回收进程树与孤儿后代"""
     chrome_exe = find_chromium_executable()
     if not chrome_exe:
         return False
@@ -396,15 +443,46 @@ def export_html_to_pdf(html_path: Path, pdf_path: Path, title: str = "") -> bool
         "--disable-gpu",
         "--no-pdf-header-footer",
         "--run-all-compositor-stages-before-draw",
+        # 彻底关闭崩溃报告与后台服务，防止派生脱离父进程的 Crashpad / 守护进程
+        "--disable-crash-reporter",
+        "--disable-breakpad",
+        "--disable-dev-shm-usage",
+        "--no-zygote",
+        "--no-first-run",
+        "--disable-background-networking",
+        "--mute-audio",
         f"--print-to-pdf={str(pdf_path)}",
         str(html_path)
     ]
 
+    # 容器内通常以 root 运行，Chrome 的沙箱在这种环境下起不来，会直接退出导致导出静默失败
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        cmd.insert(1, "--no-sandbox")
+
+    proc = None
     try:
-        res = subprocess.run(cmd, capture_output=True, timeout=60)
+        # 使用独立的进程组 (start_new_session=True)，防止子进程脱离后遗留为无法回收的孤儿
+        is_posix = sys.platform != "win32"
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=is_posix
+        )
+        proc.communicate(timeout=60)
         return pdf_path.exists() and pdf_path.stat().st_size > 0
-    except Exception:
+    except subprocess.TimeoutExpired:
+        if proc:
+            _kill_process_group(proc)
         return False
+    except Exception:
+        if proc:
+            _kill_process_group(proc)
+        return False
+    finally:
+        if proc:
+            _kill_process_group(proc)
+        _reap_zombies()
 
 
 def clean_html_to_text(html: str) -> str:
@@ -559,33 +637,48 @@ def normalize_url(url: str) -> str:
     return url
 
 
-def download_resource(url: str, path: Path) -> bool:
-    """下载单个资源文件"""
+def download_resource(url: str, path: Path) -> str | None:
+    """下载单个资源文件，返回实际落盘的文件名；失败返回 None。
+
+    三个约束：
+    1. 走独立 CDN 客户端 —— 不携带 Cookie、不发送 Referer，与数据会话完全隔离；
+    2. 先写 .part 临时文件，按文件头魔数确定后缀后原子改名，避免半截文件被当成成品；
+    3. 后缀以真实字节为准，不信任 Content-Type 与 URL 里的 wx_fmt 参数
+       （微信同一地址可能返回 jpg/png/webp，两者经常对不上）。
+    """
     proxy_url = None
+    part = path.with_name(path.name + ".part")
     try:
         proxies = get_proxies_dict()
-        if proxies:
-            proxy_url = proxies.get("http")
-        r = requests.get(
+        proxy_url = proxies.get("http") if proxies else None
+        r = get_cdn_client().get(
             url,
-            headers={
-                "Referer": "https://mp.weixin.qq.com/",
-                "User-Agent": DEFAULT_HEADERS["User-Agent"],
-            },
             proxies=proxies,
             timeout=60,
             stream=True,
         )
         r.raise_for_status()
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "wb") as f:
-            for chunk in r.iter_content(8192):
+        head = b""
+        with open(part, "wb") as f:
+            for chunk in r.iter_content(65536):
+                if len(head) < SIGNATURE_WINDOW:
+                    head += chunk[: SIGNATURE_WINDOW - len(head)]
                 f.write(chunk)
+        if not head:
+            raise RuntimeError("响应内容为空")
+        final = resolve_suffix_path(path, head)
+        os.replace(part, final)
         report_proxy_status(proxy_url, success=True)
-        return True
+        return final.name
     except Exception:
+        try:
+            if part.exists():
+                part.unlink()
+        except OSError:
+            pass
         report_proxy_status(proxy_url, success=False)
-        return False
+        return None
 
 
 def find_mmbiz_urls(html: str) -> set:
@@ -728,12 +821,23 @@ def replace_video_iframe(html: str, video: dict, local: str) -> str:
 
 
 _canonical_url_cache = {}
+_canonical_url_cache_lock = threading.Lock()
+
+
+def _cache_canonical_url(cache_key: str, value: str):
+    """带容量上限的短链解析缓存，防止长时间运行内存泄露"""
+    with _canonical_url_cache_lock:
+        if len(_canonical_url_cache) >= 1000:
+            for old_k in list(_canonical_url_cache.keys())[:250]:
+                _canonical_url_cache.pop(old_k, None)
+        _canonical_url_cache[cache_key] = value
 
 
 def clean_wechat_article_url(url: str) -> str:
     """清理公众号推文链接，去除引起风控识别的跟踪与环境参数 (参考 we-mp-rss 规范化清洗)"""
     if not url:
         return ""
+    url = normalize_wechat_short_url(url)
     try:
         from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
         parsed = urlparse(url)
@@ -765,20 +869,21 @@ def resolve_canonical_short_url(url: str, review_id: str = "") -> str:
     """将微信长链接或 review_id 解析为免验证码风控的标准短链 (https://mp.weixin.qq.com/s/{short_id})"""
     if not url:
         return ""
+    url = normalize_wechat_short_url(url)
     if "/s/" in url and "__biz=" not in url:
         return url
 
     cache_key = f"{url}::{review_id}"
-    if cache_key in _canonical_url_cache:
-        return _canonical_url_cache[cache_key]
+    with _canonical_url_cache_lock:
+        if cache_key in _canonical_url_cache:
+            return _canonical_url_cache[cache_key]
 
-    # 1. 若 review_id 存在且包含下划线，提取其末尾的 short_id
-    if review_id and "_" in review_id:
-        sid = review_id.split("_")[-1]
-        if len(sid) >= 15:
-            res = f"https://mp.weixin.qq.com/s/{sid}"
-            _canonical_url_cache[cache_key] = res
-            return res
+    # 1. 从 review_id 的完整账号前缀后提取 short_id，保留下划线
+    sid = short_id_from_review_id(review_id)
+    if sid:
+        res = f"https://mp.weixin.qq.com/s/{sid}"
+        _cache_canonical_url(cache_key, res)
+        return res
 
     # 2. 调用微信读书接口通过 URL 查询 reviewId
     try:
@@ -788,16 +893,15 @@ def resolve_canonical_short_url(url: str, review_id: str = "") -> str:
         res = s.post("https://i.weread.qq.com/mp/getreviewid", json={"urls": [url]}, headers=h, timeout=6).json()
         for item in res.get("reviewIds", []):
             rid = item.get("reviewId", "")
-            if rid and "_" in rid:
-                sid = rid.split("_")[-1]
-                if len(sid) >= 15:
-                    resolved = f"https://mp.weixin.qq.com/s/{sid}"
-                    _canonical_url_cache[cache_key] = resolved
-                    return resolved
+            sid = short_id_from_review_id(rid)
+            if sid:
+                resolved = f"https://mp.weixin.qq.com/s/{sid}"
+                _cache_canonical_url(cache_key, resolved)
+                return resolved
     except Exception as e:
         logger.debug(f"[ShortURL] 解析推文短链异常: {e}")
 
-    _canonical_url_cache[cache_key] = url
+    _cache_canonical_url(cache_key, url)
     return url
 
 
@@ -889,6 +993,8 @@ def fetch_via_headless_browser(url: str, proxy_url: str = None) -> tuple[str, st
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
             "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
         ]
         proxy_config = None
         if proxy_url:
@@ -958,10 +1064,14 @@ def fetch_wechat_article_html(url: str, review_id: str = "") -> tuple[str, str, 
     proxy_url = proxies.get("http") if proxies else None
     http_error = ""
     headers = get_wechat_mobile_headers()
+    # 数据客户端只复用连接池；公众号页面本身不需要登录态，
+    # 每次请求前清空 CookieJar，避免会话在多次抓取之间被服务端种下的 Cookie 污染
+    client = get_data_client()
 
     for target_url in urls_to_try:
         try:
-            resp = requests.get(
+            client.cookies.clear()
+            resp = client.get(
                 target_url,
                 headers=headers,
                 proxies=proxies,
@@ -1175,6 +1285,18 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
 
     # 提取正文区域
     content_html = extract_article_content(raw_html)
+
+    # 内容过滤：屏蔽广告块、二维码、以及被当作小节标题的横幅图片。
+    # 只影响「清洗后」的产物（.html / content.txt / .md / PDF），
+    # _raw.html 与 data.json 仍保留原始正文，方便回头重跑。
+    try:
+        from backend.content_filter import filter_article_html
+
+        filtered_html = filter_article_html(content_html)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("内容过滤失败，使用原始正文: %s", exc)
+        filtered_html = content_html
+
     video_iframes = _extract_video_iframes(raw_html)
     video_urls = _extract_video_urls(raw_html)
 
@@ -1187,8 +1309,9 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
         if cover_url:
             cover_ext = get_ext(cover_url) or "jpg"
             cover_filename = f"cover.{cover_ext}"
-            if download_resource(cover_url, media_dir / cover_filename):
-                url_map[cover_url] = f"media/{cover_filename}"
+            real_cover = download_resource(cover_url, media_dir / cover_filename)
+            if real_cover:
+                url_map[cover_url] = f"media/{real_cover}"
 
         # 仅在文章正文 content_html 内提取图片，避免下载外部页眉、页脚、微信小图标等多余资源
         for m in re.finditer(r'data-src="([^"]*mmbiz[^"]*)"', content_html):
@@ -1204,8 +1327,9 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
                 continue
             ext = get_ext(img_url)
             fname = f"img_{i:03d}.{ext}"
-            if download_resource(img_url, media_dir / fname):
-                url_map[img_url] = f"media/{fname}"
+            real_img = download_resource(img_url, media_dir / fname)
+            if real_img:
+                url_map[img_url] = f"media/{real_img}"
 
     # 下载视频
     if save_videos:
@@ -1231,7 +1355,9 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
             ext = get_ext(vid_url) or "mp4"
             ext = get_video_ext(vid_url) if ext == "jpg" else ext
             fname = f"video_{i}.{ext}"
-            if download_resource(vid_url, media_dir / fname):
+            real_video = download_resource(vid_url, media_dir / fname)
+            if real_video:
+                fname = real_video
                 url_map[vid_url] = f"media/{fname}"
                 if video.get("src"):
                     url_map[video["src"]] = f"media/{fname}"
@@ -1239,16 +1365,17 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
                 if save_images and video.get("cover"):
                     cover_ext = get_ext(video["cover"])
                     cover_name = f"video_cover_{i}.{cover_ext}"
-                    if download_resource(video["cover"], media_dir / cover_name):
-                        poster_attr = f' poster="media/{cover_name}"'
-                        url_map[video["cover"]] = f"media/{cover_name}"
+                    real_cover = download_resource(video["cover"], media_dir / cover_name)
+                    if real_cover:
+                        poster_attr = f' poster="media/{real_cover}"'
+                        url_map[video["cover"]] = f"media/{real_cover}"
                 url_map[f"__video_iframe__{video.get('vid', i)}"] = (
                     video,
                     f'<video controls src="media/{fname}"{poster_attr}></video>',
                 )
 
     # 替换 URL
-    localized = content_html
+    localized = filtered_html
     for orig, local in url_map.items():
         if orig.startswith("__video_iframe__"):
             video, video_tag = local
@@ -1359,7 +1486,7 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
     (art_dir / "data.json").write_text(json.dumps(new_json_data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # 保存纯文本内容（用于 AI 一键转写）
-    clean_text = clean_html_to_text(content_html)
+    clean_text = clean_html_to_text(filtered_html)
     (art_dir / "content.txt").write_text(clean_text, encoding="utf-8")
 
     # 1. 保存 Markdown (.md) 文件
@@ -1374,7 +1501,7 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
                 "cover_url": cover_url,
                 "publish_time": publish_time,
             }
-            md_text = html_to_markdown(content_html, meta=md_meta, media_map=url_map)
+            md_text = html_to_markdown(filtered_html, meta=md_meta, media_map=url_map)
             md_file_path = art_dir / f"{safe_title}.md"
             md_file_path.write_text(md_text, encoding="utf-8")
         except Exception:
@@ -1398,6 +1525,8 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
         "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "publish_time": publish_time,
         "cover_url": cover_url,
+        "round_head_img": extract_account_avatar(raw_html),
+        "avatar_account_id": extract_avatar_account_id(raw_html),
         "digest": digest,
         "source": source,
         "author": author,
@@ -1419,6 +1548,7 @@ def download_single_article(url: str, out_dir: Path, title_hint: str = "", _redi
     return {
         "success": True,
         "title": safe_title,
+        "source": source,
         "author": author or source,
         "path": str(art_dir),
         "resources": len(url_map),
