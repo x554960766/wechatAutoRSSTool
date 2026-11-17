@@ -100,9 +100,10 @@ app.register_blueprint(waterwall_bp)
 # 确保必要目录与数据库结构就绪
 ensure_dirs()
 
-# 账号池旧数据迁移
-from backend.account_pool import migrate_legacy_config
+# 账号池旧数据迁移与会话激活保活线程
+from backend.account_pool import migrate_legacy_config, start_session_keepalive_thread
 migrate_legacy_config()
+start_session_keepalive_thread()
 
 # 微信/视频号同步助手（MITM抓包代理）默认保持关闭，需用户在页面手动开启
 print("ℹ️ [App Init] 微信与视频号凭证同步助手代理默认关闭（需手动在页面开启）。", flush=True)
