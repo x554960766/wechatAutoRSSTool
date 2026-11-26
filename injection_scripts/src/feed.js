@@ -7,10 +7,18 @@
  * @param {HTMLElement} $parent
  */
 function __wx_insert_download_btn($parent) {
+  if (!$parent || $parent.querySelector(".download-icon")) {
+    return;
+  }
   var $btn = download_btn2();
   __wx_attach_download_dropdown_menu($btn);
   $btn.onclick = __wx_download_btn_handler;
   $parent.appendChild($btn);
+}
+
+function __wx_resolve_interact_container($opItem) {
+  if (!$opItem) return null;
+  return $opItem.closest(".feed-interact") || $opItem.parentElement;
 }
 
 async function _wx_insert_download_btn_to_old_feed_profile_page() {
@@ -84,19 +92,18 @@ function __wx_render_sider_tools() {
 }
 
 async function __wx_insert_download_btn_to_feed_profile_page() {
-  // console.log(
-  //   "[feed.js]the slider items count",
-  //   Array.from(document.querySelectorAll(".slides-item")).length,
-  // );
   var $operations_parents = [];
   var $op_items = Array.from(
     document.querySelectorAll(".slides-item .click-box.op-item"),
   );
-  // console.log("[feed.js]the op items count", $op_items.length);
   for (let i = 0; i < $op_items.length; i += 1) {
     var $op_item = $op_items[i];
-    var $parent = $op_item.parentElement;
-    if (!$operations_parents.includes($parent)) {
+    var $slide = $op_item.closest(".slides-item");
+    if ($slide && $slide.querySelector(".download-icon")) {
+      continue;
+    }
+    var $parent = __wx_resolve_interact_container($op_item);
+    if ($parent && !$operations_parents.includes($parent)) {
       $operations_parents.push($parent);
     }
   }
@@ -156,7 +163,7 @@ WXU.observe_node(".slides-scroll", function ($scroll_view) {
         // );
         return;
       }
-      var $parent = $opItem.parentElement;
+      var $parent = __wx_resolve_interact_container($opItem);
       if ($parent) {
         __wx_insert_download_btn($parent);
       }
@@ -176,33 +183,30 @@ function clear_error_timer() {
   }
 }
 
-WXU.onFetchFeedProfile((feed) => {
-  console.log("[feed.js]WXU.onFetchFeedProfile for page", feed);
+function __wx_apply_feed(feed) {
+  if (!feed) {
+    return;
+  }
   WXU.set_cur_video();
   WXU.set_feed(feed);
   WXU.emit(WXE.Events.Feed, feed);
   clear_error_timer();
+}
+
+WXU.onFetchFeedProfile((feed) => {
+  __wx_apply_feed(feed);
 });
 
 WXU.onGotoNextFeed((feed) => {
-  console.log("[feed.js]WXU.onGotoNextFeed", feed);
-  WXU.set_cur_video();
-  WXU.set_feed(feed);
-  WXU.emit(WXE.Events.Feed, feed);
+  __wx_apply_feed(feed);
 });
 
 WXU.onGotoPrevFeed((feed) => {
-  console.log("[feed.js]WXU.onGotoPrevFeed", feed);
-  WXU.set_cur_video();
-  WXU.set_feed(feed);
-  WXU.emit(WXE.Events.Feed, feed);
+  __wx_apply_feed(feed);
 });
 
 WXU.onHomeFeedChanged((feed) => {
-  console.log("[feed.js]WXU.onHomeFeedChanged", feed);
-  WXU.set_cur_video();
-  WXU.set_feed(feed);
-  WXU.emit(WXE.Events.Feed, feed);
+  __wx_apply_feed(feed);
 });
 
 WXU.onDOMContentLoaded(function () {

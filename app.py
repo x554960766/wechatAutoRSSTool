@@ -220,6 +220,7 @@ def main():
     parser.add_argument("--debug", action="store_true", help="调试模式")
     args = parser.parse_args()
 
+    os.environ["WECHAT_MP_PORT"] = str(args.port)
     ensure_dirs()
 
     print()

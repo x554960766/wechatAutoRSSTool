@@ -6,7 +6,12 @@
  * 创建下载按钮并插入到指定父节点
  * @param {HTMLElement} $parent
  */
+var __home_page_mounted = false;
+
 function __wx_insert_download_btn($parent) {
+  if (!$parent || $parent.querySelector(".download-icon")) {
+    return;
+  }
   var $btn = download_btn2();
   __wx_attach_download_dropdown_menu($btn);
   $btn.onclick = __wx_download_btn_handler;
@@ -17,6 +22,9 @@ function __wx_insert_download_btn($parent) {
  * 在首页右侧添加悬浮下载按钮
  */
 function __wx_render_sider_tools() {
+  if (document.querySelector(".wx-sider-tools")) {
+    return;
+  }
   const $fixed_sider = document.createElement("div");
   $fixed_sider.className = "wx-sider";
   const $sider_bg = document.createElement("div");
@@ -34,6 +42,11 @@ function __wx_render_sider_tools() {
   $tools.appendChild($btn);
 }
 
+function __wx_resolve_interact_container($opItem) {
+  if (!$opItem) return null;
+  return $opItem.closest(".feed-interact") || $opItem.parentElement;
+}
+
 async function __wx_insert_download_btn_to_home_page() {
   var $operations_parents = [];
   var $op_items = Array.from(
@@ -41,8 +54,12 @@ async function __wx_insert_download_btn_to_home_page() {
   );
   for (let i = 0; i < $op_items.length; i += 1) {
     var $op_item = $op_items[i];
-    var $parent = $op_item.parentElement;
-    if (!$operations_parents.includes($parent)) {
+    var $slide = $op_item.closest(".slides-item");
+    if ($slide && $slide.querySelector(".download-icon")) {
+      continue;
+    }
+    var $parent = __wx_resolve_interact_container($op_item);
+    if ($parent && !$operations_parents.includes($parent)) {
       $operations_parents.push($parent);
     }
   }
@@ -54,34 +71,29 @@ async function __wx_insert_download_btn_to_home_page() {
 WXU.observe_node(
   ".slides-item",
   function () {
+    __home_page_mounted = true;
     __wx_insert_download_btn_to_home_page();
   },
   function () {
-    __wx_render_sider_tools();
+    if (!__home_page_mounted) {
+      __wx_render_sider_tools();
+    }
   },
 );
 
 WXU.observe_node(".slides-scroll", function ($scroll_view) {
-  // console.log("[feed.js].slides-scroll found, setting up MutationObserver");
   var observer = new MutationObserver(function (mutations) {
     mutations.forEach(function (mutation) {
       if (mutation.type !== "childList") return;
       mutation.addedNodes.forEach(function (node) {
         if (node.nodeType !== 1 || !node.matches) return;
-        // .slides-item 是复用 DOM，不会新增。改为监听内部新增的 .click-box.op-item
         if (node.matches(".click-box.op-item")) {
-          // console.log("[feed.js]matched .click-box.op-item node");
           handleOpItem(node);
           return;
         }
         if (node.querySelectorAll) {
           var $opItems = node.querySelectorAll(".click-box.op-item");
           if ($opItems.length > 0) {
-            // console.log(
-            //   "[feed.js]found",
-            //   $opItems.length,
-            //   ".click-box.op-item inside added node",
-            // );
             $opItems.forEach(function ($opItem) {
               handleOpItem($opItem);
             });
@@ -90,16 +102,14 @@ WXU.observe_node(".slides-scroll", function ($scroll_view) {
       });
     });
     function handleOpItem($opItem) {
-      // 确认在 .slides-item 内部
       var $slide = $opItem.closest(".slides-item");
       if (!$slide) {
-        console.log("[feed.js]op-item not inside .slides-item, skip");
         return;
       }
       if ($slide.querySelector(".download-icon")) {
         return;
       }
-      var $parent = $opItem.parentElement;
+      var $parent = __wx_resolve_interact_container($opItem);
       if ($parent) {
         __wx_insert_download_btn($parent);
       }
@@ -119,43 +129,46 @@ function clear_error_timer() {
   }
 }
 
-WXU.onFetchFeedProfile((feed) => {
-  console.log("[main.js]WXU.onFetchFeedProfile", feed);
+function __wx_apply_home_feed(feed, onlyWhenEmpty = false) {
+  if (!feed) {
+    return;
+  }
+  if (onlyWhenEmpty && __wx_channels_store__.profile) {
+    clear_error_timer();
+    return;
+  }
   WXU.set_cur_video();
   WXU.set_feed(feed);
   WXU.emit(WXE.Events.Feed, feed);
   clear_error_timer();
+}
+
+WXU.onFetchFeedProfile((feed) => {
+  __wx_apply_home_feed(feed, false);
 });
 
 WXU.onPCFlowLoaded((feeds) => {
-  console.log("[main.js]WXU.onPCFlowLoaded", feeds);
-  if (!__wx_channels_store__.profile) {
-    WXU.set_cur_video();
-    WXU.set_feed(feeds[0]);
-    WXU.emit(WXE.Events.Feed, feeds[0]);
+  if (feeds && feeds.length) {
+    __wx_apply_home_feed(feeds[0], true);
   }
-  clear_error_timer();
+});
+
+WXU.onPreloadFeeds((feeds) => {
+  if (feeds && feeds.length) {
+    __wx_apply_home_feed(feeds[0], true);
+  }
 });
 
 WXU.onGotoNextFeed((feed) => {
-  console.log("[main.js]WXU.onGotoNextFeed", feed);
-  WXU.set_cur_video();
-  WXU.set_feed(feed);
-  WXU.emit(WXE.Events.Feed, feed);
+  __wx_apply_home_feed(feed, false);
 });
 
 WXU.onGotoPrevFeed((feed) => {
-  console.log("[main.js]WXU.onGotoPrevFeed", feed);
-  WXU.set_cur_video();
-  WXU.set_feed(feed);
-  WXU.emit(WXE.Events.Feed, feed);
+  __wx_apply_home_feed(feed, false);
 });
 
 WXU.onHomeFeedChanged((feed) => {
-  console.log("[main.js]WXU.onHomeFeedChanged", feed);
-  WXU.set_cur_video();
-  WXU.set_feed(feed);
-  WXU.emit(WXE.Events.Feed, feed);
+  __wx_apply_home_feed(feed, false);
 });
 
 WXU.onDOMContentLoaded(function () {

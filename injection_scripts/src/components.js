@@ -270,9 +270,9 @@ function download_btn1() {
  * @returns {HTMLDivElement}
  */
 function download_btn2() {
-  var icon_download_html = `<div class="op-icon download-icon" style="font-size: 28px;" data-v-5611c716">${download_icon2}</div>`;
+  var icon_download_html = `<div class="op-icon download-icon" style="font-size: 28px; display: flex; align-items: center; justify-content: center;" data-v-5611c716 data-v-a5c58293>${download_icon2}</div>`;
   var $icon = document.createElement("div");
-  $icon.innerHTML = `<div class=""><div data-v-6548f11a data-v-1fe2ed37 class="click-box op-item" role="button" aria-label="下载" style="padding: 4px 4px 4px 4px; --border-radius: 4px; --left: 0; --top: 0; --right: 0; --bottom: 0;">${icon_download_html}<div data-v-1fe2ed37 class="op-text">下载</div></div></div>`;
+  $icon.innerHTML = `<div class="" data-v-a5c58293><div data-v-6548f11a data-v-1fe2ed37 data-v-a5c58293 class="click-box op-item" role="button" aria-label="下载" style="padding: 4px 0; border: none; background: none; color: inherit; --border-radius: 4px; --left: 0; --top: 0; --right: 0; --bottom: 0;">${icon_download_html}<div data-v-1fe2ed37 data-v-a5c58293 class="op-text">下载</div></div></div>`;
   return $icon.firstChild;
 }
 /**

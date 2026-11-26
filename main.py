@@ -59,8 +59,10 @@ if sys.stderr is None:
 # ── 路径与端口初始化 ──────────────────────────────────────
 
 def find_free_port(start=5200, end=5220):
-    """动态查找可用端口，防冲突"""
+    """动态查找可用端口，防冲突（跳过预留给视频号代理的 5202 端口）"""
     for port in range(start, end + 1):
+        if port == 5202:
+            continue
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.bind(('127.0.0.1', port))
@@ -232,8 +234,9 @@ if __name__ == '__main__':
         # 抑制 Werkzeug 请求日志，防止在无控制台环境下写入空流导致崩溃
         logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
-        # 动态获取可用端口
+        # 动态获取可用端口并同步给代理子进程（避免打包后 5200 被占用时回传端口失配）
         port = find_free_port()
+        os.environ["WECHAT_MP_PORT"] = str(port)
 
         # 在后台线程中极速拉起 Flask 服务
         def start_flask():

@@ -15,7 +15,7 @@ from qcloud_cos import CosConfig, CosS3Client
 from backend.config import get_settings, load_json, save_json, DATA_DIR, get_proxies_dict
 from backend.channels import (
     CHANNELS_FEEDS_FILE, CHANNELS_FAVORITES_FILE, FEEDS_LOCK,
-    decrypt_channels_data, add_channels_history_item,
+    decrypt_channels_data, add_channels_history_item, open_cdn_response,
 )
 
 logger = logging.getLogger(__name__)
@@ -329,9 +329,11 @@ def _download_and_cos(snap, cos_cfg):
         raise ValueError("No video_url")
 
     logger.debug(f"[视频号上传] feedId={feed_id} 开始下载: {video_url[:80]}...")
-    resp = requests.get(video_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=60)
-    resp.raise_for_status()
-    data = bytearray(resp.content)
+    sess, resp = open_cdn_response(video_url, headers={"User-Agent": "Mozilla/5.0"}, stream=False, timeout=60)
+    try:
+        data = bytearray(resp.content)
+    finally:
+        sess.close()
     snap["upload_size"] = len(data)
     logger.debug(f"[视频号上传] feedId={feed_id} 下载完成，大小: {len(data)} bytes")
 

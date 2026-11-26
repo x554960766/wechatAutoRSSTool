@@ -2042,6 +2042,7 @@ def open_file():
     except Exception as e:
         return jsonify({"error": f"打开失败: {str(e)}"}), 500
 
+
 @xhs_bp.route("/open-parent", methods=["POST"])
 def open_parent():
     import subprocess
@@ -2074,3 +2075,243 @@ def open_parent():
         return jsonify({"message": "已打开"})
     except Exception as e:
         return jsonify({"error": f"打开失败: {str(e)}"}), 500
+
+
+# ── COS 上传与远端同步工具函数 (兼容 xhs_scheduler) ──────
+
+def upload_xhs_video_to_cos(video_path: Path, note_id: str, max_retries: int = 3, return_error: bool = False) -> str | None | tuple[str | None, str | None]:
+    """把本地下载的小红书视频文件上传到腾讯云 COS，返回公网链接。"""
+    if not video_path or not video_path.exists():
+        err = f"视频文件不存在: {video_path}"
+        return (None, err) if return_error else None
+
+    if video_path.stat().st_size == 0:
+        err = f"视频文件大小为 0 字节: {video_path}"
+        return (None, err) if return_error else None
+
+    settings = get_settings()
+    token_api_url = (settings.get("cos_token_api_url") or "").strip()
+
+    target_bucket = str(settings.get("xhs_cos_bucket") or "chenshipin-hg-1305012248").strip()
+    target_region = str(settings.get("xhs_cos_region") or settings.get("cos_region") or "ap-guangzhou").strip()
+    target_domain = str(settings.get("xhs_cos_cds_domain") or f"https://{target_bucket}.cos.{target_region}.myqcloud.com/").strip()
+    target_prefix = str(settings.get("xhs_cos_prefix") or "channels/").strip()
+    if not target_prefix.endswith("/"):
+        target_prefix += "/"
+    target_prefix = target_prefix.lstrip("/")
+
+    def _get_cos_cfg(force_refresh: bool = False):
+        if token_api_url:
+            try:
+                from backend.channels_upload import _fetch_cos_token
+                cfg = _fetch_cos_token(token_api_url, force_refresh=force_refresh)
+                if cfg:
+                    return cfg, None
+            except Exception as e:
+                return None, f"获取 STS 临时凭证失败: {e}"
+
+        s_id = str(settings.get("cos_secret_id") if settings.get("cos_secret_id") is not None else "").strip()
+        s_key = str(settings.get("cos_secret_key") if settings.get("cos_secret_key") is not None else "").strip()
+        if s_id and s_key:
+            return {
+                "secret_id": s_id,
+                "secret_key": s_key,
+                "region": target_region,
+                "bucket": target_bucket,
+            }, None
+
+        return None, "未配置腾讯云 COS 凭证密钥"
+
+    cos_cfg, cfg_err = _get_cos_cfg(force_refresh=False)
+    if not cos_cfg:
+        return (None, cfg_err) if return_error else None
+
+    try:
+        from qcloud_cos import CosConfig, CosS3Client
+    except ImportError as e:
+        err = f"未安装 qcloud_cos 依赖包: {e}"
+        return (None, err) if return_error else None
+
+    key = f"{target_prefix}{note_id or int(time.time())}.mp4"
+
+    try:
+        data = video_path.read_bytes()
+    except Exception as e:
+        err = f"读取视频文件数据失败: {e}"
+        return (None, err) if return_error else None
+
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            if attempt > 1 and token_api_url:
+                refreshed_cfg, _ = _get_cos_cfg(force_refresh=True)
+                if refreshed_cfg:
+                    cos_cfg = refreshed_cfg
+
+            cos_config_kwargs = {
+                "Region": target_region,
+                "SecretId": cos_cfg["secret_id"],
+                "SecretKey": cos_cfg["secret_key"],
+            }
+            if cos_cfg.get("token"):
+                cos_config_kwargs["Token"] = cos_cfg["token"]
+
+            config = CosConfig(**cos_config_kwargs)
+            client = CosS3Client(config)
+            client.put_object(Bucket=target_bucket, Body=data, Key=key)
+
+            cos_url = f"{target_domain.rstrip('/')}/{key.lstrip('/')}"
+            return (cos_url, None) if return_error else cos_url
+        except Exception as e:
+            last_err = e
+            if attempt < max_retries:
+                time.sleep(1.0 * attempt)
+
+    final_err_msg = f"重试 {max_retries} 次均失败: {last_err}"
+    return (None, final_err_msg) if return_error else None
+
+
+def generate_note_content(detail: dict, cos_url: str = None) -> str:
+    """区分视频和图文生成 content"""
+    import html as html_lib
+    note_type = detail.get("type", "图文")
+    desc = detail.get("desc") or ""
+    tags = detail.get("tags") or []
+    images = detail.get("images") or []
+    effective_video_url = cos_url or detail.get("cos_url") or detail.get("video_url") or detail.get("video") or ""
+
+    is_video = (note_type == "视频") or bool(effective_video_url)
+
+    if is_video:
+        parts = []
+        if desc:
+            parts.append(desc)
+        if tags:
+            tags_str = " ".join("#" + t for t in tags)
+            parts.append(tags_str)
+        if effective_video_url:
+            parts.append(f'<video src="{effective_video_url}"></video>')
+        return "\n\n".join(parts) if parts else (f'<video src="{effective_video_url}"></video>' if effective_video_url else desc)
+
+    html_parts = []
+    if desc:
+        lines = [line.strip() for line in desc.split("\n") if line.strip()]
+        for line in lines:
+            html_parts.append(f"<p>{html_lib.escape(line)}</p>")
+
+    if tags:
+        tags_str = " ".join("#" + html_lib.escape(t) for t in tags)
+        html_parts.append(f"<p>{tags_str}</p>")
+
+    for img_u in images:
+        if img_u:
+            html_parts.append(f'<p><img src="{html_lib.escape(img_u)}" referrerpolicy="no-referrer" /></p>')
+
+    return "".join(html_parts) if html_parts else desc
+
+
+def write_note_data_json(note_dir: Path, detail: dict, cos_url: str = None, video_file: str = None, image_items: list = None) -> dict:
+    """生成与公众号对齐的 data.json"""
+    import json as json_lib
+    try:
+        author = detail.get("author", {}) or {}
+        author_nick = author.get("nickname") or author.get("nickName") or "未知博主"
+        title = detail.get("title") or detail.get("note_id") or "无标题"
+        note_url = detail.get("note_url") or f"https://www.xiaohongshu.com/explore/{detail.get('note_id', '')}"
+        cover_url = detail.get("cover") or (detail.get("images", [""])[0] if detail.get("images") else "")
+        publish_time = detail.get("publish_time") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        desc = detail.get("desc") or ""
+        tags = detail.get("tags") or []
+        images = detail.get("images") or []
+
+        content = generate_note_content(detail, cos_url=cos_url)
+
+        data = {
+            "source": author_nick,
+            "title": title,
+            "url": note_url,
+            "cover_url": cover_url,
+            "publish_time": publish_time,
+            "content": content,
+            "desc": desc,
+            "type": detail.get("type", "图文"),
+            "tags": tags,
+            "images": images,
+            "video_url": cos_url or detail.get("cos_url") or detail.get("video_url") or detail.get("video") or "",
+            "cos_url": cos_url or detail.get("cos_url") or "",
+            "author": author_nick,
+            "note_id": detail.get("note_id", ""),
+            "download_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        (note_dir / "data.json").write_text(json_lib.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return data
+    except Exception as e:
+        print(f"写入 data.json 失败: {e}")
+        return {}
+
+
+def post_xhs_note_to_server(data_json: dict) -> tuple[bool, str | None]:
+    """把小红书笔记推送到远端服务器"""
+    import base64 as b64_lib
+    import json as json_lib
+    if not data_json or not isinstance(data_json, dict):
+        return False, "缺少有效的笔记数据"
+
+    settings = get_settings()
+    upload_enabled = settings.get("xhs_upload_enabled")
+    if upload_enabled is None:
+        upload_enabled = settings.get("rss_upload_enabled", False)
+
+    if not upload_enabled:
+        return False, "服务器上传功能未启用"
+
+    upload_url = (settings.get("xhs_upload_url") or settings.get("rss_upload_url") or "").strip()
+    if not upload_url:
+        return False, "未配置上传接口地址"
+
+    content_str = data_json.get("content") or data_json.get("desc") or ""
+    content_b64 = b64_lib.b64encode(content_str.encode("utf-8")).decode("ascii")
+    device_id = settings.get("xhs_device_id") or settings.get("device_id") or "小红书_caiji100"
+
+    article_item = {
+        "source": data_json.get("source", ""),
+        "title": data_json.get("title", ""),
+        "url": data_json.get("url", ""),
+        "cover_url": data_json.get("cover_url", ""),
+        "publish_time": data_json.get("publish_time", ""),
+        "content": content_b64,
+        "video_url": data_json.get("video_url") or data_json.get("cos_url") or "",
+        "cos_url": data_json.get("cos_url") or "",
+        "desc": data_json.get("desc", ""),
+        "type": data_json.get("type", "图文"),
+        "tags": data_json.get("tags", []),
+        "images": data_json.get("images", []),
+        "note_id": data_json.get("note_id", ""),
+    }
+
+    payload = {
+        "articles": [article_item],
+        "deviceId": device_id,
+    }
+
+    try:
+        resp = requests.post(
+            upload_url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            proxies=get_proxies_dict(),
+            timeout=30
+        )
+        resp_text = resp.content.decode("utf-8", errors="replace") if hasattr(resp, "content") and resp.content else (resp.text or "")
+        resp.raise_for_status()
+
+        try:
+            body = json_lib.loads(resp_text)
+            if isinstance(body, dict) and body.get("success") is False:
+                return False, body.get("message") or body.get("error") or "远端接口返回失败"
+        except Exception:
+            pass
+        return True, None
+    except Exception as e:
+        return False, f"网络请求失败: {e}"

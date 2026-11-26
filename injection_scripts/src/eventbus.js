@@ -19,16 +19,21 @@ var WXE = (() => {
     /** 首页推荐获取到视频列表 */
     PCFlowLoaded: "PCFlowLoaded",
     RecommendFeedsLoaded: "RecommendFeedsLoaded",
-    /** 个人中心 赞和喜欢 列表 */
+    RecommendTabsLoaded: "RecommendTabsLoaded",
+    PreloadFeeds: "PreloadFeeds",
+    /** 个人中心 赞和喜欢 / 播放历史 */
     InteractionedFeedsLoaded: "InteractionedFeedsLoaded",
+    PlayHistoryFeedsLoaded: "PlayHistoryFeedsLoaded",
+    FollowListLoaded: "FollowListLoaded",
     /** 直播回放 */
     LiveUserFeedsLoaded: "LiveUserFeedsLoaded",
     UserFeedsLoaded: "UserFeedsLoaded",
     GotoNextFeed: "GotoNextFeed",
     GotoPrevFeed: "GotoPrevFeed",
     HomeFeedChanged: "HomeFeedChanged",
-    /** 获取到视频详情 */
+    /** 获取到视频详情 / H5 链接 */
     FeedProfileLoaded: "OnFeedProfileLoaded",
+    GetFeedH5Url: "GetFeedH5Url",
     /** 视频的评论列表（包括评论的回复）加载完成 */
     FeedCommentListLoaded: "FeedCommentListLoaded",
     /** 获取到直播详情 */
@@ -255,6 +260,37 @@ var WXE = (() => {
       eventbus.on(ChannelsEvents.Feed, handler);
       return () => {
         eventbus.off(ChannelsEvents.Feed, handler);
+      };
+    },
+    /** Worker 预加载推荐流 */
+    onPreloadFeeds(handler) {
+      eventbus.on(ChannelsEvents.PreloadFeeds, handler);
+      return () => {
+        eventbus.off(ChannelsEvents.PreloadFeeds, handler);
+      };
+    },
+    onRecommendTabsLoaded(handler) {
+      eventbus.on(ChannelsEvents.RecommendTabsLoaded, handler);
+      return () => {
+        eventbus.off(ChannelsEvents.RecommendTabsLoaded, handler);
+      };
+    },
+    onGetFeedH5Url(handler) {
+      eventbus.on(ChannelsEvents.GetFeedH5Url, handler);
+      return () => {
+        eventbus.off(ChannelsEvents.GetFeedH5Url, handler);
+      };
+    },
+    onPlayHistoryFeedsLoaded(handler) {
+      eventbus.on(ChannelsEvents.PlayHistoryFeedsLoaded, handler);
+      return () => {
+        eventbus.off(ChannelsEvents.PlayHistoryFeedsLoaded, handler);
+      };
+    },
+    onFollowListLoaded(handler) {
+      eventbus.on(ChannelsEvents.FollowListLoaded, handler);
+      return () => {
+        eventbus.off(ChannelsEvents.FollowListLoaded, handler);
       };
     },
   };

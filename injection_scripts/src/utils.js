@@ -22,17 +22,29 @@ var __wx_assets_base = (function () {
   //     "/__wx_channels_assets"
   //   );
   // }
+  if (typeof window !== "undefined" && window.location && window.location.origin === "https://liteapp.weixin.qq.com") {
+    return "https://res.wx.qq.com/__wx_channels_assets";
+  }
   return "https://channels.weixin.qq.com/__wx_channels_assets";
 })();
+function __wx_api_url(path) {
+  if (typeof path === "string" && path.startsWith("/__wx_channels_api/")) {
+    var base = (typeof window !== "undefined" && window.__wx_channels_api_base__) || "";
+    return base + path;
+  }
+  return path;
+}
 var __wx_username;
 var __wx_channels_tip__ = {};
 var __wx_channels_cur_video = null;
 /** 全局的存储 */
 var __wx_channels_store__ = {
+  feed: null,
   profile: null,
   buffers: [],
 };
 var __wx_channels_live_store__ = {
+  feed: null,
   profile: null,
 };
 function __wx_channels_video_decrypt(t, e, p) {
@@ -107,17 +119,49 @@ var WXU = (() => {
       }, 1000);
     });
   }
+  function get_feed_title(feed) {
+    if (!feed || !feed.objectDesc) {
+      return "";
+    }
+    var od = feed.objectDesc;
+    return (
+      od.description ||
+      feed.title ||
+      (od.flowCardDesc && od.flowCardDesc.cardDesc) ||
+      (od.finderNewlifeDesc && od.finderNewlifeDesc.desc) ||
+      ""
+    );
+  }
+  function format_bgm(feed) {
+    var od = (feed && feed.objectDesc) || {};
+    var music = od.musicInfo || (od.extInfo && od.extInfo.bgmInfo);
+    if (!music) {
+      return null;
+    }
+    var songUrl = music.musicPlayUrl || music.url || music.playUrl || "";
+    if (!songUrl) {
+      return null;
+    }
+    return {
+      url: songUrl,
+      title: music.songName || music.title || "",
+      artist: music.singer || music.artist || "",
+    };
+  }
   /**
    * 格式化 FeedProfile，增加了一些字段
    * @param {ChannelsFeed} feed
    * @returns {FeedProfile | null}
    */
   function format_feed(feed) {
+    if (!feed) {
+      return null;
+    }
+    var contactInfo = feed.contact || {};
     if (feed.liveInfo) {
       return {
         ...feed,
         type: "live",
-        // id: feed.id,
         title: feed.description || "直播",
         url: feed.liveInfo.streamUrl,
         cover_url: (() => {
@@ -142,9 +186,9 @@ var WXU = (() => {
             };
           }
           return {
-            id: feed.contact.username,
-            nickname: feed.contact.nickname,
-            avatar_url: feed.contact.headUrl,
+            id: contactInfo.username || "",
+            nickname: contactInfo.nickname || "",
+            avatar_url: contactInfo.headUrl || "",
           };
         })(),
       };
@@ -157,45 +201,54 @@ var WXU = (() => {
       // 直播没有 media
       return null;
     }
-    var media = feed.objectDesc.media[0];
+    var mediaList = feed.objectDesc.media || [];
+    var media = mediaList[0];
+    if (!media) {
+      return null;
+    }
+    var title = get_feed_title(feed);
     if (type === 2) {
-      // 图片视频
+      // 图文作品（含可选 BGM）
       return {
         ...feed,
         type: "picture",
         id: feed.id,
         nonce_id: feed.objectNonceId,
-        cover_url: media.coverUrl,
-        title: feed.objectDesc.description,
-        files: feed.objectDesc.media,
+        cover_url: media.coverUrl || "",
+        title: title,
+        files: mediaList,
+        bgm: format_bgm(feed),
         url: "",
         key: 0,
         spec: [],
         contact: {
-          id: feed.contact.username,
-          avatar_url: feed.contact.headUrl,
-          nickname: feed.contact.nickname,
+          id: contactInfo.username || "",
+          avatar_url: contactInfo.headUrl || "",
+          nickname: contactInfo.nickname || "",
         },
       };
     }
     if (type === 4) {
+      if (!media.url || !media.urlToken) {
+        return null;
+      }
       return {
         ...feed,
         type: "media",
         id: feed.id,
         nonce_id: feed.objectNonceId,
-        title: feed.objectDesc.description,
+        title: title,
         url: media.url + media.urlToken,
         key: media.decodeKey,
-        cover_url: media.coverUrl,
+        cover_url: media.coverUrl || "",
         createtime: feed.createtime,
-        spec: media.spec,
+        spec: media.spec || [],
         size: media.fileSize,
         duration: media.videoPlayLen,
         contact: {
-          id: feed.contact.username,
-          avatar_url: feed.contact.headUrl,
-          nickname: feed.contact.nickname,
+          id: contactInfo.username || "",
+          avatar_url: contactInfo.headUrl || "",
+          nickname: contactInfo.nickname || "",
         },
       };
     }
@@ -234,26 +287,26 @@ var WXU = (() => {
    */
   function __wx_log(params) {
     console.log("[log]", params);
-    fetch("/__wx_channels_api/tip", {
+    fetch(__wx_api_url("/__wx_channels_api/tip"), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(params),
-    });
+    }).catch(() => {});
   }
   /**
    * @param {ErrorMsg} params
    */
   function __wx_error(params) {
     var _alert = params.alert ?? 1;
-    fetch("/__wx_channels_api/error", {
+    fetch(__wx_api_url("/__wx_channels_api/error"), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(params),
-    });
+    }).catch(() => {});
     if (_alert) {
       weui.topTips(params.msg);
     }
@@ -698,34 +751,33 @@ var WXU = (() => {
   var WXAPI4 = {};
 
   WXE.onAPILoaded((variables) => {
-    const keys = Object.keys(variables);
+    const keys = Object.keys(variables || {});
     for (let i = 0; i < keys.length; i++) {
-      (() => {
-        const variable = keys[i];
-        const methods = variables[variable];
-        // console.log("variable", {
-        //   api: typeof methods.finderGetCommentDetail,
-        //   api2: typeof methods.finderSearch,
-        //   api3: typeof methods.finderLiveUserPage,
-        //   api4: typeof methods.finderGetFollowList,
-        // });
-        if (typeof methods.finderGetFollowList === "function") {
-          WXAPI4 = methods;
-          return;
-        }
-        if (typeof methods.finderGetCommentDetail === "function") {
-          WXAPI = methods;
-          return;
-        }
-        if (typeof methods.finderSearch === "function") {
-          WXAPI2 = methods;
-          return;
-        }
-        if (typeof methods.finderLiveUserPage === "function") {
-          WXAPI3 = methods;
-          return;
-        }
-      })();
+      const methods = variables[keys[i]];
+      if (!methods || typeof methods !== "object") {
+        continue;
+      }
+      if (typeof methods.finderGetFollowList === "function") {
+        WXAPI4.finderGetFollowList = methods.finderGetFollowList.bind(methods);
+      }
+      if (typeof methods.finderGetPlayHistory === "function") {
+        WXAPI4.finderGetPlayHistory = methods.finderGetPlayHistory.bind(methods);
+      }
+      if (typeof methods.finderGetInteractionedFeedList === "function") {
+        WXAPI4.finderGetInteractionedFeedList = methods.finderGetInteractionedFeedList.bind(methods);
+      }
+      if (typeof methods.finderGetFeedH5Url === "function") {
+        WXAPI4.finderGetFeedH5Url = methods.finderGetFeedH5Url.bind(methods);
+      }
+      if (typeof methods.finderGetCommentDetail === "function") {
+        WXAPI = methods;
+      }
+      if (typeof methods.finderSearch === "function") {
+        WXAPI2 = methods;
+      }
+      if (typeof methods.finderLiveUserPage === "function") {
+        WXAPI3 = methods;
+      }
     }
   });
   WXE.onUtilsLoaded((methods) => {
@@ -758,6 +810,7 @@ var WXU = (() => {
        */
       async create(feed, opt = {}) {
         console.log("[downloader.create]create", feed);
+        var specs = Array.isArray(feed.spec) ? feed.spec : [];
         var spec = (() => {
           if (opt.spec) {
             return opt.spec;
@@ -765,8 +818,8 @@ var WXU = (() => {
           if (WXU.config.defaultHighest || opt.spec === null) {
             return null;
           }
-          if (feed.spec[0]) {
-            return feed.spec[0].fileFormat;
+          if (specs[0]) {
+            return specs[0].fileFormat;
           }
           return null;
         })();
@@ -778,44 +831,53 @@ var WXU = (() => {
         if (!filename) {
           return [new Error("filename 为空"), null];
         }
+        var targetUrl = feed.url || "";
+        var filesPayload = null;
+        var bgmUrl = (feed.bgm && feed.bgm.url) || "";
+        var itemKind = opt.suffix === ".jpg" ? "cover" : (opt.suffix === ".mp3" ? "mp3" : "");
+
         if (feed.type === "picture") {
           opt.suffix = ".zip";
-          feed.url = `zip://weixin.qq.com?files=${encodeURIComponent(
-            JSON.stringify(
-              feed.files.map((f, idx) => {
-                return {
-                  url: f.url,
-                  filename: `${idx + 1}.jpg`,
-                };
-              }),
-            ),
-          )}`;
-          console.log("[]feed.url", feed.url);
-        }
-        if (opt.suffix !== ".jpg") {
+          itemKind = "picture";
+          filesPayload = (feed.files || [])
+            .map((f) => (f && f.url ? f.url + (f.urlToken || "") : ""))
+            .filter(Boolean);
+          targetUrl = filesPayload[0] || targetUrl;
+        } else if (opt.suffix !== ".jpg" && targetUrl) {
           if (spec) {
-            feed.url = feed.url + "&X-snsvideoflag=" + spec;
+            var sep = targetUrl.includes("?") ? "&" : "?";
+            targetUrl = targetUrl + sep + "X-snsvideoflag=" + spec;
           } else {
             try {
-              var u = new URL(feed.url);
+              var u = new URL(targetUrl);
               u.searchParams.delete("X-snsvideoflag");
-              feed.url = u.toString();
+              targetUrl = u.toString();
             } catch (e) {
-              feed.url = feed.url.replace(/([?&])X-snsvideoflag=[^&]*(&|$)/, function(m, p1, p2) {
-                return p1 === '?' && p2 ? '?' : '';
+              targetUrl = targetUrl.replace(/([?&])X-snsvideoflag=[^&]*(&|$)/, function(m, p1, p2) {
+                return p1 === "?" && p2 ? "?" : "";
               });
             }
           }
         }
+        var body = {
+          url: targetUrl,
+          description: feed.title || "",
+          filename: filename,
+          createtime: String(feed.createtime || Math.floor(Date.now() / 1000)),
+          key: opt.suffix === ".jpg" || feed.type === "picture" ? "" : String(feed.key || ""),
+          suffix: opt.suffix || ".mp4",
+          type: itemKind,
+        };
+        if (filesPayload) {
+          body.files = filesPayload;
+        }
+        if (bgmUrl) {
+          body.bgm_url = bgmUrl;
+        }
         var [err, data] = await WXU.request({
           method: "POST",
           url: "/__wx_channels_api/download",
-          body: {
-            url: feed.url,
-            description: feed.title || "",
-            createtime: String(feed.createtime || Math.floor(Date.now() / 1000)),
-            key: String(feed.key || ""),
-          },
+          body: body,
         });
         if (err) {
           return [err, null];
@@ -988,13 +1050,14 @@ var WXU = (() => {
       if (!profile) {
         return;
       }
-      fetch("/__wx_channels_api/profile", {
+      fetch(__wx_api_url("/__wx_channels_api/profile"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify(profile),
-      });
+      }).catch(() => {});
+      __wx_channels_store__.feed = feed;
       __wx_channels_store__.profile = profile;
     },
     /**
@@ -1006,13 +1069,14 @@ var WXU = (() => {
       if (!profile) {
         return;
       }
-      fetch("/__wx_channels_api/profile", {
+      fetch(__wx_api_url("/__wx_channels_api/profile"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify(profile),
-      });
+      }).catch(() => {});
+      __wx_channels_live_store__.feed = feed;
       __wx_channels_live_store__.profile = profile;
     },
     /**
@@ -1035,71 +1099,78 @@ var WXU = (() => {
         return;
       }
       var timer = null;
+      var observer = new MutationObserver((mutations, obs) => {
+        var found = document.querySelector(selector);
+        if (found) {
+          if (timer) {
+            clearTimeout(timer);
+            timer = null;
+          }
+          obs.disconnect();
+          cb(found);
+          return;
+        }
+      });
       if (error_cb) {
         timer = setTimeout(() => {
           observer.disconnect();
           error_cb();
         }, 5000);
       }
-      var observer = new MutationObserver((mutations, obs) => {
-        mutations.forEach((mutation) => {
-          if (mutation.type === "childList") {
-            mutation.addedNodes.forEach((node) => {
-              if (node.nodeType === 1) {
-                if (node.matches(selector) || node.querySelector(selector)) {
-                  clearTimeout(timer);
-                  cb(
-                    node.matches(selector)
-                      ? node
-                      : node.querySelector(selector),
-                  );
-                  if (document.querySelector(selector)) {
-                    obs.disconnect();
-                  }
-                }
-              }
-            });
-          }
-        });
-      });
-      WXU.onWindowLoaded(() => {
-        const $root = document.getElementById("app");
+      function startObserving() {
+        var $root = document.getElementById("app") || document.body || document.documentElement;
         if (!$root) {
-          return;
+          return false;
         }
         observer.observe($root, {
           childList: true,
           subtree: true,
         });
-      });
+        return true;
+      }
+      if (!startObserving()) {
+        WXU.onDOMContentLoaded(() => {
+          startObserving();
+        });
+      }
     },
     /**
      * @param {{ url: string; method: 'GET' | 'POST'; body?: any }} opt
      */
     async request(opt) {
-      return new Promise((resolve, reject) => {
+      return new Promise((resolve) => {
         var xhr = new XMLHttpRequest();
-        xhr.open(opt.method, opt.url);
+        xhr.open(opt.method || "GET", __wx_api_url(opt.url));
         xhr.setRequestHeader("Content-Type", "application/json");
-        xhr.onload = async function () {
-          // console.log("[request]xhr.responseText", xhr.responseText);
+        xhr.onload = function () {
           try {
             var data = JSON.parse(xhr.responseText);
-            if (data.code !== 0) {
-              resolve([new Error(data.msg), null]);
+            if (xhr.status >= 400 || data.success === false || data.error) {
+              resolve([new Error(data.error || data.msg || ("HTTP " + xhr.status)), null]);
               return;
             }
-            resolve([null, data.data]);
+            if (typeof data.code === "number") {
+              if (data.code !== 0) {
+                resolve([new Error(data.msg || data.error || ("code " + data.code)), null]);
+                return;
+              }
+              resolve([null, data.data !== undefined ? data.data : data]);
+              return;
+            }
+            resolve([null, data.data !== undefined ? data.data : data]);
+            return;
           } catch (e) {
-            // ignore
+            if (xhr.status >= 400) {
+              resolve([new Error("HTTP " + xhr.status), null]);
+              return;
+            }
           }
           resolve([null, xhr.responseText]);
         };
         xhr.onerror = function (err) {
-          // console.log("[request]xhr.onerror", err);
-          resolve([new Error(err.type), null]);
+          resolve([new Error((err && err.type) || "network error"), null]);
         };
-        xhr.send(JSON.stringify(opt.body));
+        xhr.send(opt.body !== undefined ? JSON.stringify(opt.body) : null);
       });
     },
     async save(blob, filename) {
@@ -1524,7 +1595,7 @@ function __wx_attach_download_dropdown_menu(trigger) {
         if (err) {
           return [];
         }
-        return profile.spec.map((spec) => {
+        return (profile.spec || []).map((spec) => {
           const title = WXU.format_media_spec_label(spec) || spec.fileFormat;
           return MenuItem({
             label: WXU.format_media_spec_short_label(spec),
@@ -1557,7 +1628,7 @@ function __wx_download_btn_handler() {
     if (WXU.config.defaultHighest) {
       return null;
     }
-    if (profile.spec[0]) {
+    if (profile.spec && profile.spec[0]) {
       return profile.spec[0].fileFormat;
     }
     return null;
@@ -1565,7 +1636,7 @@ function __wx_download_btn_handler() {
   __wx_channels_handle_click_download__(spec, false);
 }
 
-if (typeof window.Timeless !== undefined) {
+if (typeof window.Timeless !== "undefined") {
   Object.assign(Timeless, Timeless.kit);
   Object.assign(Timeless, Timeless.headless);
   // Rendering

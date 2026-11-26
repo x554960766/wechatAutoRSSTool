@@ -6,6 +6,7 @@
 import sys
 import json
 import os
+import tempfile
 import time
 import random
 import string
@@ -15,7 +16,7 @@ from pathlib import Path
 from backend.runtime import app_dir
 
 # ── 版本号 ────────────────────────────────────────────────
-APP_VERSION = "2.3.8"
+APP_VERSION = "2.3.9"
 
 # ── 路径配置 ──────────────────────────────────────────────
 if getattr(sys, 'frozen', False):
@@ -109,13 +110,32 @@ def load_json(filepath: Path, default=None):
 
 
 def save_json(filepath: Path, data):
-    """安全地保存 JSON 文件"""
+    """安全地原子保存 JSON 文件（防止并发读写损坏或断电截断）"""
     filepath.parent.mkdir(parents=True, exist_ok=True)
-    filepath.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-        errors="replace"
-    )
+    content = json.dumps(data, ensure_ascii=False, indent=2)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            errors="replace",
+            dir=str(filepath.parent),
+            prefix=f".{filepath.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = f.name
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, filepath)
+    except Exception:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise
 
 
 def get_settings() -> dict:

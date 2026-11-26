@@ -171,9 +171,9 @@ def _run_certutil(args, check=False):
 
 _cert_trusted_cache = {"ts": 0.0, "val": False}
 
-def check_cert_trusted():
+def check_cert_trusted(force: bool = False):
     now = time.time()
-    if now - _cert_trusted_cache["ts"] < 4.0:
+    if not force and now - _cert_trusted_cache["ts"] < 4.0:
         return _cert_trusted_cache["val"]
 
     def _eval():
@@ -256,9 +256,9 @@ def _delete_all_matching_mac_certs(common_name: str = "Channels Interceptor CA")
 
 
 def install_system_cert(ca_cert_path):
-    if check_cert_trusted():
+    if check_cert_trusted(force=True):
         return True
-        
+
     if sys.platform == "darwin":
         # 1. 尝试直接安装至用户 Login 钥匙串
         try:
@@ -271,10 +271,9 @@ def install_system_cert(ca_cert_path):
                 "-k", keychain_path,
                 str(ca_cert_path)
             ], capture_output=True, text=True, timeout=5)
-            if res.returncode == 0 and check_cert_trusted():
+            if res.returncode == 0 and check_cert_trusted(force=True):
                 return True
         except Exception as e:
-            print(f"Login keychain installation note: {e}")
             print(f"Login keychain installation note: {e}")
 
         # 2. 唤起系统提权弹窗安装至系统钥匙串 (/Library/Keychains/System.keychain)
@@ -283,12 +282,12 @@ def install_system_cert(ca_cert_path):
             inner = f"/usr/bin/security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain '{cert_str}'"
             osa = f'do shell script "{inner}" with administrator privileges'
             res = subprocess.run(["osascript", "-e", osa], capture_output=True, text=True, timeout=30)
-            if res.returncode == 0 and check_cert_trusted():
+            if res.returncode == 0 and check_cert_trusted(force=True):
                 return True
         except Exception as system_err:
             print(f"System keychain osascript failed: {system_err}")
 
-        return check_cert_trusted()
+        return check_cert_trusted(force=True)
     elif sys.platform == "win32":
         try:
             system_root = os.environ.get("SystemRoot", r"C:\Windows")
@@ -297,15 +296,15 @@ def install_system_cert(ca_cert_path):
             env = os.environ.copy()
             env["PATH"] = f"{system32}{os.pathsep}{system_root}"
             # 向 CurrentUser/Root 导入自签名 CA 时，Windows 会弹出系统安全警告提示用户确认
-            # 此处不设隐藏窗口 flags，并设置合理超时，确保系统弹窗能正常展示给用户点击确认
+            # 不设 CREATE_NO_WINDOW 确保安全弹窗可见，预留 45 秒供用户点击确定
             subprocess.run(
                 [certutil, "-f", "-addstore", "-user", "root", str(ca_cert_path)],
-                capture_output=True, env=env, cwd=system32, timeout=20
+                capture_output=True, env=env, cwd=system32, timeout=45
             )
-            return check_cert_trusted()
+            return check_cert_trusted(force=True)
         except Exception as e:
             print(f"Failed to install Win cert: {e}")
-            return check_cert_trusted()
+            return check_cert_trusted(force=True)
     return False
 
 def uninstall_system_cert():
@@ -363,7 +362,7 @@ def uninstall_system_cert():
         if out_find_after.returncode != 0:
             return True
 
-        still_trusted = check_cert_trusted()
+        still_trusted = check_cert_trusted(force=True)
         if still_trusted:
             print("Cert still trusted after uninstall attempt")
         return not still_trusted
@@ -371,28 +370,80 @@ def uninstall_system_cert():
         try:
             _run_certutil(["-delstore", "-user", "root", "Channels Interceptor CA"])
             _run_certutil(["-delstore", "root", "Channels Interceptor CA"])
-            return True
+            return not check_cert_trusted(force=True)
         except Exception as e:
             print(f"Failed to delete Win cert: {e}")
             return False
     return False
 
+def _parse_scutil_dict(cmd_input: str) -> dict:
+    """运行 scutil 交互命令并解析 key : value 输出。"""
+    out = subprocess.check_output(
+        ["scutil"],
+        input=cmd_input,
+        text=True,
+        timeout=2,
+    )
+    result = {}
+    for line in out.splitlines():
+        if " : " in line:
+            k, v = line.split(" : ", 1)
+            result[k.strip()] = v.strip()
+    return result
+
+
 def get_active_mac_service():
+    """获取 macOS 当前主网络服务名称（兼容 VPN utun* 与有线/Wi-Fi 切换）。"""
     try:
+        # 1. 优先通过 PrimaryService UUID 精准定位（避免 VPN utun 接口导致误判）
+        services = set(get_all_mac_network_services())
+        for state_key in ("State:/Network/Global/IPv4", "State:/Network/Global/IPv6"):
+            try:
+                g_info = _parse_scutil_dict(f"show {state_key}\nquit\n")
+            except Exception:
+                continue
+            primary_service = g_info.get("PrimaryService", "")
+            if primary_service:
+                try:
+                    s_info = _parse_scutil_dict(
+                        f"show Setup:/Network/Service/{primary_service}\nquit\n"
+                    )
+                    user_name = s_info.get("UserDefinedName", "")
+                    if user_name and (not services or user_name in services):
+                        return user_name
+                except Exception:
+                    pass
+            primary_iface = g_info.get("PrimaryInterface", "")
+            if primary_iface:
+                ports_out = subprocess.check_output(
+                    ["networksetup", "-listallhardwareports"], timeout=2, text=True
+                )
+                for block in ports_out.split("Hardware Port:"):
+                    block = block.strip()
+                    if not block:
+                        continue
+                    lines = block.split("\n")
+                    service = lines[0].strip()
+                    if any(f"Device: {primary_iface}" in l for l in lines):
+                        return service
+
+        # 2. 回退：从 scutil --nwi 的接口列表跳过 utun 等虚拟隧道匹配物理硬件端口
         nwi_out = subprocess.check_output(["scutil", "--nwi"], timeout=2).decode("utf-8")
-        match = re.search(r"Network interfaces:\s*([^\s]+)", nwi_out)
-        if match:
-            iface = match.group(1)
-            ports_out = subprocess.check_output(["networksetup", "-listallhardwareports"], timeout=2).decode("utf-8")
-            blocks = ports_out.split("Hardware Port:")
-            for block in blocks:
-                block = block.strip()
-                if not block:
+        m_ifaces = re.search(r"Network interfaces:\s*(.+)", nwi_out)
+        if m_ifaces:
+            ifaces = m_ifaces.group(1).split()
+            ports_out = subprocess.check_output(
+                ["networksetup", "-listallhardwareports"], timeout=2, text=True
+            )
+            blocks = [b.strip() for b in ports_out.split("Hardware Port:") if b.strip()]
+            for iface in ifaces:
+                if iface.startswith(("utun", "ipsec", "ppp", "lo")):
                     continue
-                lines = block.split("\n")
-                service = lines[0].strip()
-                if f"Device: {iface}" in block or any(f"Device: {iface}" in l for l in lines):
-                    return service
+                for block in blocks:
+                    lines = block.split("\n")
+                    service = lines[0].strip()
+                    if any(f"Device: {iface}" in l for l in lines):
+                        return service
     except Exception as e:
         print(f"Error getting active service: {e}")
     return "Wi-Fi"
@@ -483,10 +534,12 @@ def detect_upstream_proxy() -> str | None:
                 if "=" in server:
                     parts = dict(p.split("=", 1) for p in server.split(";") if "=" in p)
                     server = parts.get("http") or parts.get("https") or ""
+                server = re.sub(r'^https?://', '', server.strip(), flags=re.IGNORECASE)
                 if server and ":" in server:
-                    srv, prt_str = server.split(":", 1)
+                    srv, prt_str = server.rsplit(":", 1)
                     prt = int(prt_str)
-                    if prt not in (5202, 5200) and _is_tcp_port_open(srv, prt):
+                    flask_port = int(os.environ.get("WECHAT_MP_PORT", "5200") or 5200)
+                    if prt not in (5202, 5200, flask_port) and _is_tcp_port_open(srv, prt):
                         return f"http://{srv}:{prt}"
         except Exception:
             pass
@@ -523,7 +576,7 @@ def set_mac_proxy(enabled, host="127.0.0.1", port=5202):
                         if "Enabled: Yes" in s_out:
                             m_s = re.search(r"Server:\s*(\S+)", s_out)
                             m_p = re.search(r"Port:\s*(\d+)", s_out)
-                            if m_p and m_p and int(m_p.group(1)) not in (port, 5200):
+                            if m_s and m_p and int(m_p.group(1)) not in (port, 5200):
                                 info["secure"] = (m_s.group(1), m_p.group(1))
                     except Exception:
                         pass
@@ -671,27 +724,82 @@ class ChannelsAddon:
             except Exception:
                 pass
 
-    def _local_json(self, flow, status, payload_bytes):
-        from mitmproxy import http
-        flow.response = http.Response.make(
-            status,
-            payload_bytes,
-            {"Content-Type": "application/json"},
-        )
+    _ALLOWED_CORS_ORIGINS = (
+        "https://liteapp.weixin.qq.com",
+        "https://channels.weixin.qq.com",
+    )
 
-    def _forward_to_flask(self, flow, url):
+    def _cors_headers(self, flow):
+        origin = flow.request.headers.get("Origin") or flow.request.headers.get("origin") or ""
+        if origin in self._ALLOWED_CORS_ORIGINS:
+            return {
+                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type",
+                "Vary": "Origin",
+            }
+        return {}
+
+    def _local_json(self, flow, status, payload_bytes, extra_headers=None):
+        from mitmproxy import http
+        headers = {"Content-Type": "application/json"}
+        headers.update(self._cors_headers(flow))
+        if extra_headers:
+            headers.update(extra_headers)
+        flow.response = http.Response.make(status, payload_bytes, headers)
+
+    def _serve_local_asset(self, flow, relpath):
+        from mitmproxy import http
+        from pathlib import Path
+        rel = relpath.lstrip("/").split("?", 1)[0]
+        base = Path(_injection_base()).resolve()
+        target = (base / rel).resolve()
+        try:
+            is_inside = target.is_relative_to(base)
+        except AttributeError:
+            is_inside = str(target).startswith(str(base) + os.sep)
+        if not is_inside or not target.is_file():
+            flow.response = http.Response.make(404, b"Not found", {"Content-Type": "text/plain"})
+            return
+        ext = target.suffix.lower()
+        ctype = "application/javascript; charset=utf-8" if ext == ".js" else (
+            "text/css; charset=utf-8" if ext == ".css" else "application/octet-stream"
+        )
+        headers = {
+            "Content-Type": ctype,
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type",
+        }
+        flow.response = http.Response.make(200, target.read_bytes(), headers)
+
+    @staticmethod
+    def _flask_url(path: str) -> str:
+        flask_port = os.environ.get("WECHAT_MP_PORT", "5200") or "5200"
+        return f"http://127.0.0.1:{flask_port}{path}"
+
+    def _forward_to_flask(self, flow, url, fallback_fn=None):
         import urllib.request
         try:
+            # 显式绕过系统代理，避免访问本地 Flask 服务时受环境代理变量干扰
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             req = urllib.request.Request(
                 url,
                 data=flow.request.raw_content,
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with opener.open(req, timeout=60) as r:
                 body = r.read()
             self._local_json(flow, 200, body)
         except Exception as ex:
+            if fallback_fn is not None:
+                try:
+                    fallback_fn(flow)
+                    return
+                except Exception as fb_ex:
+                    ex = fb_ex
             print(f"Error forwarding to flask {url}: {ex}")
             self._local_json(
                 flow, 500,
@@ -699,28 +807,64 @@ class ChannelsAddon:
             )
 
     def http_connect(self, flow):
-        # DIAG: 记录所有 CONNECT 的目标域名,用于发现 bundle 实际所在 CDN
-        print(f"[DIAG CONNECT] {flow.request.host}:{flow.request.port}", flush=True)
+        host = flow.request.host
+        if host in ("channels.weixin.qq.com", "liteapp.weixin.qq.com", "res.wx.qq.com", "mp.weixin.qq.com"):
+            print(f"[DIAG CONNECT TARGET] {host}:{flow.request.port}", flush=True)
+
+    def tls_failed_client(self, data):
+        try:
+            conn = getattr(data, "context", None)
+            server = getattr(conn, "server", None)
+            sni = getattr(getattr(conn, "client", None), "sni", "") or getattr(server, "address", "")
+            err = getattr(data, "error", None)
+            print(f"[ProxyWorker TLS FAIL] sni={sni} err={err}", flush=True)
+        except Exception:
+            pass
 
     def request(self, flow):
         host = flow.request.pretty_host
         path = flow.request.path.split("?", 1)[0]
 
+        if host == "res.wx.qq.com":
+            if path.startswith("/__wx_channels_assets/"):
+                if flow.request.method == "OPTIONS":
+                    from mitmproxy import http
+                    flow.response = http.Response.make(204, b"", {
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Methods": "GET, OPTIONS",
+                        "Access-Control-Allow-Headers": "Content-Type",
+                    })
+                    return
+                self._serve_local_asset(flow, path[len("/__wx_channels_assets/"):])
+                return
+            if any(k in path for k in ("virtual_svg-icons-register.publish", "connect.publish", "applyMic.publish", "libpag")):
+                for hdr in ("if-none-match", "if-modified-since", "If-None-Match", "If-Modified-Since"):
+                    if hdr in flow.request.headers:
+                        del flow.request.headers[hdr]
+            return
+
         if host == "channels.weixin.qq.com":
+            if path.startswith("/__wx_channels_api/") and flow.request.method == "OPTIONS":
+                from mitmproxy import http
+                cors = self._cors_headers(flow) or {"Access-Control-Allow-Origin": "*"}
+                cors.setdefault("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                cors.setdefault("Access-Control-Allow-Headers", "Content-Type")
+                flow.response = http.Response.make(204, b"", cors)
+                return
+
             if path == "/__wx_channels_api/sync-feed":
-                try:
-                    payload = json.loads(flow.request.get_text())
+                def _local_sync_fallback(f):
+                    payload = json.loads(f.request.get_text())
                     save_synced_feeds(payload.get("username"), payload.get("feeds", []))
                     self._local_json(
-                        flow, 200,
+                        f, 200,
                         b'{"code":0,"success":true,"message":"Feeds synced successfully"}',
                     )
-                except Exception as ex:
-                    print(f"Error handling sync-feed: {ex}")
-                    self._local_json(
-                        flow, 500,
-                        json.dumps({"success": False, "error": str(ex)}).encode("utf-8"),
-                    )
+                self._forward_to_flask(
+                    flow,
+                    self._flask_url("/api/channels/sync-feed"),
+                    fallback_fn=_local_sync_fallback,
+                )
                 return
             if path in ("/__wx_channels_api/error", "/__wx_channels_api/log-error"):
                 try:
@@ -749,7 +893,8 @@ class ChannelsAddon:
             if path == "/__wx_channels_api/profile":
                 try:
                     payload = json.loads(flow.request.get_text())
-                    print(f"[FRONTEND PROFILE] {payload.get('username')}", flush=True)
+                    who = payload.get("username") or (payload.get("contact") or {}).get("id") or payload.get("id")
+                    print(f"[FRONTEND PROFILE] {who}", flush=True)
                 except Exception:
                     pass
                 self._local_json(flow, 200, b'{"success":true}')
@@ -826,33 +971,23 @@ class ChannelsAddon:
                     )
                 return
             if path == "/__wx_channels_api/process-uploads":
-                self._forward_to_flask(
-                    flow, "http://127.0.0.1:5200/api/channels/process-uploads"
-                )
+                self._forward_to_flask(flow, self._flask_url("/api/channels/process-uploads"))
                 return
             if path == "/__wx_channels_api/download":
-                self._forward_to_flask(
-                    flow, "http://127.0.0.1:5200/api/channels/download"
-                )
+                self._forward_to_flask(flow, self._flask_url("/api/channels/download"))
                 return
 
         elif host == "mp.weixin.qq.com":
             if path == "/__wx_official_api/download":
-                self._forward_to_flask(
-                    flow, "http://127.0.0.1:5200/api/articles/download-url"
-                )
+                self._forward_to_flask(flow, self._flask_url("/api/articles/download-url"))
                 return
 
             if path == "/__wx_official_api/mp-batch-next":
-                self._forward_to_flask(
-                    flow, "http://127.0.0.1:5200/api/auth/mp-batch-next"
-                )
+                self._forward_to_flask(flow, self._flask_url("/api/auth/mp-batch-next"))
                 return
 
             if path == "/__wx_official_api/mp-batch-status":
-                self._forward_to_flask(
-                    flow, "http://127.0.0.1:5200/api/auth/mp-batch-status"
-                )
+                self._forward_to_flask(flow, self._flask_url("/api/auth/mp-batch-status"))
                 return
 
             if path == "/__wx_official_api/log":
@@ -996,33 +1131,42 @@ class ChannelsAddon:
             return
         content_type = flow.response.headers.get("content-type", "").lower()
         
-        # 1. Check for res.wx.qq.com JS bundles
+        # 1. Check for res.wx.qq.com JS bundles (including WeChat 4.x LiteApp libpag)
         if host == "res.wx.qq.com":
             pathname = flow.request.path.split("?", 1)[0]
             print(f"[DIAG res.wx] path={pathname} ct={content_type}", flush=True)
-            if "javascript" not in content_type:
+            if "javascript" not in content_type and not pathname.endswith(".js"):
                 return
             if "wasm_video_decode" in pathname:
                 return
             try:
                 js_content = flow.response.get_text(strict=False)
                 if js_content:
-                    modified = _hook_wx_bundle(pathname, js_content)
-                    # DIAG: dump raw+hooked bundles to DATA_DIR for cross-platform debugging
-                    _diag_bundles = ("virtual_svg-icons-register.publish", "connect.publish", "applyMic.publish")
-                    for _db in _diag_bundles:
-                        if _db in pathname:
-                            try:
-                                _tag = _db.replace(".", "_")
-                                _dump_dir = DATA_DIR / "diag_bundles"
-                                _dump_dir.mkdir(parents=True, exist_ok=True)
-                                (_dump_dir / f"{_tag}_raw.js").write_text(js_content, encoding="utf-8")
-                                (_dump_dir / f"{_tag}_hooked.js").write_text(modified, encoding="utf-8")
-                                print(f"[DIAG] dumped {_db} bundle raw+hooked to {_dump_dir}", flush=True)
-                            except Exception as _e:
-                                print(f"[DIAG] dump failed: {_e}", flush=True)
-                            break
-                    flow.response.text = modified
+                    if re.search(r"/libpag/(?:[^/]+/)?libpag(?:\.min)?\.js$", pathname):
+                        modified = _inject_liteapp_bootstrap(js_content)
+                        print(f"[Proxy LiteApp] Injected runtime bootstrap into {pathname}", flush=True)
+                    else:
+                        modified = _hook_wx_bundle(pathname, js_content)
+                        # DIAG: dump raw+hooked bundles to DATA_DIR for cross-platform debugging
+                        _diag_bundles = ("virtual_svg-icons-register.publish", "connect.publish", "applyMic.publish")
+                        for _db in _diag_bundles:
+                            if _db in pathname:
+                                try:
+                                    _tag = _db.replace(".", "_")
+                                    _dump_dir = DATA_DIR / "diag_bundles"
+                                    _dump_dir.mkdir(parents=True, exist_ok=True)
+                                    (_dump_dir / f"{_tag}_raw.js").write_text(js_content, encoding="utf-8")
+                                    (_dump_dir / f"{_tag}_hooked.js").write_text(modified, encoding="utf-8")
+                                    print(f"[DIAG] dumped {_db} bundle raw+hooked to {_dump_dir}", flush=True)
+                                except Exception as _e:
+                                    print(f"[DIAG] dump failed: {_e}", flush=True)
+                                break
+                    if modified != js_content:
+                        flow.response.text = modified
+                        for h in ("etag", "last-modified", "expires"):
+                            if h in flow.response.headers:
+                                del flow.response.headers[h]
+                        flow.response.headers["cache-control"] = "no-store, no-cache, must-revalidate, max-age=0"
             except Exception as ex:
                 print(f"[Proxy] Error hooking JS bundle: {ex}", flush=True)
             return
@@ -1032,9 +1176,12 @@ class ChannelsAddon:
         #     re-fetch with modified query params to get the actual page content)
         if host == "channels.weixin.qq.com":
             path_only = flow.request.path.split("?", 1)[0]
+            if "text/html" in content_type or path_only.startswith("/web/pages/"):
+                print(f"[Proxy Channels] {flow.request.method} {path_only} status={flow.response.status_code} ct={content_type}", flush=True)
             if path_only == "/web/pages/feed" and flow.response.status_code == 302:
                 try:
                     import urllib.parse
+                    import requests as req_lib
                     original_url = flow.request.url
                     parsed = urllib.parse.urlparse(original_url)
                     qs = urllib.parse.parse_qs(parsed.query)
@@ -1045,13 +1192,20 @@ class ChannelsAddon:
                     qs["wx_header"] = ["0"]
                     new_query = urllib.parse.urlencode(qs, doseq=True)
                     retry_url = urllib.parse.urlunparse(parsed._replace(query=new_query))
-                    headers = dict(flow.request.headers)
-                    headers.pop("accept-encoding", None)
-                    headers.pop("Accept-Encoding", None)
-                    resp2 = __import__("requests").get(
-                        retry_url, headers=headers, timeout=10,
-                        allow_redirects=False, verify=False
-                    )
+                    headers = {
+                        k: v for k, v in flow.request.headers.items()
+                        if k.lower() not in ("host", "content-length", "connection", "accept-encoding", "proxy-connection")
+                    }
+                    with req_lib.Session() as sess:
+                        sess.trust_env = False
+                        resp2 = sess.get(
+                            retry_url,
+                            headers=headers,
+                            proxies={"http": None, "https": None},
+                            timeout=10,
+                            allow_redirects=False,
+                            verify=False,
+                        )
                     if resp2.status_code == 200:
                         from mitmproxy import http
                         flow.response = http.Response.make(
@@ -1281,210 +1435,240 @@ class ChannelsAddon:
             if h in flow.response.headers:
                 del flow.response.headers[h]
 
-        for h in ("content-security-policy", "x-content-security-policy", "x-webkit-csp", "x-frame-options", "frame-options"):
-            if h in flow.response.headers:
-                del flow.response.headers[h]
-
 
 # ── Synced Data Saving (同步数据持久化) ──────────────────────────
 
+def _spec_sort_key(spec: dict) -> tuple:
+    """按 wx_channels_download PickHighestSpec 逻辑对画质规格排序。"""
+    if not isinstance(spec, dict):
+        return (0, 0, 0)
+    level_order = spec.get("levelOrder") or 0
+    bitrate = spec.get("videoBitrate") or spec.get("bitrate") or 0
+    pixels = (spec.get("width") or 0) * (spec.get("height") or 0)
+    return (int(level_order), int(bitrate), int(pixels))
+
+
+def _pick_best_spec(spec_list, coding_format=None):
+    """从规格列表中挑选最高规格条目；可按 codingFormat(1=H264, 2=H265) 过滤。"""
+    candidates = [s for s in (spec_list or []) if isinstance(s, dict) and s.get("fileFormat")]
+    if coding_format is not None:
+        filtered = [s for s in candidates if s.get("codingFormat") == coding_format]
+        candidates = filtered
+    if not candidates:
+        return None
+    return max(candidates, key=_spec_sort_key)
+
+
+def _extract_feed_title(feed: dict) -> str:
+    """按 wx_channels_download get_feed_title 顺序提取作品标题/描述。"""
+    object_desc = feed.get("objectDesc") or {}
+    return (
+        object_desc.get("description")
+        or feed.get("title")
+        or feed.get("description")
+        or ((object_desc.get("flowCardDesc") or {}).get("cardDesc"))
+        or ((object_desc.get("finderNewlifeDesc") or {}).get("desc"))
+        or ""
+    )
+
+
 def save_synced_feeds(username, feeds):
     import urllib.parse
-    from backend.config import load_json, save_json
-    from backend.channels import CHANNELS_FEEDS_FILE, CHANNELS_FAVORITES_FILE
-    
+    from backend.config import load_json, save_json, get_settings
+    from backend.channels import CHANNELS_FEEDS_FILE, CHANNELS_FAVORITES_FILE, FEEDS_LOCK
+
     if not username or not feeds:
         return
-        
+
     username = urllib.parse.unquote(username)
-        
+
     first_feed = feeds[0]
-    contact = first_feed.get("contact", {})
+    contact = first_feed.get("contact") or {}
     nickname = contact.get("nickname") or "已同步作者"
     head_img_url = contact.get("headUrl") or contact.get("avatar_url") or ""
-    
+
     # Extract first video's decrypted CDN URL
     first_video_url = ""
     for feed in feeds:
         if feed.get("url"):
             first_video_url = feed.get("url")
             break
-        media_list = feed.get("objectDesc", {}).get("media", [])
+        media_list = (feed.get("objectDesc") or {}).get("media") or []
         if media_list and media_list[0].get("url"):
             media = media_list[0]
-            first_video_url = media.get("url", "") + media.get("urlToken", "")
+            first_video_url = (media.get("url") or "") + (media.get("urlToken") or "")
             break
-    
-    # 1. Update/Merge Favorites list
-    favs = load_json(CHANNELS_FAVORITES_FILE, [])
-    found_fav = False
-    
-    # Check if there is an existing favorite item with the real username (e.g. v2_xxx@finder)
-    for fav in favs:
-        if fav.get("username") == username:
-            if head_img_url:
-                fav["head_img_url"] = head_img_url
-            if nickname and nickname != "已同步作者":
-                fav["nickname"] = nickname
-            if first_video_url:
-                fav["video_url"] = first_video_url
-            found_fav = True
-            break
-            
-    # If not found by real username, check if there is a placeholder favorite with the nickname as username
-    if not found_fav:
+
+    with FEEDS_LOCK:
+        # 1. Update/Merge Favorites list
+        favs = load_json(CHANNELS_FAVORITES_FILE, [])
+        found_fav = False
+
+        # Check if there is an existing favorite item with the real username (e.g. v2_xxx@finder)
         for fav in favs:
-            if fav.get("username") == nickname or fav.get("nickname") == nickname:
-                # Upgrade this placeholder favorite to the real username!
-                fav["username"] = username
+            if fav.get("username") == username:
                 if head_img_url:
                     fav["head_img_url"] = head_img_url
+                if nickname and nickname != "已同步作者":
+                    fav["nickname"] = nickname
                 if first_video_url:
                     fav["video_url"] = first_video_url
                 found_fav = True
                 break
-                
-    # If still not found, append a new favorite
-    if not found_fav:
-        favs.append({
-            "username": username,
-            "nickname": nickname,
-            "head_img_url": head_img_url,
-            "video_url": first_video_url,
-            "added_time": int(time.time())
-        })
-    save_json(CHANNELS_FAVORITES_FILE, favs)
-    
-    # 2. Update/Merge Feeds DB
-    feeds_db = load_json(CHANNELS_FEEDS_FILE, {})
-    
-    # If there are old feeds saved under the nickname (placeholder), move/merge them
-    old_feeds = []
-    if nickname in feeds_db:
-        old_feeds = feeds_db.pop(nickname) # Extract and delete old key
-    if username in feeds_db and nickname != username:
-        pass
-        
-    if username not in feeds_db:
-        feeds_db[username] = []
-        
-    # Append old feeds if they are not already in the real list
-    for of in old_feeds:
-        of_id = of.get("id")
-        if not of_id:
-            continue
-        if not any(item.get("id") == of_id for item in feeds_db[username]):
-            feeds_db[username].append(of)
-        
-    new_needs_upload = 0
-    for feed in feeds:
-        is_media = False
-        if feed.get("type") == "media":
-            is_media = True
-        elif feed.get("objectDesc", {}).get("mediaType") == 4:
-            is_media = True
-            
-        if not is_media:
-            continue # Sync videos only
-            
-        feed_id = feed.get("id")
-        if not feed_id:
-            continue
-            
-        # Try to parse as raw first, fallback to flat
-        object_desc = feed.get("objectDesc", {})
-        media_list = object_desc.get("media", [])
-        
-        description = object_desc.get("description") or feed.get("title") or feed.get("description") or ""
-        createtime = str(feed.get("createtime", 0))
-        
-        if media_list:
-            media = media_list[0]
-            video_url = media.get("url", "") + media.get("urlToken", "")
-            cover_url = media.get("coverUrl", "")
-            decode_key = media.get("decodeKey") or feed.get("key") or ""
-            spec_list = media.get("spec", [])
-        else:
-            # Flat structure fallback
-            video_url = feed.get("url", "")
-            cover_url = feed.get("cover_url", "")
-            decode_key = feed.get("key") or ""
-            spec_list = feed.get("spec", [])
-            
-        # Extract specs
-        video_url_h264 = ""
-        video_url_h265 = ""
-        if spec_list:
-            for s in spec_list:
-                ff = s.get("fileFormat")
-                if not ff:
-                    continue
-                url_with_flag = video_url + f"&X-snsvideoflag={ff}"
-                coding = s.get("codingFormat", 0)
-                if coding == 2:
-                    video_url_h265 = url_with_flag
-                elif coding == 1:
-                    video_url_h264 = url_with_flag
-                    
-            if not video_url_h265 and spec_list:
-                video_url_h265 = video_url + f"&X-snsvideoflag={spec_list[0].get('fileFormat')}"
-            if not video_url_h264 and len(spec_list) > 1:
-                video_url_h264 = video_url + f"&X-snsvideoflag={spec_list[1].get('fileFormat')}"
-        else:
-            video_url_h264 = video_url
-            video_url_h265 = video_url
-            
-        item = {
-            "id": feed_id,
-            "description": description,
-            "cover_url": cover_url,
-            "video_url": video_url,
-            "video_url_h264": video_url_h264,
-            "video_url_h265": video_url_h265,
-            "createtime": createtime,
-            "decode_key": decode_key,
-            "nickname": feed.get("contact", {}).get("nickname") or nickname,
-            "like_count": feed.get("likeCount", 0),
-            "comment_count": feed.get("commentCount", 0),
-            "forward_count": feed.get("forwardCount", 0),
-            "fav_count": feed.get("favCount", 0),
-        }
-        
-        found = False
-        for ex_item in feeds_db[username]:
-            if ex_item.get("id") == feed_id:
-                ex_item.update(item)
-                found = True
-                break
-        if not found:
-            item["needs_upload"] = True
-            feeds_db[username].append(item)
-            new_needs_upload += 1
-            
-    save_json(CHANNELS_FEEDS_FILE, feeds_db)
+
+        # If not found by real username, check if there is a placeholder favorite with the nickname as username
+        if not found_fav:
+            for fav in favs:
+                if fav.get("username") == nickname or fav.get("nickname") == nickname:
+                    fav["username"] = username
+                    if head_img_url:
+                        fav["head_img_url"] = head_img_url
+                    if first_video_url:
+                        fav["video_url"] = first_video_url
+                    found_fav = True
+                    break
+
+        if not found_fav:
+            favs.append({
+                "username": username,
+                "nickname": nickname,
+                "head_img_url": head_img_url,
+                "video_url": first_video_url,
+                "added_time": int(time.time())
+            })
+        save_json(CHANNELS_FAVORITES_FILE, favs)
+
+        # 2. Update/Merge Feeds DB
+        feeds_db = load_json(CHANNELS_FEEDS_FILE, {})
+
+        old_feeds = []
+        if nickname in feeds_db and nickname != username:
+            old_feeds = feeds_db.pop(nickname)
+
+        if username not in feeds_db:
+            feeds_db[username] = []
+
+        existing_ids = {item.get("id") for item in feeds_db[username] if item.get("id")}
+        for of in old_feeds:
+            of_id = of.get("id")
+            if of_id and of_id not in existing_ids:
+                feeds_db[username].append(of)
+                existing_ids.add(of_id)
+
+        new_needs_upload = 0
+        for feed in feeds:
+            feed_type = feed.get("type")
+            media_type_code = (feed.get("objectDesc") or {}).get("mediaType")
+            is_video = feed_type == "media" or media_type_code == 4
+            if not is_video:
+                continue  # Sync videos only
+
+            feed_id = feed.get("id")
+            if not feed_id:
+                continue
+
+            object_desc = feed.get("objectDesc") or {}
+            media_list = object_desc.get("media") or []
+
+            description = _extract_feed_title(feed)
+            createtime = str(feed.get("createtime", 0))
+
+            if media_list:
+                media = media_list[0]
+                video_url = (media.get("url") or "") + (media.get("urlToken") or "")
+                cover_url = media.get("coverUrl") or ""
+                decode_key = media.get("decodeKey") or feed.get("key") or ""
+                spec_list = media.get("spec") or []
+            else:
+                video_url = feed.get("url") or ""
+                cover_url = feed.get("cover_url") or ""
+                decode_key = feed.get("key") or ""
+                spec_list = feed.get("spec") or []
+
+            # Pick highest spec per coding format (falling back to overall highest spec)
+            video_url_h264 = ""
+            video_url_h265 = ""
+            if spec_list and video_url:
+                best_h265 = _pick_best_spec(spec_list, coding_format=2)
+                best_h264 = _pick_best_spec(spec_list, coding_format=1)
+                best_any = _pick_best_spec(spec_list, coding_format=None)
+                sep = "&" if "?" in video_url else "?"
+                if best_h265:
+                    video_url_h265 = f"{video_url}{sep}X-snsvideoflag={best_h265['fileFormat']}"
+                elif best_any:
+                    video_url_h265 = f"{video_url}{sep}X-snsvideoflag={best_any['fileFormat']}"
+                if best_h264:
+                    video_url_h264 = f"{video_url}{sep}X-snsvideoflag={best_h264['fileFormat']}"
+                elif best_any:
+                    video_url_h264 = f"{video_url}{sep}X-snsvideoflag={best_any['fileFormat']}"
+            else:
+                video_url_h264 = video_url
+                video_url_h265 = video_url
+
+            item = {
+                "id": feed_id,
+                "description": description,
+                "cover_url": cover_url,
+                "video_url": video_url,
+                "video_url_h264": video_url_h264,
+                "video_url_h265": video_url_h265,
+                "createtime": createtime,
+                "decode_key": decode_key,
+                "nickname": (feed.get("contact") or {}).get("nickname") or nickname,
+                "like_count": feed.get("likeCount", 0),
+                "comment_count": feed.get("commentCount", 0),
+                "forward_count": feed.get("forwardCount", 0),
+                "fav_count": feed.get("favCount", 0),
+            }
+            if spec_list:
+                item["specs"] = [
+                    {
+                        "file_format": s.get("fileFormat"),
+                        "width": s.get("width", 0),
+                        "height": s.get("height", 0),
+                        "bitrate": s.get("videoBitrate") or s.get("bitrate") or 0,
+                        "coding_format": s.get("codingFormat", 0),
+                        "level_order": s.get("levelOrder", 0),
+                    }
+                    for s in spec_list if isinstance(s, dict) and s.get("fileFormat")
+                ]
+
+            found = False
+            for ex_item in feeds_db[username]:
+                if ex_item.get("id") == feed_id:
+                    ex_item.update(item)
+                    found = True
+                    break
+            if not found:
+                item["needs_upload"] = True
+                feeds_db[username].append(item)
+                new_needs_upload += 1
+
+        save_json(CHANNELS_FEEDS_FILE, feeds_db)
 
     # 若有新作品落盘且开启了视频号自动上传，异步触发上传流程
     if new_needs_upload > 0:
         def _trigger_upload():
             try:
-                from backend.config import get_settings
                 s = get_settings()
                 if s.get("channels_upload_enabled"):
-                    import urllib.request
-                    req = urllib.request.Request(
-                        "http://127.0.0.1:5200/api/channels/process-uploads",
-                        data=b"{}",
-                        headers={"Content-Type": "application/json"},
-                        method="POST"
-                    )
-                    with urllib.request.urlopen(req, timeout=5) as resp:
-                        pass
-            except Exception:
-                try:
                     from backend.channels_upload import process_pending_uploads
                     process_pending_uploads()
+            except Exception:
+                try:
+                    flask_port = os.environ.get("WECHAT_MP_PORT", "5200") or "5200"
+                    import urllib.request
+                    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{flask_port}/api/channels/process-uploads",
+                        data=b"{}",
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with opener.open(req, timeout=5):
+                        pass
                 except Exception as ex_inner:
-                    print(f"[Channels] Fallback process_pending_uploads error: {ex_inner}", flush=True)
+                    print(f"[Channels] Trigger process_pending_uploads error: {ex_inner}", flush=True)
         threading.Thread(target=_trigger_upload, daemon=True).start()
 
 
@@ -1619,9 +1803,182 @@ def _hook_async_method(js_script, func_name, wrapper_template, has_param=True):
     return js_script, True
 
 
+_VIRTUAL_SVG_ASYNC_HOOKS = (
+    ("finderInit", False, 'if(typeof WXU!=="undefined"&&result){WXU.emit(WXU.Events.Init,result.data);}'),
+    ("finderPcFlow", True, 'if(typeof WXU!=="undefined"&&result&&result.data){WXU.emit(WXU.Events.PCFlowLoaded,result.data.object);}'),
+    ("finderGetRecommend", True, 'if(typeof WXU!=="undefined"&&result&&result.data){WXU.emit(WXU.Events.RecommendFeedsLoaded,result.data.object);}'),
+    ("getRecommendTabsFromService", False, 'if(typeof WXU!=="undefined"&&result){WXU.emit(WXU.Events.RecommendTabsLoaded,result.tagItem||[]);}'),
+    ("finderGetCommentDetail", True, 'if(typeof WXU!=="undefined"&&result&&result.data){WXU.emit(WXU.Events.FeedProfileLoaded,result.data.object);}'),
+    ("finderGetCommentList", True, 'if(typeof WXU!=="undefined"&&result){WXU.emit(WXU.Events.FeedCommentListLoaded,result.data);}'),
+    ("finderPCSearch", True, ""),
+    ("finderSearch", True, ""),
+    ("finderGetInteractionedFeedList", True, 'if(typeof WXU!=="undefined"&&result&&result.data){WXU.emit(WXU.Events.InteractionedFeedsLoaded,result.data.object);}'),
+    ("finderGetPlayHistory", True, 'if(typeof WXU!=="undefined"&&result&&result.data){WXU.emit(WXU.Events.PlayHistoryFeedsLoaded,result.data.object);}'),
+    ("finderGetFeedH5Url", True, 'if(typeof WXU!=="undefined"&&result&&result.data){WXU.emit(WXU.Events.GetFeedH5Url,result.data);}'),
+    ("finderGetFollowList", True, 'if(typeof WXU!=="undefined"&&result&&result.data){WXU.emit(WXU.Events.FollowListLoaded,result.data);}'),
+    ("finderUserPage", True, 'if(typeof WXU!=="undefined"&&result&&result.data){WXU.emit(WXU.Events.UserFeedsLoaded,{feeds:result.data.object,lastBuffer:result.data.lastBuffer,raw:result.data});}'),
+    ("finderLiveUserPage", True, 'if(typeof WXU!=="undefined"&&result&&result.data){WXU.emit(WXU.Events.LiveUserFeedsLoaded,result.data.object);}'),
+    ("finderGetLiveInfo", True, 'if(typeof WXU!=="undefined"&&result){WXU.emit(WXU.Events.LiveProfileLoaded,result.data);}'),
+    ("joinLive", True, 'if(typeof WXU!=="undefined"&&result){WXU.emit(WXU.Events.JoinLive,result.data);}'),
+)
+
+
+def _inject_liteapp_bootstrap(js_script: str) -> str:
+    """为微信 4.x LiteApp (libpag.js) 注入隔离后的增强脚本加载器。"""
+    marker = "/* __wx_channels_liteapp_boot__ */"
+    if marker in js_script:
+        return js_script
+    assets = [
+        "lib/mitt.umd.js",
+        "lib/timeless.reactive.umd.min.js",
+        "lib/timeless.utils.umd.min.js",
+        "lib/timeless.ui.umd.min.js",
+        "lib/timeless.kit.umd.min.js",
+        "lib/timeless.headless.umd.min.js",
+        "lib/timeless.icons.umd.min.js",
+        "lib/timeless.web.umd.min.js",
+        "lib/floating-ui.core.1.7.4.min.js",
+        "lib/floating-ui.dom.1.7.4.min.js",
+        "lib/weui.min.css",
+        "lib/weui.min.js",
+        "lib/wui.umd.js",
+        "src/eventbus.js",
+        "src/utils.js",
+        "src/components.js",
+        "src/liteapp_runtime.js",
+        "src/automation.js",
+    ]
+    bootstrap = (
+        f"\n;{marker}\n"
+        "(function(){"
+        "if(typeof location==='undefined'||typeof document==='undefined')return;"
+        "if(location.origin!=='https://liteapp.weixin.qq.com')return;"
+        "if(!location.pathname.startsWith('/a/finder/wxalite28e098851253e34f4777f7ca024236fd'))return;"
+        "if(window.__wx_channels_liteapp_loaded__)return;"
+        "window.__wx_channels_liteapp_loaded__=true;"
+        "window.__wx_channels_api_base__='https://channels.weixin.qq.com';"
+        "window.__wx_channels_config__={downloadInFrontend:false,downloadForceCheckAllFeeds:true,defaultHighest:true};"
+        "window.__wx_channels_version__='local';"
+        "window.WXVariable=window.WXVariable||{};"
+        "var base='https://res.wx.qq.com/__wx_channels_assets/';"
+        f"var assets={json.dumps(assets)};"
+        "var idx=0;"
+        "function next(){"
+        "if(idx>=assets.length)return;"
+        "var rel=assets[idx++];"
+        "if(rel.endsWith('.css')){"
+        "var link=document.createElement('link');"
+        "link.rel='stylesheet';link.href=base+rel;"
+        "(document.head||document.documentElement).appendChild(link);"
+        "next();return;"
+        "}"
+        "var s=document.createElement('script');"
+        "s.src=base+rel;s.async=false;"
+        "s.onload=next;s.onerror=next;"
+        "(document.head||document.documentElement).appendChild(s);"
+        "}"
+        "next();"
+        "})();\n"
+    )
+    return js_script + bootstrap
+
+
+def _hook_preload_worker_feeds(js_script: str):
+    """Hook worker 预加载 feeds (channels:PreloadFeeds)，兼容新旧 bundle。"""
+    pattern = re.compile(
+        r'(const|let|var)\s*\{data:([a-zA-Z_$][\w$]*),code:([a-zA-Z_$][\w$]*)\}\s*=\s*'
+        r'await\s+([a-zA-Z_$][\w$]*\.invoke\([a-zA-Z_$][\w$]*\));\('
+    )
+    def _repl(m):
+        return (
+            f"{m.group(1)}{{data:{m.group(2)},code:{m.group(3)}}}=await {m.group(4)};"
+            f'if(typeof WXU!=="undefined"&&{m.group(2)}&&{m.group(2)}.object)'
+            f"{{WXU.emit(WXU.Events.PreloadFeeds,{m.group(2)}.object);}}("
+        )
+    js_script, n = pattern.subn(_repl, js_script)
+    return js_script, n > 0
+
+
+def _hook_flow_navigation(js_script: str) -> dict:
+    """在 bundle 中 hook 推荐流上下切换与本地列表加载（兼容 virtual_svg / connect / applyMic）。"""
+    report = {}
+    m_flow = re.search(r'\bflowTab:([a-zA-Z_$][\w$]*)', js_script)
+    if m_flow:
+        flow_var = m_flow.group(1)
+        for method_name, evt_name in (
+            ("goToNextFlowFeed", "GotoNextFeed"),
+            ("goToPrevFlowFeed", "GotoPrevFeed"),
+        ):
+            pat = re.compile(rf'\b{method_name}:([a-zA-Z_$][\w$]*)')
+            def _make_flow_repl(m_name=method_name, ev=evt_name, fv=flow_var):
+                def _repl(m):
+                    orig = m.group(1)
+                    return (
+                        f"{m_name}:async function(v){{"
+                        f"var r=await {orig}(v);"
+                        f"if({fv}&&{fv}.value&&{fv}.value.feeds){{"
+                        f"var feed={fv}.value.feeds[{fv}.value.currentFeedIndex];"
+                        f'if(typeof WXU!=="undefined"&&feed){{WXU.emit(WXU.Events.{ev},feed);}}'
+                        f"}}return r;}}"
+                    )
+                return _repl
+            js_script, cnt = pat.subn(_make_flow_repl(), js_script)
+            report[method_name] = cnt > 0
+
+    m_local = re.search(r'\blocalFlowTab:([a-zA-Z_$][\w$]*)', js_script)
+    if m_local:
+        local_var = m_local.group(1)
+        pat_local = re.compile(r'\bloadLocalPlaylist:([a-zA-Z_$][\w$]*)')
+        def _local_repl(m):
+            orig = m.group(1)
+            return (
+                f"loadLocalPlaylist:async function(...args){{"
+                f"var r=await {orig}(...args);"
+                f"if({local_var}&&{local_var}.value&&{local_var}.value.feeds){{"
+                f"var feed={local_var}.value.feeds[{local_var}.value.currentFeedIndex];"
+                f'if(typeof WXU!=="undefined"&&feed){{WXU.emit(WXU.Events.HomeFeedChanged,feed);}}'
+                f"}}return r;}}"
+            )
+        js_script, cnt_local = pat_local.subn(_local_repl, js_script)
+        report["loadLocalPlaylist"] = cnt_local > 0
+
+    return {"js": js_script, "report": report}
+
+
+def _extract_export_locals(export_body: str) -> str:
+    locals_list = []
+    for item in export_body.split(","):
+        p = item.strip()
+        if not p:
+            continue
+        local = p.split(" as ")[0].strip() if " as " in p else p
+        if local and not local.isspace():
+            locals_list.append(local)
+    return "{" + ",".join(locals_list) + "}" if locals_list else "{}"
+
+
+def _inject_before_last_export(js_script: str, emit_js: str):
+    matches = list(re.finditer(r'\bexport\s*\{([^}]+)\}', js_script))
+    if not matches:
+        return js_script, None
+    last = matches[-1]
+    patched = js_script[:last.start()] + f";{emit_js};export{{{last.group(1)}}}" + js_script[last.end():]
+    return patched, last.group(1)
+
+
+def _safe_utils_emit_js() -> str:
+    return (
+        'if(typeof WXU!=="undefined"){WXU.emit(WXU.Events.UtilsLoaded,{'
+        'decodeBase64ToUint64String:typeof decodeBase64ToUint64String!=="undefined"?decodeBase64ToUint64String:void 0,'
+        'createAdapterFromGlobalMapper:typeof createAdapterFromGlobalMapper!=="undefined"?createAdapterFromGlobalMapper:void 0,'
+        'finderJoinLiveMapper:typeof finderJoinLiveMapper!=="undefined"?finderJoinLiveMapper:void 0'
+        '});}'
+    )
+
+
 def _hook_wx_bundle(pathname, js_script):
     v = "?t=local"
-    
+
     # Cache-busting imports in JS
     js_script = re.sub(r'from\s*"([^"]+)\.js"', r'from "\1.js' + v + '"', js_script)
     js_script = re.sub(r'"js/([^"]+)\.js"', r'"js/\1.js' + v + '"', js_script)
@@ -1632,136 +1989,42 @@ def _hook_wx_bundle(pathname, js_script):
         print("[Bundle Hook] Hooking virtual_svg-icons-register.publish", flush=True)
         hook_report = {}
 
-        # 1. finderInit (no param)
-        js_script, ok = _hook_async_method(js_script, "finderInit",
-            "var result=await(async()=>{{ {body} }})();var data=result.data;WXU.emit(WXU.Events.Init,data);return result;",
-            has_param=False)
-        hook_report["finderInit"] = ok
+        for func_name, has_param, post_expr in _VIRTUAL_SVG_ASYNC_HOOKS:
+            escaped_post = post_expr.replace("{", "{{").replace("}", "}}")
+            template = f"var result=await(async()=>{{{{ {{body}} }}}})();{escaped_post}return result;"
+            js_script, ok = _hook_async_method(js_script, func_name, template, has_param=has_param)
+            hook_report[func_name] = ok
 
-        # 2. finderPcFlow
-        js_script, ok = _hook_async_method(js_script, "finderPcFlow",
-            "var result=await(async()=>{{ {body} }})();var feeds=result.data.object;WXU.emit(WXU.Events.PCFlowLoaded,feeds);return result;")
-        hook_report["finderPcFlow"] = ok
+        js_script, preload_ok = _hook_preload_worker_feeds(js_script)
+        hook_report["preloadFeed"] = preload_ok
 
-        # 3. finderGetRecommend
-        js_script, ok = _hook_async_method(js_script, "finderGetRecommend",
-            "var result=await(async()=>{{ {body} }})();var feeds=result.data.object;WXU.emit(WXU.Events.RecommendFeedsLoaded,feeds);return result;")
-        hook_report["finderGetRecommend"] = ok
+        flow_res = _hook_flow_navigation(js_script)
+        js_script = flow_res["js"]
+        hook_report.update(flow_res["report"])
 
-        # 4. finderGetCommentDetail
-        js_script, ok = _hook_async_method(js_script, "finderGetCommentDetail",
-            "var result=await(async()=>{{ {body} }})();var feed=result.data.object;WXU.emit(WXU.Events.FeedProfileLoaded,feed);return result;")
-        hook_report["finderGetCommentDetail"] = ok
+        hit = sum(1 for val in hook_report.values() if val)
+        print(f"[Bundle Hook] Hook report: {hit}/{len(hook_report)} applied — {hook_report}", flush=True)
 
-        # 5. finderGetCommentList
-        js_script, ok = _hook_async_method(js_script, "finderGetCommentList",
-            "var result=await(async()=>{{ {body} }})();WXU.emit(WXU.Events.FeedCommentListLoaded,result.data);return result;")
-        hook_report["finderGetCommentList"] = ok
-
-        # 6. finderPCSearch
-        js_script, ok = _hook_async_method(js_script, "finderPCSearch",
-            "var result=await(async()=>{{ {body} }})();return result;")
-        hook_report["finderPCSearch"] = ok
-
-        # 7. finderSearch
-        js_script, ok = _hook_async_method(js_script, "finderSearch",
-            "var result=await(async()=>{{ {body} }})();return result;")
-        hook_report["finderSearch"] = ok
-
-        # 8. finderGetInteractionedFeedList
-        js_script, ok = _hook_async_method(js_script, "finderGetInteractionedFeedList",
-            "var result=await(async()=>{{ {body} }})();var feeds=result.data.object;WXU.emit(WXU.Events.InteractionedFeedsLoaded,feeds);return result;")
-        hook_report["finderGetInteractionedFeedList"] = ok
-
-        # 9. finderUserPage
-        js_script, ok = _hook_async_method(js_script, "finderUserPage",
-            "var result=await(async()=>{{ {body} }})();var feeds=result.data.object;WXU.emit(WXU.Events.UserFeedsLoaded,{{feeds:feeds,lastBuffer:result.data.lastBuffer,raw:result.data}});return result;")
-        hook_report["finderUserPage"] = ok
-
-        # 10. finderLiveUserPage
-        js_script, ok = _hook_async_method(js_script, "finderLiveUserPage",
-            "var result=await(async()=>{{ {body} }})();var feeds=result.data.object;WXU.emit(WXU.Events.LiveUserFeedsLoaded,feeds);return result;")
-        hook_report["finderLiveUserPage"] = ok
-
-        # 11. finderGetLiveInfo
-        js_script, ok = _hook_async_method(js_script, "finderGetLiveInfo",
-            "var result=await(async()=>{{ {body} }})();var live=result.data;WXU.emit(WXU.Events.LiveProfileLoaded,live);return result;")
-        hook_report["finderGetLiveInfo"] = ok
-
-        # 12. joinLive
-        js_script, ok = _hook_async_method(js_script, "joinLive",
-            "var result=await(async()=>{{ {body} }})();var data=result.data;WXU.emit(WXU.Events.JoinLive,data);return result;")
-        hook_report["joinLive"] = ok
-
-        hit = sum(1 for v in hook_report.values() if v)
-        print(f"[Bundle Hook] Hook report: {hit}/12 applied — {hook_report}", flush=True)
-
-        # 13. Export hooks (APILoaded)
-        export_match = re.search(r'exports?\s*\{([^}]+)\}', js_script)
-        api_methods = "{}"
-        if export_match:
-            items = export_match.group(1).split(",")
-            locals_list = []
-            for item in items:
-                p = item.strip()
-                if not p:
-                    continue
-                if " as " in p:
-                    local = p.split(" as ")[0].strip()
-                else:
-                    local = p
-                if local and not local.isspace():
-                    locals_list.append(local)
-            if locals_list:
-                api_methods = "{" + ",".join(locals_list) + "}"
-        
-        api_methods_escaped = api_methods.replace('\\', '\\\\')
-        js_wxapi = f";WXU.emit(WXU.Events.APILoaded,{api_methods_escaped});export{{"
-        js_script, n_subs = re.subn(r'exports?\s*\{', js_wxapi, js_script, count=1)
-        if n_subs == 0:
+        matches = list(re.finditer(r'\bexport\s*\{([^}]+)\}', js_script))
+        if matches:
+            api_methods = _extract_export_locals(matches[-1].group(1))
+            emit_api = (
+                f'if(typeof WXU!=="undefined"){{WXU.emit(WXU.Events.APILoaded,{api_methods});}}'
+                + _safe_utils_emit_js()
+            )
+            js_script, _ = _inject_before_last_export(js_script, emit_api)
+        else:
             print("[Bundle Hook] WARNING: export{} pattern not found in virtual_svg bundle", flush=True)
 
     elif "connect.publish" in pathname or "applyMic.publish" in pathname:
         print(f"[Bundle Hook] Hooking {pathname}", flush=True)
-        m_flow = re.search(r'flowTab:([a-zA-Z_$][\w$]*)', js_script)
-        flow_var = m_flow.group(1) if m_flow else "yt"
-        
-        js_go_next = (
-            f"goToNextFlowFeed:async function(v){{"
-            f"await \\1(v);"
-            f"if(!{flow_var}||!{flow_var}.value.feeds){{return;}}"
-            f"var feed={flow_var}.value.feeds[{flow_var}.value.currentFeedIndex];"
-            f"WXU.emit(WXU.Events.GotoNextFeed,feed);"
-            f"}}"
-        )
-        js_script = re.sub(r'\bgoToNextFlowFeed:([a-zA-Z_$][\w$]*)', js_go_next, js_script)
-        
-        js_go_prev = (
-            f"goToPrevFlowFeed:async function(v){{"
-            f"await \\1(v);"
-            f"if(!{flow_var}||!{flow_var}.value.feeds){{return;}}"
-            f"var feed={flow_var}.value.feeds[{flow_var}.value.currentFeedIndex];"
-            f"WXU.emit(WXU.Events.GotoPrevFeed,feed);"
-            f"}}"
-        )
-        js_script = re.sub(r'\bgoToPrevFlowFeed:([a-zA-Z_$][\w$]*)', js_go_prev, js_script)
-        
-        js_wxutil = ";WXU.emit(WXU.Events.UtilsLoaded,{decodeBase64ToUint64String:decodeBase64ToUint64String,createAdapterFromGlobalMapper:createAdapterFromGlobalMapper,finderJoinLiveMapper:finderJoinLiveMapper});export{"
-        js_script = re.sub(r'exports?\s*\{', js_wxutil, js_script, count=1)
-        
-        m_local = re.search(r'localFlowTab:([a-zA-Z_$][\w$]*)', js_script)
-        local_var = m_local.group(1) if m_local else "vn"
-        
-        js_load_local = (
-            f"loadLocalPlaylist:async function(...args){{"
-            f"await \\1(...args);"
-            f"if(!{local_var}||!{local_var}.value||!{local_var}.value.feeds){{return;}}"
-            f"var feed={local_var}.value.feeds[{local_var}.value.currentFeedIndex];"
-            f"WXU.emit(WXU.Events.HomeFeedChanged,feed);"
-            f"}}"
-        )
-        js_script = re.sub(r'\bloadLocalPlaylist:([a-zA-Z_$][\w$]*)', js_load_local, js_script)
-        
+        js_script, preload_ok = _hook_preload_worker_feeds(js_script)
+        flow_res = _hook_flow_navigation(js_script)
+        js_script = flow_res["js"]
+        flow_res["report"]["preloadFeed"] = preload_ok
+        print(f"[Bundle Hook] Flow/preload report: {flow_res['report']}", flush=True)
+        js_script, _ = _inject_before_last_export(js_script, _safe_utils_emit_js())
+
     return js_script
 
 
@@ -2336,19 +2599,25 @@ class ProxyManager:
             if sys.platform == "win32":
                 flags = 0x08000000  # CREATE_NO_WINDOW
                 out = subprocess.check_output(
-                    f"netstat -ano | findstr :{port}",
-                    shell=True,
+                    ["netstat", "-ano"],
                     text=True,
                     encoding="utf-8",
                     errors="ignore",
                     creationflags=flags
                 )
-                for line in out.strip().splitlines():
+                port_pat = re.compile(rf"(?:127\.0\.0\.1|0\.0\.0\.0|\[::\]):{port}\b")
+                for line in out.splitlines():
+                    if "LISTENING" not in line or not port_pat.search(line):
+                        continue
                     parts = line.strip().split()
-                    if len(parts) >= 5 and "LISTENING" in parts:
+                    if parts:
                         pid = parts[-1]
                         if pid.isdigit() and int(pid) != curr_pid:
-                            subprocess.run(f"taskkill /F /PID {pid}", shell=True, capture_output=True, creationflags=flags)
+                            subprocess.run(
+                                ["taskkill", "/F", "/PID", pid],
+                                capture_output=True,
+                                creationflags=flags,
+                            )
             else:
                 out = subprocess.check_output(["lsof", "-ti", f":{port}"], text=True).strip()
                 if out:
@@ -2369,6 +2638,16 @@ class ProxyManager:
         cleanup_mitmproxy_logging_handlers()
 
         try:
+            # Windows 端若检测到微信未运行，启动代理前自动精确剔除过期 LiteApp/网页磁盘缓存（保留登录态）
+            if sys.platform == "win32":
+                try:
+                    from backend.channels import evict_windows_channels_cache_if_idle
+                    evicted = evict_windows_channels_cache_if_idle()
+                    if evicted:
+                        print(f"[Proxy] Windows 启动前已自动清理 {evicted} 个过期视频号缓存条目", flush=True)
+                except Exception as cache_ex:
+                    print(f"[Proxy] Windows 自动清缓存跳过: {cache_ex}", flush=True)
+
             # 0. 准备证书与目录
             ensure_ca_certificates()
             cert_ok = install_system_cert(CA_CERT_PATH)
